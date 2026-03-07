@@ -12,7 +12,7 @@
 
 Instead, please report them privately via one of these methods:
 
-1. **GitHub Security Advisories** — [Report a vulnerability](https://github.com/eniz1806/VaultS3/security/advisories/new) (preferred)
+1. **GitHub Security Advisories** — [Report a vulnerability](https://github.com/Kodiqa-Solutions/VaultS3/security/advisories/new) (preferred)
 2. **Email** — Send details to the repository owner
 
 ### What to Include

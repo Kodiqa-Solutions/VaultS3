@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/eniz1806/VaultS3/internal/config"
-	"github.com/eniz1806/VaultS3/internal/metadata"
-	"github.com/eniz1806/VaultS3/internal/metrics"
-	"github.com/eniz1806/VaultS3/internal/storage"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metrics"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 func newTestAPI(t *testing.T) (*APIHandler, *metadata.Store) {

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
-	"github.com/eniz1806/VaultS3/internal/storage"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 // mockEngine implements storage.Engine for handler testing.

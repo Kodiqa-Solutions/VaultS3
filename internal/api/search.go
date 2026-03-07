@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/eniz1806/VaultS3/internal/search"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/search"
 )
 
 func (h *APIHandler) handleSearch(w http.ResponseWriter, r *http.Request) {

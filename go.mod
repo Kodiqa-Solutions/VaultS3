@@ -1,4 +1,4 @@
-module github.com/eniz1806/VaultS3
+module github.com/Kodiqa-Solutions/VaultS3
 
 go 1.25.0
 

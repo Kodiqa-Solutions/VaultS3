@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/eniz1806/VaultS3/internal/config"
-	"github.com/eniz1806/VaultS3/internal/metadata"
-	"github.com/eniz1806/VaultS3/internal/storage"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 // Rebalancer handles background migration of objects when cluster membership changes.

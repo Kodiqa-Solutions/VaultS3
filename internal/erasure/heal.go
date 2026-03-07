@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
-	"github.com/eniz1806/VaultS3/internal/storage"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 // Healer periodically scans for degraded erasure-coded objects and repairs them.

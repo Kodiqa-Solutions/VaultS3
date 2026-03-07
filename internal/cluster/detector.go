@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eniz1806/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 )
 
 // NodeState represents the health state of a cluster node.

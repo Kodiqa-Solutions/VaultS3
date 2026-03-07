@@ -9,7 +9,7 @@ import (
 	"path"
 	"time"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
 // SnowballUpload handles PUT /{bucket}/{key} with x-amz-meta-snowball-auto-extract: true.

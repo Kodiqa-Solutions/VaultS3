@@ -4,7 +4,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/eniz1806/VaultS3/internal/versioning"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/versioning"
 )
 
 func (h *APIHandler) handleListVersions(w http.ResponseWriter, r *http.Request) {

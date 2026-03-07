@@ -3,7 +3,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/eniz1806/VaultS3/internal/ratelimit"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/ratelimit"
 )
 
 func (h *APIHandler) SetRateLimiter(rl *ratelimit.Limiter) {

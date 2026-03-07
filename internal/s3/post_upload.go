@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
 // PostUpload handles POST /{bucket} for HTML form-based uploads with policy document validation.

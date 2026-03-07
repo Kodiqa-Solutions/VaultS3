@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/eniz1806/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 )
 
 type Target interface {

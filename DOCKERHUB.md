@@ -119,6 +119,6 @@ docker run -d \
 
 ## Links
 
-- [GitHub](https://github.com/eniz1806/VaultS3)
-- [Documentation](https://github.com/eniz1806/VaultS3/blob/main/README.md)
-- [Issues](https://github.com/eniz1806/VaultS3/issues)
+- [GitHub](https://github.com/Kodiqa-Solutions/VaultS3)
+- [Documentation](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/README.md)
+- [Issues](https://github.com/Kodiqa-Solutions/VaultS3/issues)

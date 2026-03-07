@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/eniz1806/VaultS3/internal/config"
-	"github.com/eniz1806/VaultS3/internal/server"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/server"
 )
 
 var version = "dev"

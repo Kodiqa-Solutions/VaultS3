@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eniz1806/VaultS3/internal/config"
-	"github.com/eniz1806/VaultS3/internal/metadata"
-	"github.com/eniz1806/VaultS3/internal/storage"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 // SyncRequest is sent to a remote site to request changes since a given sequence.

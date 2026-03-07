@@ -1,6 +1,6 @@
 package erasure
 
-import "github.com/eniz1806/VaultS3/internal/config"
+import "github.com/Kodiqa-Solutions/VaultS3/internal/config"
 
 // Config is an alias for config.ErasureConfig.
 type Config = config.ErasureConfig

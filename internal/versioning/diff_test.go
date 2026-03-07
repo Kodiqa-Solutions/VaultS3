@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
 func TestComputeDiff_Identical(t *testing.T) {

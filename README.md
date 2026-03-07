@@ -11,11 +11,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/eniz1806/VaultS3/actions"><img src="https://github.com/eniz1806/VaultS3/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Kodiqa-Solutions/VaultS3/actions"><img src="https://github.com/Kodiqa-Solutions/VaultS3/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://hub.docker.com/r/eniz1806/vaults3"><img src="https://img.shields.io/docker/pulls/eniz1806/vaults3?logo=docker&logoColor=white&color=2496ED" alt="Docker Pulls"></a>
-  <a href="https://github.com/eniz1806/VaultS3/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL_v3-4F46E5" alt="License"></a>
+  <a href="https://github.com/Kodiqa-Solutions/VaultS3/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL_v3-4F46E5" alt="License"></a>
   <a href="https://golang.org"><img src="https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white" alt="Go"></a>
-  <a href="https://github.com/eniz1806/VaultS3"><img src="https://img.shields.io/badge/S3_Operations-80+-10B981" alt="S3 Ops"></a>
+  <a href="https://github.com/Kodiqa-Solutions/VaultS3"><img src="https://img.shields.io/badge/S3_Operations-80+-10B981" alt="S3 Ops"></a>
 </p>
 
 <p align="center">

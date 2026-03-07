@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	s3handler "github.com/eniz1806/VaultS3/internal/s3"
+	s3handler "github.com/Kodiqa-Solutions/VaultS3/internal/s3"
 )
 
 type presignRequest struct {

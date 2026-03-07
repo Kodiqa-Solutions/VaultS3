@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
-	"github.com/eniz1806/VaultS3/internal/metrics"
-	"github.com/eniz1806/VaultS3/internal/ratelimit"
-	"github.com/eniz1806/VaultS3/internal/storage"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metrics"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/ratelimit"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 // ActivityFunc is a callback for recording S3 activity.

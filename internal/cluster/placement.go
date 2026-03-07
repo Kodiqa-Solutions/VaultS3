@@ -1,6 +1,6 @@
 package cluster
 
-import "github.com/eniz1806/VaultS3/internal/config"
+import "github.com/Kodiqa-Solutions/VaultS3/internal/config"
 
 // PlacementConfig is an alias for config.PlacementConfig.
 type PlacementConfig = config.PlacementConfig

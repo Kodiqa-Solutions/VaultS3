@@ -7,17 +7,17 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/eniz1806/VaultS3/internal/backup"
-	"github.com/eniz1806/VaultS3/internal/config"
-	"github.com/eniz1806/VaultS3/internal/lambda"
-	"github.com/eniz1806/VaultS3/internal/metadata"
-	"github.com/eniz1806/VaultS3/internal/metrics"
-	"github.com/eniz1806/VaultS3/internal/ratelimit"
-	s3auth "github.com/eniz1806/VaultS3/internal/s3"
-	"github.com/eniz1806/VaultS3/internal/scanner"
-	"github.com/eniz1806/VaultS3/internal/search"
-	"github.com/eniz1806/VaultS3/internal/storage"
-	"github.com/eniz1806/VaultS3/internal/tiering"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/backup"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/lambda"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metrics"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/ratelimit"
+	s3auth "github.com/Kodiqa-Solutions/VaultS3/internal/s3"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/scanner"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/search"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/tiering"
 )
 
 // APIHandler serves the dashboard REST API at /api/v1/.

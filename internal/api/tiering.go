@@ -3,7 +3,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/eniz1806/VaultS3/internal/tiering"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/tiering"
 )
 
 func (h *APIHandler) handleTieringStatus(w http.ResponseWriter, r *http.Request) {

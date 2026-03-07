@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/eniz1806/VaultS3/internal/scanner"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/scanner"
 )
 
 func (h *APIHandler) handleScannerStatus(w http.ResponseWriter, r *http.Request) {

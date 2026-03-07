@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
 // ChangeLog tracks object mutations for efficient delta sync between sites.

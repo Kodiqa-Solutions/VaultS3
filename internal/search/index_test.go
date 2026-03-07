@@ -3,7 +3,7 @@ package search
 import (
 	"testing"
 
-	"github.com/eniz1806/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
 func newTestIndex(max int) *Index {

@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/eniz1806/VaultS3/internal/lambda"
-	"github.com/eniz1806/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/lambda"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
 // SetLambdaManager sets the lambda trigger manager.

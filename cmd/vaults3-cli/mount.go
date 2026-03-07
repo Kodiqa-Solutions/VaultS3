@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	vfuse "github.com/eniz1806/VaultS3/internal/fuse"
+	vfuse "github.com/Kodiqa-Solutions/VaultS3/internal/fuse"
 )
 
 func runMount(args []string) {
