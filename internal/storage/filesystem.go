@@ -155,10 +155,15 @@ func (fs *FileSystem) ObjectSize(bucket, key string) (int64, error) {
 func (fs *FileSystem) ListObjects(bucket, prefix, startAfter string, maxKeys int) ([]ObjectInfo, bool, error) {
 	bucketDir := fs.bucketPath(bucket)
 
+	// Verify bucket directory is accessible before walking
+	if _, err := os.Stat(bucketDir); err != nil {
+		return nil, false, fmt.Errorf("bucket directory: %w", err)
+	}
+
 	var objects []ObjectInfo
 	err := filepath.Walk(bucketDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return nil // skip inaccessible files within the bucket
 		}
 		// Skip the .vs/ versions directory
 		if info.IsDir() && info.Name() == ".vs" {
@@ -212,9 +217,15 @@ func (fs *FileSystem) BucketSize(bucket string) (int64, int64, error) {
 	var count int64
 
 	bucketDir := fs.bucketPath(bucket)
+
+	// Verify bucket directory is accessible before walking
+	if _, err := os.Stat(bucketDir); err != nil {
+		return 0, 0, fmt.Errorf("bucket directory: %w", err)
+	}
+
 	err := filepath.Walk(bucketDir, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return nil // skip inaccessible files within the bucket
 		}
 		if info.IsDir() && info.Name() == ".vs" {
 			return filepath.SkipDir

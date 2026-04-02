@@ -5,7 +5,7 @@ export interface SearchResult {
   key: string
   size: number
   content_type: string
-  last_modified: string
+  last_modified: number
   etag: string
   tags: Record<string, string>
 }

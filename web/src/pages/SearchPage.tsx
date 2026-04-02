@@ -64,7 +64,7 @@ export default function SearchPage() {
         case 'key': cmp = a.key.localeCompare(b.key); break
         case 'size': cmp = a.size - b.size; break
         case 'content_type': cmp = (a.content_type || '').localeCompare(b.content_type || ''); break
-        case 'last_modified': cmp = (a.last_modified || '').localeCompare(b.last_modified || ''); break
+        case 'last_modified': cmp = (a.last_modified || 0) - (b.last_modified || 0); break
       }
       return sortDir === 'asc' ? cmp : -cmp
     })
@@ -144,7 +144,7 @@ export default function SearchPage() {
                       <td className="px-4 py-3 text-gray-500 dark:text-gray-400">{formatSize(r.size)}</td>
                       <td className="px-4 py-3 text-gray-500 dark:text-gray-400">{r.content_type || '-'}</td>
                       <td className="px-4 py-3 text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                        {r.last_modified ? new Date(r.last_modified).toLocaleString() : '-'}
+                        {r.last_modified ? new Date(r.last_modified * 1000).toLocaleString() : '-'}
                       </td>
                     </tr>
                   ))}

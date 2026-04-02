@@ -282,7 +282,7 @@ func buildSearchText(bucket, key string, meta metadata.ObjectMeta) string {
 	}
 	if meta.LastModified > 0 {
 		b.WriteByte(' ')
-		b.WriteString(time.Unix(0, meta.LastModified).Format("2006-01-02"))
+		b.WriteString(time.Unix(meta.LastModified, 0).Format("2006-01-02"))
 	}
 	return b.String()
 }

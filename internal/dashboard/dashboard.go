@@ -17,11 +17,21 @@ var distFS embed.FS
 func Handler() http.Handler {
 	dist, _ := fs.Sub(distFS, "dist")
 	fileServer := http.FileServer(http.FS(dist))
+	indexHTML, _ := fs.ReadFile(dist, "index.html")
 
 	return http.StripPrefix("/dashboard", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		urlPath := r.URL.Path
+
+		// Normalize: strip trailing slashes to prevent redirect loops
+		if urlPath != "/" && strings.HasSuffix(urlPath, "/") {
+			urlPath = strings.TrimRight(urlPath, "/")
+			r.URL.Path = urlPath
+		}
+
 		if urlPath == "" || urlPath == "/" {
-			urlPath = "/index.html"
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(indexHTML)
+			return
 		}
 
 		// Check if the file exists in the embedded filesystem
@@ -37,8 +47,8 @@ func Handler() http.Handler {
 			return
 		}
 
-		// SPA fallback: serve index.html for client-side routes
-		r.URL.Path = "/index.html"
-		fileServer.ServeHTTP(w, r)
+		// SPA fallback: serve index.html directly for client-side routes
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexHTML)
 	}))
 }
