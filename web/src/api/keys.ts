@@ -17,8 +17,11 @@ export function listKeys(): Promise<AccessKey[]> {
   return apiFetch<AccessKey[]>('/keys')
 }
 
-export function createKey(): Promise<CreatedKey> {
-  return apiFetch<CreatedKey>('/keys', { method: 'POST' })
+export function createKey(userId: string, buckets?: string[]): Promise<CreatedKey> {
+  return apiFetch<CreatedKey>('/keys', {
+    method: 'POST',
+    body: JSON.stringify({ userId, buckets: buckets?.length ? buckets : undefined }),
+  })
 }
 
 export function deleteKey(accessKey: string): Promise<void> {

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { listKeys, createKey, deleteKey, type AccessKey, type CreatedKey } from '../api/keys'
+import { listBuckets, type Bucket } from '../api/buckets'
 import { useToast } from '../hooks/useToast'
 
 type SortField = 'accessKey' | 'createdAt' | 'type'
@@ -10,6 +11,10 @@ export default function AccessKeysPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [creating, setCreating] = useState(false)
+  const [showCreateModal, setShowCreateModal] = useState(false)
+  const [newUserId, setNewUserId] = useState('')
+  const [buckets, setBuckets] = useState<Bucket[]>([])
+  const [selectedBuckets, setSelectedBuckets] = useState<string[]>([])
   const [newKey, setNewKey] = useState<CreatedKey | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [copied, setCopied] = useState('')
@@ -32,11 +37,28 @@ export default function AccessKeysPage() {
 
   useEffect(() => { fetchKeys() }, [fetchKeys])
 
+  const openCreateModal = async () => {
+    setNewUserId('')
+    setSelectedBuckets([])
+    setShowCreateModal(true)
+    try {
+      const b = await listBuckets()
+      setBuckets(b)
+    } catch {
+      setBuckets([])
+    }
+  }
+
   const handleCreate = async () => {
+    if (!newUserId.trim()) {
+      addToast('error', 'User ID is required')
+      return
+    }
     setCreating(true)
     setError('')
     try {
-      const key = await createKey()
+      const key = await createKey(newUserId.trim(), selectedBuckets)
+      setShowCreateModal(false)
       setNewKey(key)
       addToast('success', 'Access key created')
       fetchKeys()
@@ -45,6 +67,12 @@ export default function AccessKeysPage() {
     } finally {
       setCreating(false)
     }
+  }
+
+  const toggleBucket = (name: string) => {
+    setSelectedBuckets(prev =>
+      prev.includes(name) ? prev.filter(b => b !== name) : [...prev, name]
+    )
   }
 
   const handleDelete = async (accessKey: string) => {
@@ -118,17 +146,74 @@ export default function AccessKeysPage() {
           <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">Manage S3 API access keys</p>
         </div>
         <button
-          onClick={handleCreate}
-          disabled={creating}
-          className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm font-medium transition-colors"
+          onClick={openCreateModal}
+          className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium transition-colors"
         >
-          {creating ? 'Creating...' : 'Create Key'}
+          Create Key
         </button>
       </div>
 
       {error && (
         <div className="mb-4 p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 text-sm">
           {error}
+        </div>
+      )}
+
+      {/* Create key modal */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-gray-200 dark:border-gray-700 p-6 w-full max-w-md mx-4">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Create Access Key</h3>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">User ID <span className="text-red-500">*</span></label>
+                <input
+                  type="text"
+                  value={newUserId}
+                  onChange={e => setNewUserId(e.target.value)}
+                  placeholder="e.g. app-user, backup-agent"
+                  className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+                  autoFocus
+                  onKeyDown={e => { if (e.key === 'Enter' && newUserId.trim()) handleCreate() }}
+                />
+                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">An IAM user will be auto-created if it doesn't exist.</p>
+              </div>
+              {buckets.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Bucket Access <span className="text-xs font-normal text-gray-500">(optional)</span></label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">Leave empty for full S3 access, or select specific buckets.</p>
+                  <div className="max-h-40 overflow-y-auto space-y-1 border border-gray-200 dark:border-gray-600 rounded-lg p-2">
+                    {buckets.map(b => (
+                      <label key={b.name} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedBuckets.includes(b.name)}
+                          onChange={() => toggleBucket(b.name)}
+                          className="rounded border-gray-300 dark:border-gray-600 text-indigo-600 focus:ring-indigo-500"
+                        />
+                        <span className="text-sm text-gray-700 dark:text-gray-300">{b.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="flex gap-2 justify-end mt-6">
+              <button
+                onClick={() => setShowCreateModal(false)}
+                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCreate}
+                disabled={creating || !newUserId.trim()}
+                className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm font-medium transition-colors"
+              >
+                {creating ? 'Creating...' : 'Create Key'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
