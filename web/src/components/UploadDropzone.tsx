@@ -64,7 +64,12 @@ async function collectFiles(dataTransfer: DataTransfer): Promise<{ files: File[]
       }
     }
 
-    if (allFiles.length > 0) return { files: allFiles, hasFolder }
+    // We successfully read entries via webkitGetAsEntry (even if an empty
+    // folder resolved to zero files) — trust this result and do NOT fall
+    // through to dataTransfer.files below. Chrome exposes dropped folders
+    // there as an unreadable phantom 0-byte File, which hangs forever when
+    // uploaded.
+    if (entries.length > 0) return { files: allFiles, hasFolder }
   }
 
   // Fallback: plain file list
@@ -79,7 +84,10 @@ export default function UploadDropzone({ bucket, prefix, onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
 
   const doUpload = useCallback(async (files: File[], preservePaths: boolean) => {
-    if (files.length === 0) return
+    if (files.length === 0) {
+      setError('No files found to upload (folder may be empty)')
+      return
+    }
     setUploading(true)
     setProgress(0)
     setError('')
