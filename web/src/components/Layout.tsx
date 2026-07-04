@@ -7,13 +7,14 @@ import { useKeyboardShortcuts, shortcuts } from '../hooks/useKeyboardShortcuts'
 
 export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [isCollapsed, setIsCollapsed] = useState(false)
   const { showHelp, setShowHelp } = useKeyboardShortcuts()
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-gray-900">
       {/* Desktop sidebar */}
-      <div className="hidden md:flex">
-        <Sidebar />
+      <div className={`hidden md:flex transition-all duration-300 ${isCollapsed ? 'w-16' : 'w-56'}`}>
+        <Sidebar isCollapsed={isCollapsed} onToggleCollapse={() => setIsCollapsed(!isCollapsed)} />
       </div>
 
       {/* Mobile sidebar overlay */}

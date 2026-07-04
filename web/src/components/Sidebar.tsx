@@ -22,18 +22,22 @@ const navItems = [
 
 interface Props {
   onClose?: () => void
+  isCollapsed?: boolean
+  onToggleCollapse?: () => void
 }
 
-export default function Sidebar({ onClose }: Props) {
+export default function Sidebar({ onClose, isCollapsed, onToggleCollapse }: Props) {
   return (
-    <aside className="w-56 h-full bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col">
-      <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold text-gray-900 dark:text-white tracking-tight">
-            VaultS3
-          </h1>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Object Storage</p>
-        </div>
+    <aside className="w-full h-full bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col transition-all duration-300 overflow-hidden">
+      <div className={`h-14 px-4 border-b border-gray-200 dark:border-gray-700 flex items-center ${isCollapsed ? 'justify-center' : 'justify-between'} shrink-0`}>
+        {!isCollapsed && (
+          <div className="overflow-hidden whitespace-nowrap flex flex-col justify-center mt-0.5">
+            <h1 className="text-lg font-bold text-gray-900 dark:text-white tracking-tight leading-none">
+              VaultS3
+            </h1>
+            <p className="text-[10px] text-gray-500 dark:text-gray-400 mt-1 uppercase tracking-wider font-semibold leading-none">Object Storage</p>
+          </div>
+        )}
         {onClose && (
           <button
             onClick={onClose}
@@ -44,33 +48,51 @@ export default function Sidebar({ onClose }: Props) {
             </svg>
           </button>
         )}
+        {onToggleCollapse && (
+          <button
+            onClick={onToggleCollapse}
+            className={`hidden md:flex p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors shrink-0 ${isCollapsed ? '' : 'ml-2'}`}
+            title={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          >
+            {isCollapsed ? (
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M11.25 4.5l7.5 7.5-7.5 7.5m-6-15l7.5 7.5-7.5 7.5" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5" />
+              </svg>
+            )}
+          </button>
+        )}
       </div>
-      <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
+      <nav className="flex-1 p-3 space-y-1 overflow-y-auto overflow-x-hidden">
         {navItems.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}
             end={item.to === '/'}
             onClick={onClose}
+            title={isCollapsed ? item.label : undefined}
             className={({ isActive }) =>
-              `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+              `flex items-center gap-2.5 ${isCollapsed ? 'justify-center px-2' : 'px-3'} py-2 rounded-lg text-sm font-medium transition-colors ${
                 isActive
                   ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300'
                   : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/50'
               }`
             }
           >
-            {item.icon()}
-            {item.label}
+            <div className="shrink-0">{item.icon()}</div>
+            {!isCollapsed && <span className="whitespace-nowrap">{item.label}</span>}
           </NavLink>
         ))}
       </nav>
-      <SidebarVersion />
+      <SidebarVersion isCollapsed={isCollapsed} />
     </aside>
   )
 }
 
-function SidebarVersion() {
+function SidebarVersion({ isCollapsed }: { isCollapsed?: boolean }) {
   const [v, setV] = useState<VersionStatus | null>(null)
   useEffect(() => {
     getVersion().then(setV).catch(() => {})
@@ -79,22 +101,25 @@ function SidebarVersion() {
   const label = /^\d/.test(v.current) ? `v${v.current}` : v.current
   const outdated = v.updateAvailable && v.latest
   return (
-    <div className="p-3 border-t border-gray-200 dark:border-gray-700">
+    <div className="p-3 border-t border-gray-200 dark:border-gray-700 overflow-hidden">
       <a
         href="https://github.com/Kodiqa-Solutions/VaultS3/releases"
         target="_blank"
         rel="noreferrer"
         title={outdated ? `Update available: ${v.latest}` : 'You are on the latest version'}
-        className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg text-xs text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700/50 transition-colors"
+        className={`flex items-center ${isCollapsed ? 'justify-center' : 'justify-between'} gap-2 px-2 py-1.5 rounded-lg text-xs text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700/50 transition-colors`}
       >
-        <span className="font-mono">{label}</span>
+        {!isCollapsed && <span className="font-mono whitespace-nowrap">{label}</span>}
         {outdated ? (
-          <span className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400 font-medium">
-            <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
-            update
+          <span className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400 font-medium shrink-0">
+            <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse shrink-0" />
+            {!isCollapsed && "update"}
           </span>
         ) : (
-          <span className="text-gray-400 dark:text-gray-500">latest</span>
+          !isCollapsed && <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap">latest</span>
+        )}
+        {isCollapsed && !outdated && (
+          <span className="font-mono text-[10px] shrink-0">{v.current.replace(/^v/, '')}</span>
         )}
       </a>
     </div>
