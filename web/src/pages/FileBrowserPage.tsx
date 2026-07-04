@@ -6,13 +6,17 @@ import { listVersions, getVersionTags, createVersionTag, deleteVersionTag, rollb
 import UploadDropzone from '../components/UploadDropzone'
 import CopyButton from '../components/CopyButton'
 import VersionDiffViewer from '../components/VersionDiffViewer'
+import FileTypeIcon from '../components/FileTypeIcon'
+import FileGridView from '../components/FileGridView'
 import { useToast } from '../hooks/useToast'
 
 type SortField = 'name' | 'size' | 'type' | 'modified'
 type SortDir = 'asc' | 'desc'
+type ViewMode = 'table' | 'grid'
 
 const PAGE_SIZE = 50
 const FETCH_SIZE = 1000 // objects pulled from the server per request
+const VIEW_MODE_KEY = 'vaults3:fileBrowserViewMode'
 
 export default function FileBrowserPage() {
   const { name: bucket } = useParams<{ name: string }>()
@@ -34,6 +38,17 @@ export default function FileBrowserPage() {
 
   // Pagination
   const [page, setPage] = useState(0)
+
+  // View mode (table / grid), persisted; defaults to table
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    const saved = localStorage.getItem(VIEW_MODE_KEY)
+    return saved === 'grid' ? 'grid' : 'table'
+  })
+
+  const setView = (mode: ViewMode) => {
+    setViewMode(mode)
+    localStorage.setItem(VIEW_MODE_KEY, mode)
+  }
 
   // Preview / metadata panel
   const [selectedFile, setSelectedFile] = useState<ObjectItem | null>(null)
@@ -380,6 +395,41 @@ export default function FileBrowserPage() {
           <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Files</h2>
         </div>
 
+        <div className="flex items-center justify-end mb-3">
+          <div className="inline-flex rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+            <button
+              onClick={() => setView('table')}
+              title="List view"
+              aria-pressed={viewMode === 'table'}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                viewMode === 'table'
+                  ? 'bg-indigo-600 text-white'
+                  : 'bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
+              }`}
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h16.5" />
+              </svg>
+              List
+            </button>
+            <button
+              onClick={() => setView('grid')}
+              title="Grid view"
+              aria-pressed={viewMode === 'grid'}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium border-l border-gray-200 dark:border-gray-700 transition-colors ${
+                viewMode === 'grid'
+                  ? 'bg-indigo-600 text-white'
+                  : 'bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
+              }`}
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6a2.25 2.25 0 012.25-2.25h.75a2.25 2.25 0 012.25 2.25v.75a2.25 2.25 0 01-2.25 2.25h-.75A2.25 2.25 0 013.75 6.75V6zM3.75 15a2.25 2.25 0 012.25-2.25h.75a2.25 2.25 0 012.25 2.25v.75a2.25 2.25 0 01-2.25 2.25h-.75A2.25 2.25 0 013.75 17.25V15zM13.5 6a2.25 2.25 0 012.25-2.25h.75A2.25 2.25 0 0118.75 6v.75a2.25 2.25 0 01-2.25 2.25h-.75a2.25 2.25 0 01-2.25-2.25V6zM13.5 15a2.25 2.25 0 012.25-2.25h.75a2.25 2.25 0 012.25 2.25v.75a2.25 2.25 0 01-2.25 2.25h-.75a2.25 2.25 0 01-2.25-2.25V15z" />
+              </svg>
+              Grid
+            </button>
+          </div>
+        </div>
+
         <div className="mb-4">
           <UploadDropzone bucket={bucket} prefix={prefix} onUploaded={() => fetchObjects()} />
         </div>
@@ -485,6 +535,7 @@ export default function FileBrowserPage() {
           </div>
         ) : (
           <>
+            {viewMode === 'table' ? (
             <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
@@ -526,12 +577,12 @@ export default function FileBrowserPage() {
                       <td className="px-4 py-3">
                         {obj.isPrefix ? (
                           <span className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 font-medium">
-                            <FolderIcon />
+                            <FileTypeIcon name={displayName(obj.key, prefix)} isFolder />
                             {displayName(obj.key, prefix)}
                           </span>
                         ) : (
                           <span className="flex items-center gap-2 text-gray-900 dark:text-white">
-                            <FileIcon />
+                            <FileTypeIcon name={displayName(obj.key, prefix)} />
                             {displayName(obj.key, prefix)}
                           </span>
                         )}
@@ -571,6 +622,22 @@ export default function FileBrowserPage() {
                 </tbody>
               </table>
             </div>
+            ) : (
+              <FileGridView
+                objects={pagedObjects}
+                prefix={prefix}
+                bucket={bucket!}
+                selectedFileKey={selectedFile?.key ?? null}
+                selectedKeys={selectedKeys}
+                onNavigate={navigatePrefix}
+                onSelectFile={handleSelectFile}
+                onToggleSelect={toggleSelect}
+                onDeleteRequest={setDeleteTarget}
+                getDownloadUrl={getDownloadUrl}
+                displayName={displayName}
+                formatSize={formatSize}
+              />
+            )}
 
             {/* Pagination */}
             {(totalPages > 1 || truncated) && (
@@ -903,22 +970,6 @@ function formatSize(bytes: number): string {
 function formatDate(iso: string): string {
   if (!iso) return '-'
   return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
-}
-
-function FolderIcon() {
-  return (
-    <svg className="w-4 h-4 text-yellow-500" fill="currentColor" viewBox="0 0 20 20">
-      <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
-    </svg>
-  )
-}
-
-function FileIcon() {
-  return (
-    <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-    </svg>
-  )
 }
 
 function DownloadIcon() {
