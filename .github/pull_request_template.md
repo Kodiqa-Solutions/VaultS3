@@ -15,5 +15,4 @@
 - [ ] Added/updated tests for the change
 - [ ] Updated `README.md` / `docs/` for user-facing changes
 - [ ] No secrets, keys, binaries, or logs committed
-- [ ] Commits are signed off (`git commit -s`), see [DCO](../CONTRIBUTING.md#contributor-license-agreement--sign-off)
 - [ ] I will sign the [CLA](CLA.md) when the bot asks (first-time contributors)

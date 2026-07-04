@@ -64,13 +64,12 @@ node, partition two sites and check convergence). See the existing
 2. Keep changes focused. One logical change per PR.
 3. Run `go test ./...` and `npm run build` before opening the PR.
 4. Use clear, present-tense commit messages (e.g. `Fix versioned ListObjectsV2 empty result`).
-   **Sign off each commit** with `git commit -s` (see DCO below).
 5. Update `README.md` and any relevant docs when you change user-facing behavior.
 6. Open the PR against `main` and describe **what** changed and **why**.
 
-## Contributor License Agreement & sign-off
+## Contributor License Agreement
 
-Two lightweight, one-time-ish steps keep VaultS3's licensing clean. Both run
+One lightweight, one-time step keeps VaultS3's licensing clean. It runs
 automatically on your pull request.
 
 - **CLA (sign once, ever).** On your first PR, the **CLA Assistant** bot asks you
@@ -80,17 +79,6 @@ automatically on your pull request.
   This grants Kodiqa Solutions the right to keep VaultS3 open source **and** offer
   commercial editions, it's what makes the open-core model possible. You keep full
   ownership of your contributions. One signature covers all your future PRs.
-
-- **DCO (sign off each commit).** A **`Signed-off-by:`** line on every commit
-  attests you have the right to submit the code. Add it automatically with:
-
-  ```bash
-  git commit -s -m "Your message"          # new commits
-  git commit -s --amend                     # fix the last commit
-  git rebase --signoff main                 # fix a whole branch
-  ```
-
-  The DCO check fails any commit that's missing it.
 
 ## Reporting bugs
 
