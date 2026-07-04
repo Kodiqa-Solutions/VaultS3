@@ -42,12 +42,12 @@ export default function FileGridView({
           <div
             key={obj.key}
             onClick={() => (obj.isPrefix ? onNavigate(obj.key) : onSelectFile(obj))}
-            className={`group relative flex flex-col items-center gap-2 rounded-xl border p-3 pt-4 cursor-pointer transition-colors ${
+            className={`group relative flex flex-col items-center gap-2.5 rounded-2xl border p-4 pt-5 cursor-pointer shadow-sm hover:shadow-md transition-all duration-200 hover:-translate-y-0.5 ${
               isSelected
                 ? 'border-indigo-400 dark:border-indigo-500 bg-indigo-50 dark:bg-indigo-900/20'
                 : isChecked
                 ? 'border-indigo-200 dark:border-indigo-700 bg-indigo-50/50 dark:bg-indigo-900/10'
-                : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 hover:border-indigo-300 dark:hover:border-indigo-600 hover:bg-gray-50 dark:hover:bg-gray-700/30'
+                : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 hover:border-indigo-300 dark:hover:border-indigo-600 hover:bg-gray-50/80 dark:hover:bg-gray-700/40'
             }`}
             title={name}
           >
@@ -90,7 +90,7 @@ export default function FileGridView({
               </div>
             )}
 
-            <FileTypeIcon name={name} isFolder={obj.isPrefix} className="w-10 h-10" />
+            <FileTypeIcon name={name} isFolder={obj.isPrefix} className="w-12 h-12 mb-1" />
 
             <span
               className={`text-xs text-center break-all line-clamp-2 leading-tight ${

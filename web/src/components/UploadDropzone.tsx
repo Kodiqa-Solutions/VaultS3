@@ -7,7 +7,6 @@ interface Props {
   onUploaded: (results: UploadResult[]) => void
 }
 
-// Recursively read all files from a dropped directory entry.
 async function readDirectoryEntries(entry: FileSystemDirectoryEntry): Promise<File[]> {
   const reader = entry.createReader()
   const files: File[] = []
@@ -22,7 +21,6 @@ async function readDirectoryEntries(entry: FileSystemDirectoryEntry): Promise<Fi
         const file = await new Promise<File>((resolve, reject) =>
           (child as FileSystemFileEntry).file(resolve, reject)
         )
-        // Preserve relative path from the dropped folder
         const relativePath = child.fullPath.replace(/^\//, '')
         Object.defineProperty(file, 'webkitRelativePath', { value: relativePath })
         files.push(file)
@@ -36,12 +34,9 @@ async function readDirectoryEntries(entry: FileSystemDirectoryEntry): Promise<Fi
   return files
 }
 
-// Collect all files from a DataTransfer, including folder contents.
 async function collectFiles(dataTransfer: DataTransfer): Promise<{ files: File[]; hasFolder: boolean }> {
   const items = dataTransfer.items
   let hasFolder = false
-
-  // Try webkitGetAsEntry for folder support
   if (items && items.length > 0 && typeof items[0].webkitGetAsEntry === 'function') {
     const allFiles: File[] = []
     const entries: FileSystemEntry[] = []
@@ -64,15 +59,9 @@ async function collectFiles(dataTransfer: DataTransfer): Promise<{ files: File[]
       }
     }
 
-    // We successfully read entries via webkitGetAsEntry (even if an empty
-    // folder resolved to zero files) — trust this result and do NOT fall
-    // through to dataTransfer.files below. Chrome exposes dropped folders
-    // there as an unreadable phantom 0-byte File, which hangs forever when
-    // uploaded.
     if (entries.length > 0) return { files: allFiles, hasFolder }
   }
 
-  // Fallback: plain file list
   return { files: Array.from(dataTransfer.files), hasFolder: false }
 }
 
@@ -93,11 +82,9 @@ export default function UploadDropzone({ bucket, prefix, onUploaded }: Props) {
     setError('')
     try {
       if (preservePaths) {
-        // Upload files with their relative paths as key prefixes
         const formData = new FormData()
         for (const file of files) {
           const relPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
-          // Append with the relative path as the filename
           formData.append('file', new File([file], relPath, { type: file.type }))
         }
 
@@ -151,11 +138,10 @@ export default function UploadDropzone({ bucket, prefix, onUploaded }: Props) {
       onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
       onDragLeave={() => setDragging(false)}
       onDrop={handleDrop}
-      className={`relative border-2 border-dashed rounded-xl p-6 text-center transition-colors ${
-        dragging
-          ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-900/20'
-          : 'border-gray-300 dark:border-gray-600 hover:border-gray-400 dark:hover:border-gray-500'
-      }`}
+      className={`relative border-2 border-dashed rounded-2xl p-8 text-center transition-all duration-300 ${dragging
+        ? 'border-indigo-500 bg-indigo-50/80 dark:bg-indigo-900/30 scale-[1.01]'
+        : 'border-gray-300 dark:border-gray-600 hover:border-indigo-300 dark:hover:border-indigo-700 bg-gray-50/50 dark:bg-gray-800/30'
+        }`}
     >
       {uploading ? (
         <div>
