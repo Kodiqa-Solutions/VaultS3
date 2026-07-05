@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback } from 'react'
 import { uploadFiles, type UploadResult } from '../api/objects'
+import { getToken } from '../api/client'
 
 interface Props {
   bucket: string
@@ -88,7 +89,7 @@ export default function UploadDropzone({ bucket, prefix, onUploaded }: Props) {
           formData.append('file', new File([file], relPath, { type: file.type }))
         }
 
-        const token = localStorage.getItem('vaults3_token')
+        const token = getToken()
         const xhr = new XMLHttpRequest()
         xhr.open('POST', `/api/v1/buckets/${bucket}/upload?prefix=${encodeURIComponent(prefix)}`)
         if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)

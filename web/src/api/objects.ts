@@ -1,4 +1,4 @@
-import { apiFetch } from './client'
+import { apiFetch, getToken } from './client'
 
 export interface ObjectItem {
   key: string
@@ -49,12 +49,12 @@ export function bulkDeleteObjects(bucket: string, keys: string[]): Promise<BulkD
 }
 
 export function getDownloadUrl(bucket: string, key: string): string {
-  const token = localStorage.getItem('vaults3_token')
+  const token = getToken()
   return `/api/v1/buckets/${bucket}/download/${key}?token=${token}`
 }
 
 export function getDownloadZipUrl(bucket: string, keys: string[]): string {
-  const token = localStorage.getItem('vaults3_token')
+  const token = getToken()
   return `/api/v1/buckets/${bucket}/download-zip?keys=${encodeURIComponent(keys.join(','))}&token=${token}`
 }
 
@@ -70,7 +70,7 @@ export function uploadFiles(
       formData.append('file', file)
     }
 
-    const token = localStorage.getItem('vaults3_token')
+    const token = getToken()
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/v1/buckets/${bucket}/upload?prefix=${encodeURIComponent(prefix)}`)
     if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)

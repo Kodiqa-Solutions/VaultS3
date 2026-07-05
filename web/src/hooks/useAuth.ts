@@ -1,13 +1,14 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
 import { createElement } from 'react'
 import { login as apiLogin, oidcLogin as apiOIDCLogin, getMe, type MeResponse } from '../api/auth'
+import { getToken, setToken, clearToken } from '../api/client'
 
 interface AuthContextType {
   token: string | null
   user: MeResponse | null
   isAuthenticated: boolean
   isLoading: boolean
-  login: (accessKey: string, secretKey: string) => Promise<void>
+  login: (accessKey: string, secretKey: string, remember?: boolean) => Promise<void>
   loginWithOIDC: (idToken: string) => Promise<void>
   logout: () => void
 }
@@ -15,7 +16,7 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem('vaults3_token'))
+  const [token, setTokenState] = useState<string | null>(() => getToken())
   const [user, setUser] = useState<MeResponse | null>(null)
   const [isLoading, setIsLoading] = useState(!!token)
 
@@ -24,32 +25,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       getMe()
         .then(setUser)
         .catch(() => {
-          localStorage.removeItem('vaults3_token')
-          setToken(null)
+          clearToken()
+          setTokenState(null)
         })
         .finally(() => setIsLoading(false))
     }
   }, [token])
 
-  const login = useCallback(async (accessKey: string, secretKey: string) => {
+  const login = useCallback(async (accessKey: string, secretKey: string, remember = false) => {
     const res = await apiLogin(accessKey, secretKey)
-    localStorage.setItem('vaults3_token', res.token)
-    setToken(res.token)
+    setToken(res.token, remember)
+    setTokenState(res.token)
     const me = await getMe()
     setUser(me)
   }, [])
 
   const loginWithOIDC = useCallback(async (idToken: string) => {
     const res = await apiOIDCLogin(idToken)
-    localStorage.setItem('vaults3_token', res.token)
-    setToken(res.token)
+    setToken(res.token, true)
+    setTokenState(res.token)
     const me = await getMe()
     setUser(me)
   }, [])
 
   const logout = useCallback(() => {
-    localStorage.removeItem('vaults3_token')
-    setToken(null)
+    clearToken()
+    setTokenState(null)
     setUser(null)
   }, [])
 
