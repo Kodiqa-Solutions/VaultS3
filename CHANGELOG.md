@@ -5,6 +5,24 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+### Security
+- Dashboard dependencies updated to clear two high-severity advisories:
+  `react-router` / `react-router-dom` 7.18.1 to 7.18.2 (GHSA-qwww-vcr4-c8h2, a
+  CSRF bypass in the unstable RSC code paths) and `nanoid` 3.3.16 to 3.3.18
+  (GHSA-2v37-7h3g-55p8) via `postcss`. Neither was reachable in VaultS3: the
+  dashboard does not use React Router's RSC APIs, and `postcss` is a
+  build-time-only devDependency, so `nanoid` never reaches the browser bundle.
+  Lockfile only, no source changes. `npm audit` now reports 0 vulnerabilities.
+
+### Documentation
+- Recorded the first real-world cluster memory measurement and separated it from
+  the single-node figure: 64 MiB objects under sustained PUT load cost ~20 MiB of
+  `anon` on one node but ~1.85 GiB on a 12-pod cluster member (user-reported on
+  4.4.51), because a clustered node also forwards bodies to the owner and fans
+  replicas out to peers. The `<80 MB RAM` headline is explicitly a small
+  single-node figure; size cluster pods from your own measurement, and measure a
+  restart as well as a load test.
+
 
 ## [4.4.51] - 2026-08-08
 ### Fixed

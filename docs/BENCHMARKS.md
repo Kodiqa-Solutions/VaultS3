@@ -101,11 +101,29 @@ buffers proportional to the part or object it is moving. Measure at the object
 size and concurrency you actually run, and size container limits from that number
 rather than from an idle reading.
 
-For scale, measured on a 3-pod cluster (`replica_count: 1`, zstd, 4 GiB per pod)
-with 64 MiB objects at 32 concurrent uploads: worst-pod peak was **3.3 GiB before
-4.4.48 (which OOM-killed a pod) and 2.7 GiB after**, when uploads stopped being
-buffered whole (issue #46). Comparing a memory number across versions is only
-meaningful with the same object size, concurrency and codec on both sides.
+Comparing a memory number across versions is only meaningful with the same object
+size, concurrency and codec on both sides.
+
+**A single node and a cluster member are not the same measurement.** Two figures
+for 64 MiB objects, both `anon`, both under sustained PUT load:
+
+| deployment | concurrency | peak `anon` |
+|---|---|---|
+| single node, 4 GiB limit | 64 | **~20 MiB** |
+| 12-pod cluster, 8 GiB per pod (user-reported, 4.4.51) | 48 | **~1.85 GiB** |
+
+The gap is not explained by object size or codec, so treat the single-node number
+as a floor rather than a guide for a cluster: a clustered node also forwards
+bodies to the owner and fans replicas out to peers. **Size cluster pods from your
+own measurement, not from the single-node figure or the README's small-deploy
+claim.**
+
+**Startup is a separate peak from steady state.** A node installing a Raft
+snapshot on join or restart allocates for that restore; before 4.4.51 it did so in
+one transaction and scaled with the total object count (2175 MiB at 1.6M objects),
+which OOM-killed pods before they served anything. From 4.4.51 it is bounded
+(~66 MiB at the same size). If you are sizing limits, measure a **restart**, not
+just a load test.
 
 ---
 

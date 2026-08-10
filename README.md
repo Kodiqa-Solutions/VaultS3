@@ -83,7 +83,7 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 
 - **S3-compatible API**: Works with any S3 client (AWS CLI, mc, boto3, minio-js, s3fs), including directory-marker objects (`folder/` keys) so tools that represent folders as zero-byte objects work correctly
 - **Single binary**: One file, no runtime dependencies, no Docker required
-- **Low memory**: Targets <80MB RAM (vs MinIO's 300-500MB)
+- **Low memory**: Targets <80MB RAM for a small single-node deploy (vs MinIO's 300-500MB). A clustered node under sustained large-object load costs more, because it also forwards bodies to the owner and fans replicas out to peers, so size cluster pods from your own measurement, see the [benchmarks guide](docs/BENCHMARKS.md)
 - **BoltDB metadata**: Embedded key-value store, no external database needed
 - **S3 Signature V4**: Standard AWS authentication
 - **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault or local key provider) encryption modes
