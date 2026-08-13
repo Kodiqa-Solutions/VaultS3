@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"fmt"
 	"io"
 )
 
-// EncryptedEngine wraps another Engine and encrypts/decrypts data transparently.
-// Uses AES-256-GCM with a random 12-byte nonce prepended to the ciphertext.
+// EncryptedEngine wraps another Engine and encrypts/decrypts data transparently
+// with AES-256-GCM.
+//
+// Writes use the chunked streaming format (see streamcrypt.go) so neither a PUT
+// nor a GET holds more than a chunk of the object. Objects written by earlier
+// versions used one GCM seal over the whole object and are still read, by the
+// legacy path, which necessarily buffers because a single tag covers everything
+// (issue #49).
 type EncryptedEngine struct {
 	inner Engine
 	gcm   cipher.AEAD
+	key   []byte
 }
 
 // NewEncryptedEngine creates an encrypting wrapper around the given engine.
@@ -33,7 +39,7 @@ func NewEncryptedEngine(inner Engine, key []byte) (*EncryptedEngine, error) {
 		return nil, fmt.Errorf("create GCM: %w", err)
 	}
 
-	return &EncryptedEngine{inner: inner, gcm: gcm}, nil
+	return &EncryptedEngine{inner: inner, gcm: gcm, key: append([]byte(nil), key...)}, nil
 }
 
 func (e *EncryptedEngine) CreateBucketDir(bucket string) error {
@@ -44,8 +50,9 @@ func (e *EncryptedEngine) DeleteBucketDir(bucket string) error {
 	return e.inner.DeleteBucketDir(bucket)
 }
 
-// maxEncryptedSize is the maximum object size for in-memory encryption (1GB).
-// Larger objects risk OOM due to 3x RAM amplification (plaintext + ciphertext + output).
+// maxEncryptedSize bounds the objects that still use the whole-object format:
+// those written before the streaming format existed, which have to be held in
+// memory to be authenticated. New writes stream and have no such limit.
 const maxEncryptedSize int64 = 1 * 1024 * 1024 * 1024
 
 func (e *EncryptedEngine) PutObject(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
@@ -53,66 +60,38 @@ func (e *EncryptedEngine) PutObject(bucket, key string, reader io.Reader, size i
 		// Directory markers hold no bytes; store as a plain directory, no crypto.
 		return e.inner.PutObject(bucket, key, reader, size)
 	}
-	if size > maxEncryptedSize {
-		return 0, "", fmt.Errorf("object too large for encryption (max %dMB)", maxEncryptedSize/(1024*1024))
-	}
-	// Read all plaintext into memory for encryption
-	plaintext, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1))
-	if err != nil {
-		return 0, "", fmt.Errorf("read plaintext: %w", err)
-	}
-
-	// Generate random nonce
-	nonce := make([]byte, e.gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return 0, "", fmt.Errorf("generate nonce: %w", err)
-	}
-
-	// Encrypt: nonce + ciphertext (includes GCM auth tag)
-	ciphertext := e.gcm.Seal(nil, nonce, plaintext, nil)
-	encrypted := append(nonce, ciphertext...)
-
-	// Write encrypted data to inner engine
-	written, etag, err := e.inner.PutObject(bucket, key, bytes.NewReader(encrypted), int64(len(encrypted)))
-	if err != nil {
-		return 0, "", err
-	}
-	_ = written
-
-	// Return original plaintext size and etag
-	return int64(len(plaintext)), etag, nil
+	return sealStreamToEngine(e.key, 0, reader, size, func(sealed io.Reader, storedSize int64) (int64, string, error) {
+		return e.inner.PutObject(bucket, key, sealed, storedSize)
+	})
 }
 
 func (e *EncryptedEngine) GetObject(bucket, key string) (ReadSeekCloser, int64, error) {
 	if IsDirMarker(key) {
 		return e.inner.GetObject(bucket, key)
 	}
-	reader, _, err := e.inner.GetObject(bucket, key)
+	reader, stored, err := e.inner.GetObject(bucket, key)
 	if err != nil {
 		return nil, 0, err
 	}
+	return e.decrypt(reader, stored)
+}
+
+// decrypt picks the format from the blob itself: a VS3S header means the object
+// streams, anything else is the original whole-object format.
+func (e *EncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	if h, ok := peekStreamHeader(reader); ok {
+		sr, err := newStreamReader(reader, stored, h, e.key)
+		if err != nil {
+			reader.Close()
+			return nil, 0, fmt.Errorf("open encrypted stream: %w", err)
+		}
+		return sr, sr.Size(), nil
+	}
 	defer reader.Close()
-
-	// Read all encrypted data (capped to max encrypted size + overhead)
-	maxRead := maxEncryptedSize + int64(e.gcm.NonceSize()) + 16 + 1 // nonce + GCM tag + 1
-	encrypted, err := io.ReadAll(io.LimitReader(reader, maxRead))
-	if err != nil {
-		return nil, 0, fmt.Errorf("read encrypted data: %w", err)
-	}
-
-	nonceSize := e.gcm.NonceSize()
-	if len(encrypted) < nonceSize {
-		return nil, 0, fmt.Errorf("encrypted data too short")
-	}
-
-	nonce := encrypted[:nonceSize]
-	ciphertext := encrypted[nonceSize:]
-
-	plaintext, err := e.gcm.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := openLegacyWhole(reader, stored, e.gcm)
 	if err != nil {
 		return nil, 0, fmt.Errorf("decrypt: %w", err)
 	}
-
 	return &bytesReadSeekCloser{Reader: bytes.NewReader(plaintext)}, int64(len(plaintext)), nil
 }
 
@@ -140,58 +119,17 @@ func (e *EncryptedEngine) BucketSize(bucket string) (int64, int64, error) {
 }
 
 func (e *EncryptedEngine) PutObjectVersion(bucket, key, versionID string, reader io.Reader, size int64) (int64, string, error) {
-	if size > maxEncryptedSize {
-		return 0, "", fmt.Errorf("object too large for encryption (max %dMB)", maxEncryptedSize/(1024*1024))
-	}
-	plaintext, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1))
-	if err != nil {
-		return 0, "", fmt.Errorf("read plaintext: %w", err)
-	}
-
-	nonce := make([]byte, e.gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return 0, "", fmt.Errorf("generate nonce: %w", err)
-	}
-
-	ciphertext := e.gcm.Seal(nil, nonce, plaintext, nil)
-	encrypted := append(nonce, ciphertext...)
-
-	written, etag, err := e.inner.PutObjectVersion(bucket, key, versionID, bytes.NewReader(encrypted), int64(len(encrypted)))
-	if err != nil {
-		return 0, "", err
-	}
-	_ = written
-
-	return int64(len(plaintext)), etag, nil
+	return sealStreamToEngine(e.key, 0, reader, size, func(sealed io.Reader, storedSize int64) (int64, string, error) {
+		return e.inner.PutObjectVersion(bucket, key, versionID, sealed, storedSize)
+	})
 }
 
 func (e *EncryptedEngine) GetObjectVersion(bucket, key, versionID string) (ReadSeekCloser, int64, error) {
-	reader, _, err := e.inner.GetObjectVersion(bucket, key, versionID)
+	reader, stored, err := e.inner.GetObjectVersion(bucket, key, versionID)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer reader.Close()
-
-	maxRead := maxEncryptedSize + int64(e.gcm.NonceSize()) + 16 + 1
-	encrypted, err := io.ReadAll(io.LimitReader(reader, maxRead))
-	if err != nil {
-		return nil, 0, fmt.Errorf("read encrypted data: %w", err)
-	}
-
-	nonceSize := e.gcm.NonceSize()
-	if len(encrypted) < nonceSize {
-		return nil, 0, fmt.Errorf("encrypted data too short")
-	}
-
-	nonce := encrypted[:nonceSize]
-	ciphertext := encrypted[nonceSize:]
-
-	plaintext, err := e.gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, 0, fmt.Errorf("decrypt: %w", err)
-	}
-
-	return &bytesReadSeekCloser{Reader: bytes.NewReader(plaintext)}, int64(len(plaintext)), nil
+	return e.decrypt(reader, stored)
 }
 
 func (e *EncryptedEngine) DeleteObjectVersion(bucket, key, versionID string) error {

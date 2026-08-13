@@ -138,7 +138,13 @@ func New(cfg *config.Config) (*Server, error) {
 	var engine storage.Engine = fs
 	var perBucketEngine *storage.PerBucketEngine
 
-	// Wrap with compression if enabled (compress before encrypt)
+	// Compression is wrapped first, which makes encryption the OUTER engine: a
+	// write is encrypted and then handed to the compressor. That is the reverse
+	// of what this comment used to claim, and it means compression saves nothing
+	// when encryption is on, since ciphertext does not compress (measured 1.00x
+	// on a highly repetitive payload). Swapping the order would fix that but
+	// changes the on-disk layering, so existing objects would need format
+	// detection in both directions; left as its own change.
 	if cfg.Compression.Enabled {
 		engine = storage.NewCompressedEngine(engine)
 		// Writes are zstd; gzip is still decoded on read for objects written by

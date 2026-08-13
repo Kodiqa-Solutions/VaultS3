@@ -49,6 +49,11 @@ auth:
   admin_secret_key: "vaults3-secret-change-me"
 
 encryption:
+  # AES-256-GCM at rest. Objects are sealed in 1 MiB chunks, so a read costs a
+  # chunk of memory rather than a copy of the object and each chunk is verified
+  # before its bytes are served. Objects written before 4.4.53 use the older
+  # whole-object format: still readable, but a read of one costs its own size,
+  # so rewrite large ones if pod memory is tight.
   enabled: false
   key: "" # hex-encoded 32-byte key (64 hex chars)
   # Per-bucket encryption: with per_bucket true, `key` becomes the master KEK that

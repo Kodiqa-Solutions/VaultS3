@@ -605,10 +605,27 @@ backup:
   peaks at ~1.4 GiB (issue #46). Digests are computed as the bytes flow past, so
   nothing is retained to validate them.
 
-  Two paths still buffer a whole object by nature and should be sized for: SSE-C
-  (customer-key encryption seals the object as one message) and an upload whose
-  length is not declared up front (the compressor cannot record the frame size
-  without it). Multipart uploads are bounded by part size, not object size.
+  **Reads with encryption at rest were the mirror image of this, and are fixed in
+  4.4.53** (issue #49). Encryption sealed each object as a single AES-GCM
+  message, which cannot be decrypted incrementally, so every `GET` allocated the
+  ciphertext and the plaintext before the first byte went out: memory scaled with
+  **object size x concurrent readers** while the object count was irrelevant.
+  Measured on one node with a 643 MiB object, 3 GiB limit: 4.4.52 peaked at
+  **2661 MiB for a single reader and was OOM-killed by the second**, where 4.4.53
+  peaks at **15 MiB for one reader and 31 MiB for eight**. Writes improved with
+  it (2010 MiB to 15 MiB for the same object). Objects are now sealed in 1 MiB
+  chunks, each authenticated before its bytes are served.
+
+  Objects written before 4.4.53 keep the old format and are still read, but a
+  read of one still costs about its own size (one tag covers the whole object, so
+  nothing can be released until all of it is verified). Rewriting an object
+  migrates it. If you have large encrypted objects from an earlier version and
+  tight pod limits, copy them in place to convert them.
+
+  Two paths still buffer a whole object and should be sized for: SSE-C
+  (customer-key encryption still seals the object as one message) and an upload
+  whose length is not declared up front (the compressor cannot record the frame
+  size without it). Multipart uploads are bounded by part size, not object size.
 
   Size per-pod memory for concurrency x part/object size plus headroom. If OOMKills
   persist after 4.4.48, that is worth reporting rather than only raising the limit.

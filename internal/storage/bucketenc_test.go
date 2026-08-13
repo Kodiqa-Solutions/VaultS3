@@ -49,10 +49,10 @@ func TestPerBucketEngine_EncryptedVsOptOut(t *testing.T) {
 	if got := getPlain(t, pe, "tenant-a", "f.txt"); !bytes.Equal(got, secret) {
 		t.Fatalf("round-trip mismatch: %q", got)
 	}
-	// On disk it is encrypted (per-bucket header, plaintext absent).
+	// On disk it is encrypted (streaming-format header, plaintext absent).
 	raw, _ := os.ReadFile(fs.ObjectPath("tenant-a", "f.txt"))
-	if !bytes.HasPrefix(raw, []byte("VS3X")) {
-		t.Fatal("encrypted bucket object should carry the per-bucket header on disk")
+	if !bytes.HasPrefix(raw, []byte(streamMagic)) {
+		t.Fatalf("encrypted bucket object should carry the streaming header on disk, got %q", raw[:min(4, len(raw))])
 	}
 	if bytes.Contains(raw, secret) {
 		t.Fatal("plaintext leaked to disk")

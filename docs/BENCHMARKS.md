@@ -101,6 +101,28 @@ buffers proportional to the part or object it is moving. Measure at the object
 size and concurrency you actually run, and size container limits from that number
 rather than from an idle reading.
 
+**Benchmark the features you run, not just the defaults.** Wrapper engines change
+the memory profile completely, and a default-config run will not show it. One
+node, 256 MiB objects, 3 GiB limit, peak `anon` by concurrent readers:
+
+| configuration | c=1 | c=4 | c=8 |
+|---|---|---|---|
+| default (no encryption/compression) | 15 MiB | 15 MiB | 16 MiB |
+| compression on | 33 MiB | 62 MiB | 98 MiB |
+| erasure coding on | 719 MiB | 719 MiB | 719 MiB |
+| encryption on, 4.4.52 | 847 MiB | 2348 MiB | **OOMKilled** |
+| encryption on, 4.4.53 | 19 MiB | 25 MiB | 29 MiB |
+
+The 4.4.52 encryption row is issue #49: reads scaled with object size times
+concurrency. It is also why an encryption benchmark must vary concurrency, since
+the c=1 figure alone looks merely large rather than fatal.
+
+Read the erasure row carefully: it is high but **flat**, because that cost is the
+write path (which still assembles the object to shard it), not the read. Only a
+row that climbs with concurrency is a per-reader cost. Combinations behave the
+same way, measured on 4.4.53 with a 128 MiB object at 8 readers: encryption plus
+compression 45 MiB, encryption plus erasure 348 MiB and flat from c=1.
+
 Comparing a memory number across versions is only meaningful with the same object
 size, concurrency and codec on both sides.
 

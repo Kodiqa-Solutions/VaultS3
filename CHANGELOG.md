@@ -4,7 +4,48 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
-## [Unreleased]
+## [4.4.53] - 2026-08-13
+### Fixed
+- **Encrypted reads no longer allocate in proportion to object size**, which is
+  what OOM-killed replicas serving a large object to a handful of concurrent
+  readers (issue #49, reported by vikram-a-m). Encryption at rest sealed each
+  object as one AES-256-GCM message. A single tag over the whole object cannot be
+  verified incrementally, so every `GET` read the entire ciphertext and allocated
+  the entire plaintext before sending a byte, and peak memory scaled with object
+  size times concurrent readers. Object count never mattered, which is why 32
+  concurrent readers of 2.2 MiB objects were fine while 8 readers of one 643 MiB
+  object were not.
+  - Objects are now sealed in 1 MiB chunks (the STREAM construction used by age
+    and Tink: the nonce binds each chunk to its index and marks the final one, so
+    chunks cannot be reordered and truncation is detected). Each chunk is
+    authenticated before any of its bytes are served, so no unverified plaintext
+    reaches a client.
+  - Measured on one node, 643 MiB object, 3 GiB limit: peak `anon` went from
+    **2661 MiB with a single reader, OOMKilled at two**, to **15 MiB at one
+    reader and 31 MiB at eight**. Writes improved with it, 2010 MiB to 15 MiB.
+  - Applies to SSE-S3, SSE-KMS and per-bucket encryption. The 1 GiB object-size
+    cap on encryption no longer applies to newly written objects.
+  - A full read never seeks the underlying reader. That matters on a bucket that
+    is both compressed and encrypted, where a single seek makes the decompressor
+    materialise the whole object (the codecs are not seekable): 128 MiB at 8
+    readers costs 45 MiB rather than 2257 MiB.
+  - **Objects written by earlier versions are still read.** They keep the
+    whole-object format, so reading one still costs roughly its own size;
+    rewriting an object migrates it to the streaming format. Reading the old
+    format now takes one copy rather than three.
+  - Not covered: SSE-C (customer-supplied keys) still seals an object as one
+    message and still buffers it.
+
+### Documentation
+- Corrected a long-standing README and code claim that data is "compressed then
+  encrypted". The wrapping is the other way round, so the compressor only ever
+  sees ciphertext and **compression saves nothing while encryption at rest is
+  enabled** (measured 1.00x on a highly repetitive 1.12 MB payload). Enabling
+  both costs CPU for no saving. Behaviour is unchanged, and pre-dates this
+  release; reordering the two would change the on-disk layering and needs its own
+  change.
+
+## [4.4.52] - 2026-08-10
 ### Security
 - Dashboard dependencies updated to clear two high-severity advisories:
   `react-router` / `react-router-dom` 7.18.1 to 7.18.2 (GHSA-qwww-vcr4-c8h2, a

@@ -33,52 +33,62 @@ func (e *KMSEncryptedEngine) DeleteBucketDir(bucket string) error {
 	return e.inner.DeleteBucketDir(bucket)
 }
 
+// dataKey fetches the DEK the streaming format seals with. The KMS caches it, so
+// this is not a round trip per request.
+func (e *KMSEncryptedEngine) dataKey() ([]byte, error) {
+	return e.kms.GetDataKey(e.keyName)
+}
+
+// decrypt serves a stored blob, streaming when it carries a VS3S header and
+// falling back to the whole-object KMS path for objects written before it.
+func (e *KMSEncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	if h, ok := peekStreamHeader(reader); ok {
+		dek, err := e.dataKey()
+		if err != nil {
+			reader.Close()
+			return nil, 0, fmt.Errorf("kms key: %w", err)
+		}
+		sr, err := newStreamReader(reader, stored, h, dek)
+		if err != nil {
+			reader.Close()
+			return nil, 0, fmt.Errorf("open encrypted stream: %w", err)
+		}
+		return sr, sr.Size(), nil
+	}
+	defer reader.Close()
+	encrypted, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1024))
+	if err != nil {
+		return nil, 0, fmt.Errorf("read encrypted: %w", err)
+	}
+	plaintext, err := e.kms.Decrypt(e.keyName, encrypted)
+	if err != nil {
+		return nil, 0, fmt.Errorf("kms decrypt: %w", err)
+	}
+	return &bytesReadSeekCloser{Reader: bytes.NewReader(plaintext)}, int64(len(plaintext)), nil
+}
+
 func (e *KMSEncryptedEngine) PutObject(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
 	if IsDirMarker(key) {
 		return e.inner.PutObject(bucket, key, reader, size)
 	}
-	if size > maxEncryptedSize {
-		return 0, "", fmt.Errorf("object too large for encryption (max %dMB)", maxEncryptedSize/(1024*1024))
-	}
-	plaintext, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1))
+	dek, err := e.dataKey()
 	if err != nil {
-		return 0, "", fmt.Errorf("read plaintext: %w", err)
+		return 0, "", fmt.Errorf("kms key: %w", err)
 	}
-
-	encrypted, err := e.kms.Encrypt(e.keyName, plaintext)
-	if err != nil {
-		return 0, "", fmt.Errorf("kms encrypt: %w", err)
-	}
-
-	written, etag, err := e.inner.PutObject(bucket, key, bytes.NewReader(encrypted), int64(len(encrypted)))
-	if err != nil {
-		return 0, "", err
-	}
-	_ = written
-	return int64(len(plaintext)), etag, nil
+	return sealStreamToEngine(dek, 0, reader, size, func(sealed io.Reader, storedSize int64) (int64, string, error) {
+		return e.inner.PutObject(bucket, key, sealed, storedSize)
+	})
 }
 
 func (e *KMSEncryptedEngine) GetObject(bucket, key string) (ReadSeekCloser, int64, error) {
 	if IsDirMarker(key) {
 		return e.inner.GetObject(bucket, key)
 	}
-	reader, _, err := e.inner.GetObject(bucket, key)
+	reader, stored, err := e.inner.GetObject(bucket, key)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer reader.Close()
-
-	encrypted, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1024))
-	if err != nil {
-		return nil, 0, fmt.Errorf("read encrypted: %w", err)
-	}
-
-	plaintext, err := e.kms.Decrypt(e.keyName, encrypted)
-	if err != nil {
-		return nil, 0, fmt.Errorf("kms decrypt: %w", err)
-	}
-
-	return &bytesReadSeekCloser{Reader: bytes.NewReader(plaintext)}, int64(len(plaintext)), nil
+	return e.decrypt(reader, stored)
 }
 
 func (e *KMSEncryptedEngine) DeleteObject(bucket, key string) error {
@@ -102,45 +112,21 @@ func (e *KMSEncryptedEngine) BucketSize(bucket string) (int64, int64, error) {
 }
 
 func (e *KMSEncryptedEngine) PutObjectVersion(bucket, key, versionID string, reader io.Reader, size int64) (int64, string, error) {
-	if size > maxEncryptedSize {
-		return 0, "", fmt.Errorf("object too large for encryption (max %dMB)", maxEncryptedSize/(1024*1024))
-	}
-	plaintext, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1))
+	dek, err := e.dataKey()
 	if err != nil {
-		return 0, "", fmt.Errorf("read plaintext: %w", err)
+		return 0, "", fmt.Errorf("kms key: %w", err)
 	}
-
-	encrypted, err := e.kms.Encrypt(e.keyName, plaintext)
-	if err != nil {
-		return 0, "", fmt.Errorf("kms encrypt: %w", err)
-	}
-
-	written, etag, err := e.inner.PutObjectVersion(bucket, key, versionID, bytes.NewReader(encrypted), int64(len(encrypted)))
-	if err != nil {
-		return 0, "", err
-	}
-	_ = written
-	return int64(len(plaintext)), etag, nil
+	return sealStreamToEngine(dek, 0, reader, size, func(sealed io.Reader, storedSize int64) (int64, string, error) {
+		return e.inner.PutObjectVersion(bucket, key, versionID, sealed, storedSize)
+	})
 }
 
 func (e *KMSEncryptedEngine) GetObjectVersion(bucket, key, versionID string) (ReadSeekCloser, int64, error) {
-	reader, _, err := e.inner.GetObjectVersion(bucket, key, versionID)
+	reader, stored, err := e.inner.GetObjectVersion(bucket, key, versionID)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer reader.Close()
-
-	encrypted, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1024))
-	if err != nil {
-		return nil, 0, fmt.Errorf("read encrypted: %w", err)
-	}
-
-	plaintext, err := e.kms.Decrypt(e.keyName, encrypted)
-	if err != nil {
-		return nil, 0, fmt.Errorf("kms decrypt: %w", err)
-	}
-
-	return &bytesReadSeekCloser{Reader: bytes.NewReader(plaintext)}, int64(len(plaintext)), nil
+	return e.decrypt(reader, stored)
 }
 
 func (e *KMSEncryptedEngine) DeleteObjectVersion(bucket, key, versionID string) error {

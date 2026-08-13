@@ -81,7 +81,27 @@ object payload (AES-256-GCM, per-object random nonce)
 ### Object on-disk format
 
 New encrypted objects are self-describing so decryption can pick the right key
-version and so legacy/plaintext objects are distinguishable:
+version and so legacy/plaintext objects are distinguishable.
+
+**From 4.4.53 the written format is chunked** (`VS3S`), because sealing an object
+as one AEAD message forced every read to hold the whole object in memory and
+OOM-killed nodes serving large objects to concurrent readers (issue #49):
+
+```
+┌──────────┬────────┬─────────────┬────────────┬──────────────┬─────────────────────┐
+│ magic    │ format │ key version │ chunk size │ nonce prefix │ chunks              │
+│ "VS3S"(4)│ 1 byte │ uint32 (4)  │ uint32 (4) │ 7 bytes      │ [ct + 16-byte tag]* │
+└──────────┴────────┴─────────────┴────────────┴──────────────┴─────────────────────┘
+```
+
+Each chunk's nonce is `prefix || chunkIndex(4) || finalFlag(1)`, so chunks cannot
+be reordered or transplanted between objects and truncation is detected. A
+plaintext ending exactly on a chunk boundary is followed by an empty final chunk,
+so every object carries an authenticated end-of-stream marker. The plaintext
+length is derived from the stored length alone.
+
+The previous format, still written before 4.4.53 and still read, sealed the whole
+object as one message:
 
 ```
 ┌──────────┬──────────┬──────────────┬───────────┬──────────────────┐
@@ -90,9 +110,10 @@ version and so legacy/plaintext objects are distinguishable:
 └──────────┴──────────┴──────────────┴───────────┴──────────────────┘
 ```
 
-- On read, if the blob starts with `VS3X`, decrypt with the bucket's DEK for the
-  embedded **key version**.
-- If it does **not** start with the magic, it is either a legacy global-key object
+- On read, `VS3S` or `VS3X` both decrypt with the bucket's DEK for the embedded
+  **key version**. Key version 0 in a `VS3S` blob means it was sealed with a
+  server-wide key (per-bucket versions start at 1), so it routes to the legacy key.
+- If it starts with neither magic, it is either a legacy global-key object
   (decrypt with the legacy engine key if configured) or plaintext (opt-out bucket)
 , handled by the integration layer.
 

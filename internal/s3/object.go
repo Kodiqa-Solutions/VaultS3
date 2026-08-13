@@ -554,9 +554,12 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	var err error
 	var plainSize int64
 	if ssecKey != nil {
-		// SSE-C seals the object as one AEAD message, so this path genuinely needs
-		// the whole plaintext in memory and keeps buffering. It is opt-in and
-		// per-request, so it does not put the general large-object path at risk.
+		// SSE-C still seals the object as one AEAD message and so still buffers it.
+		// That is now a gap rather than a necessity: the chunked format in
+		// internal/storage/streamcrypt.go would bound this too, but SSE-C keys are
+		// per-request and the stored format would need the same read-both-formats
+		// migration, so it is left for its own change. Memory here scales with
+		// object size times concurrent SSE-C requests (the shape of issue #49).
 		body, rerr := io.ReadAll(digests)
 		if rerr != nil {
 			writeS3Error(w, "InternalError", "Failed to read request body", http.StatusInternalServerError)
@@ -730,6 +733,7 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 
 	// SSE-C: object was encrypted with a customer-provided key. Require + verify it,
 	// then decrypt into an in-memory reader so range/part logic runs on plaintext.
+	// This buffers the whole object; see the note on the SSE-C write path.
 	if meta != nil && meta.SSECustomerKeyMD5 != "" {
 		ssecKey, perr := parseSSECHeaders(r)
 		if perr != nil || ssecKey == nil {

@@ -86,7 +86,7 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 - **Low memory**: Targets <80MB RAM for a small single-node deploy (vs MinIO's 300-500MB). A clustered node under sustained large-object load costs more, because it also forwards bodies to the owner and fans replicas out to peers, so size cluster pods from your own measurement, see the [benchmarks guide](docs/BENCHMARKS.md)
 - **BoltDB metadata**: Embedded key-value store, no external database needed
 - **S3 Signature V4**: Standard AWS authentication
-- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault or local key provider) encryption modes
+- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault or local key provider) encryption modes. Objects are sealed in 1 MiB chunks, so encrypted reads stream and cost a chunk of memory rather than a copy of the object
 - **Per-bucket encryption keys**: For bucket-per-tenant setups, each bucket can be encrypted with its own key that is **not shared** with other tenants (or opt out and stay plaintext). Envelope encryption (master KEK wraps a per-bucket data key). Opt in per bucket via `PUT /{bucket}?encryption` or the dashboard. Supports key rotation and crypto-shredding. Enable with `encryption.per_bucket: true`, see [design doc](docs/design/per-bucket-encryption.md)
 - **SSE-C (customer-provided keys)**: Operator-blind per-object encryption: the client supplies the key per request (`x-amz-server-side-encryption-customer-*`). The server encrypts/decrypts with it and stores only the key's MD5, never the key
 - **Bucket policies**: Public-read, private, custom S3-compatible JSON policies. Supports the standard AWS `Principal` forms (`"*"`, `{"AWS": "*"}`, `{"AWS": ["*"]}`), wildcard actions, explicit `Deny` precedence, and per-bucket `Resource` matching. Granting `s3:GetObject` to everyone makes objects publicly readable and `s3:ListBucket` makes the listing public, as separate permissions; bucket sub-resources (`?policy`, `?acl`, ...) always require authentication. **Public Access Block** (`BlockPublicPolicy` / `RestrictPublicBuckets`) overrides any policy and blocks anonymous access
@@ -472,7 +472,11 @@ encryption:
     local_key: ""              # hex-encoded fallback key (when provider: "local")
 ```
 
-SSE-KMS fetches data encryption keys from HashiCorp Vault's Transit engine, caches them in memory, and supports key rotation. All objects are encrypted with AES-256-GCM using a random nonce per object.
+SSE-KMS fetches data encryption keys from HashiCorp Vault's Transit engine, caches them in memory, and supports key rotation.
+
+**How objects are sealed.** From 4.4.53 an object is encrypted in 1 MiB chunks, each its own AES-256-GCM message with a nonce derived from a per-object random prefix, the chunk's index, and a flag marking the last chunk. That binding is what makes chunks impossible to reorder or move between objects and makes a truncated object fail to read rather than come back short. Each chunk is authenticated before any of its bytes are served, so a client never receives unverified plaintext.
+
+The practical effect is on memory: a read costs one chunk, not one copy of the object. Before 4.4.53 an object was a single GCM message, which cannot be verified incrementally, so every concurrent reader of a large object held all of it (issue #49). Objects written by earlier versions keep the old format and are still read; rewriting one migrates it. Reading an old-format object still costs about its own size, so rewrite large ones if pod memory is tight.
 
 ### Virtual-Hosted Style URLs
 
@@ -799,7 +803,9 @@ compression:
   enabled: true
 ```
 
-All objects are transparently compressed (zstd) on write and decompressed on read. Objects written by older gzip builds are still read correctly. Works with encryption (data is compressed then encrypted on disk).
+All objects are transparently compressed (zstd) on write and decompressed on read. Objects written by older gzip builds are still read correctly.
+
+**Compression currently has no effect when encryption at rest is enabled.** Encryption wraps compression, so the compressor is handed ciphertext, which does not compress: measured on a 1.12 MB highly repetitive payload with both enabled, the stored object is 1.00x the plaintext. Enabling both costs CPU for no saving. Pick one until this is addressed.
 
 Both directions stream, so a large object costs a compression window rather than a copy of itself: peak memory scales with concurrency, not with concurrency multiplied by object size. An upload that does not declare its length falls back to buffering, because the decompressed size has to be recorded in the frame header for reads to stream.
 
@@ -1458,7 +1464,7 @@ VaultS3 is designed with security in mind:
 - **OIDC SSRF prevention**: Issuer URL validated against loopback, private, and link-local addresses before JWKS discovery
 - **IPv6-safe rate limiting**: Uses `net.SplitHostPort` for correct IP extraction from IPv6 `[::1]:port` addresses
 - **OIDC authorization layer**: Dashboard admin routes (IAM, keys, STS, audit, settings, lambda, backups) restricted to admin user. OIDC users get read-only access
-- **Encryption size cap**: 1GB max object size for encrypted reads/writes prevents OOM from 3x RAM amplification
+- **Chunked encryption**: encrypted objects are sealed a chunk at a time (AES-256-GCM per chunk, nonce bound to chunk index and end-of-stream), so a read is authenticated before any byte is served and costs a chunk of memory rather than a copy of the object. The 1GB cap now applies only to objects still stored in the pre-4.4.53 whole-object format
 - **Compression size cap**: 1GB max decompressed size prevents decompression-bomb DoS (gzip/zstd)
 - **Version path traversal protection**: `versionId` parameter validated against directory escape in version storage
 - **BatchDelete lock enforcement**: Batch delete respects WORM/legal-hold and validates keys against path traversal

@@ -244,6 +244,33 @@ func (m *Manager) dek(bucket string, version int) ([]byte, error) {
 	return d, nil
 }
 
+// CurrentKey returns the bucket's current data key and its version, so a caller
+// that encrypts a stream rather than a buffer can seal chunk by chunk with the
+// same key this package would have used. ok is false for an opted-out bucket,
+// which is stored as plaintext.
+//
+// The key stays inside the process (it is the same unwrapped DEK the cache
+// already holds); handing it out avoids forcing every object through a
+// whole-object Encrypt, which is what made encrypted reads scale with object
+// size (issue #49).
+func (m *Manager) CurrentKey(bucket string) (key []byte, version int, ok bool, err error) {
+	version, _, ok = m.keys.Current(bucket)
+	if !ok {
+		return nil, 0, false, nil
+	}
+	dek, err := m.dek(bucket, version)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return dek, version, true, nil
+}
+
+// KeyForVersion returns the data key for a specific key version, which a reader
+// takes from the blob's header. A shredded or unknown version yields ErrNoKey.
+func (m *Manager) KeyForVersion(bucket string, version int) ([]byte, error) {
+	return m.dek(bucket, version)
+}
+
 // Encrypt encrypts plaintext for a bucket. Buckets without a key are pass-through:
 // the plaintext is returned unchanged and encrypted=false.
 func (m *Manager) Encrypt(bucket string, plaintext []byte) (out []byte, encrypted bool, err error) {
