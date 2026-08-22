@@ -96,6 +96,24 @@ jobs:
           sha256sum *.tar.gz > checksums.txt
           cat checksums.txt
 
+      # Pull this version's CHANGELOG section into the release body. Without it
+      # the release page said only "docker pull", so a release carrying a
+      # breaking change or a security fix announced neither, on the very page
+      # the dashboard's update banner sends people to.
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "notes<<CHANGELOG_EOF"
+            awk -v v="## [$VERSION]" '
+              index($0, v) == 1 { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -104,6 +122,10 @@ jobs:
             artifacts/*.tar.gz
             artifacts/checksums.txt
           body: |
+            ${{ steps.changelog.outputs.notes }}
+
+            ---
+
             ## Installation
 
             **Docker (recommended):**

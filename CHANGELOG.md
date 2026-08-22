@@ -119,6 +119,12 @@ so **upgrade, and read the operator actions at the end of this section.**
 4. If you scrape `/metrics` anonymously and rely on the per-bucket series, either
    send the cluster secret with the scrape or set `metrics.public_bucket_labels`.
 
+Several other fixes tighten authorization and can look like regressions: the
+OIDC implicit flow is off, migrations from private addresses are blocked, STS
+session policies and session tokens are enforced, a copy needs read on its
+source, and IAM conditions are no longer ignored. README's **Upgrading to
+4.4.56** section lists each symptom with its cause and what to do.
+
 ## [4.4.55] - 2026-08-22
 ### Fixed
 - **A freshly downloaded binary would not start.** The release archive ships the

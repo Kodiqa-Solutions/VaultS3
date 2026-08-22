@@ -1683,24 +1683,52 @@ The current/latest version is also exposed at `GET /api/v1/version`.
 
 **This release closes 14 findings from an external security assessment, several
 of them remotely exploitable against a default deployment.** The full list is in
-[CHANGELOG.md](CHANGELOG.md). Four things need your attention:
+[CHANGELOG.md](CHANGELOG.md). Upgrading is strongly recommended, and a few things
+change behaviour, so read this first.
 
-1. **Rotate the admin credentials on any deployment that has ever run with
-   `vaults3-secret-change-me`.** 4.4.55 stopped shipping that secret, but an
-   installation that already booted with it has it persisted, and persisted
-   credentials win over configuration, so upgrading does not replace it. Set
-   `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY`, or change the password from the
-   dashboard.
-2. **Set `cluster.secret` before upgrading a clustered deployment.** Inter-node
-   endpoints are authenticated with it and now fail closed, so a clustered server
-   refuses to start without one. The Helm chart already sets it for you.
-3. **Everyone is logged out once.** The console signing key is now random per
-   installation rather than derived from the admin secret, so existing sessions
-   stop working.
-4. **Non-admin dashboard users are now subject to IAM policies.** The console
-   used to allow any authenticated user into any bucket. If you have non-admin
-   users, give them policies covering the buckets they need, the same ones the S3
-   API already required.
+#### Before you upgrade
+
+**Set `cluster.secret` on every node of a clustered deployment.** This is the one
+change that stops a server booting. Inter-node endpoints authenticate with it and
+now fail closed, so a clustered node with no secret exits at startup with an
+error naming the setting. Use the same value on every node, ideally from a secret
+manager. The Helm chart already derives one, so chart users need do nothing.
+
+```yaml
+cluster:
+  enabled: true
+  secret: "a-shared-value"      # or VAULTS3_CLUSTER_SECRET
+```
+
+Single-node deployments are unaffected.
+
+#### After you upgrade
+
+**Rotate the admin credentials if this installation ever ran with
+`vaults3-secret-change-me`.** 4.4.55 stopped shipping that secret, but an
+installation that already booted with it has it persisted, and persisted
+credentials win over configuration, so upgrading does not replace it. Change it
+from the dashboard, or set `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY`.
+
+**Everyone is logged out once.** The console signing key is now random per
+installation instead of derived from the admin secret, so existing dashboard
+sessions stop working. Users log in again. Nothing else is affected.
+
+#### If something stops working, this is probably why
+
+Each of these was a security fix, and each can look like a regression.
+
+| Symptom | Cause | What to do |
+|---|---|---|
+| A non-admin dashboard user gets 403 on a bucket | The console now enforces IAM policies, as the S3 API always did. Any authenticated user used to reach any bucket | Give the user a policy covering the buckets they need |
+| OIDC login fails | The implicit flow is disabled. The authorization-code flow, which the dashboard uses, is unaffected | Use the code flow, or set `oidc.allow_implicit_flow: true` if your provider supports nothing newer |
+| Per-bucket panels in Prometheus go blank | Anonymous scrapes no longer receive the per-bucket series, which carry bucket names, sizes and counts | Send `X-Cluster-Secret` with the scrape, or set `metrics.public_bucket_labels: true` |
+| A migration from an internal source fails | Loopback, private and link-local destinations are blocked by default, because a caller-supplied endpoint was a server-side request primitive | Re-run the job with private sources allowed |
+| An STS credential has less access than before | Session policies are now enforced. A scoped session used to inherit the full permissions of the user it came from | Widen the session policy if the access was intended |
+| An STS request returns 403 | `X-Amz-Security-Token` is now verified. Standard SDKs send it automatically | Send the session token that was issued with the key |
+| A copy returns 403 | A copy now requires `s3:GetObject` on its source, not only write on the destination | Grant read on the source bucket |
+| An IAM policy now denies what it used to allow | `Condition`, `NotAction` and `NotResource` are now evaluated. They used to be ignored, so a restriction you wrote was not being applied | The policy is now doing what it says. Adjust it if the restriction was not intended |
+| Automation gets 429 on login | Ten failed logins from one address earn a fifteen-minute lockout | Fix the credentials the automation is using |
 
 ### Upgrading to 4.4.55
 
