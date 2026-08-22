@@ -4,6 +4,114 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.56] - 2026-08-22
+### Security
+
+An external white-box assessment of VaultS3 reported 14 findings. All of them are
+addressed here. Several were remotely exploitable against a default deployment,
+so **upgrade, and read the operator actions at the end of this section.**
+
+- **The console signing key is no longer derived from the admin secret.** It was
+  `HMAC-SHA256("vaults3-jwt-signing-key", adminSecret)`, which made the key a
+  function of a credential: anyone who knew the admin secret could mint a
+  `sub=admin` session offline, without ever calling the login endpoint, and reach
+  every admin route. While the shipped default secret was public that was true of
+  every default installation. The key is now 32 random bytes per installation,
+  generated on first start and persisted, and changing the admin password rotates
+  it, which invalidates existing sessions as a password change should.
+- **The console API now enforces per-bucket authorization.** It authorized on
+  "is this JWT valid" plus a short admin allowlist, and nothing else, so any
+  authenticated subject could list, download, upload, overwrite and delete
+  objects in any bucket and change bucket configuration. The S3 API enforced IAM
+  policies on exactly the same data, so a user refused a read over S3 could take
+  the object through the dashboard. Every console route that names a bucket now
+  resolves the caller to an IAM identity and evaluates the equivalent S3 action
+  through the same evaluator the S3 path uses, and the bucket list shows only
+  what the caller may open. With `oidc.auto_create_users` on, this was reachable
+  by anyone with an account at the configured identity provider.
+- **Inter-node endpoints fail closed.** `/cluster/*` and `/_replication/sync`
+  authorized only when a cluster secret was configured, and the shipped
+  configuration set none, so on a default clustered deployment they served
+  anonymous callers on the public S3 port: cluster topology, an object-existence
+  oracle, arbitrary object deletion, destructive reclaim, the full replication
+  change log, and a rogue node joining the Raft quorum, which was demonstrated to
+  take the cluster offline. An unset secret is now a refusal, and
+  **`cluster.secret` is required: a clustered server refuses to start without
+  one.** The same fail-open had been copied into the metadata shard RPC added in
+  4.4.54 and is fixed there too.
+- **Maintenance and cross-bucket routes are admin-only.** `/versions/rollback`,
+  `/versions/tags`, `/reclaim`, `/heal`, `/speedtest`, `/migrate*`, `/search` and
+  `/versions` were reachable by any authenticated subject. Rollback silently
+  rewrote live object content to an arbitrary earlier version, reclaim deletes
+  data files, and search and versions answered across every bucket.
+- **The migration client no longer makes arbitrary server-side requests.** It
+  fetched from any endpoint a caller supplied, so it could be pointed at
+  loopback, the internal network, or the cloud metadata service at
+  169.254.169.254, and the response was reflected in the error message. Those
+  destinations are now blocked at dial time, so a hostname cannot resolve to
+  something harmless during validation and to loopback a moment later, and
+  connection errors are logged rather than returned. Operators migrating from a
+  source on their own network opt back in per migration job.
+- **A copy now authorizes its source.** `CopyObject` and `UploadPartCopy`
+  authorized the destination write only, so a user with write access to one
+  bucket could copy any object out of any other bucket and read it from their
+  own. `s3:GetObject` is now required on the copy source.
+- **IAM `Condition`, `NotAction` and `NotResource` are enforced.** The evaluator
+  on the S3 path matched Action, Resource and Effect and ignored the rest, so a
+  policy scoped to a source IP range was treated as unconditional and a
+  conditional `Deny` did not deny. A complete evaluator already existed and had
+  no callers. It is now the only one, request context (`aws:SourceIp`,
+  `aws:username`) is passed from the S3 handler, and a condition that cannot be
+  evaluated resolves conservatively: an `Allow` does not grant, a `Deny` still
+  blocks.
+- **STS session policies are enforced and session tokens are verified.** A
+  scoped-down session resolved its permissions against the user it was derived
+  from, so it inherited that user's full access and its inline policy was never
+  evaluated, and `X-Amz-Security-Token` was never read at all, so the access key
+  and secret alone were sufficient and any token value, or none, was accepted.
+- **The Prometheus endpoint no longer exposes the bucket inventory anonymously.**
+  Per-bucket series carry bucket names, object counts, sizes and quotas, which is
+  the inventory `ListBuckets` requires credentials for. Anonymous scrapes now get
+  the process-level metrics with those labels withheld. A scrape carrying the
+  cluster secret gets everything, and `metrics.public_bucket_labels` restores the
+  old behaviour.
+- **The credential endpoints are throttled.** `/api/v1/auth/login` had no rate
+  limit, backoff or lockout: 30 wrong passwords in a row all returned 401 with no
+  delay and the correct one worked immediately after. The general rate limiter is
+  off by default and sized for object traffic, so this is separate and always on:
+  10 consecutive failures from an address earn a 15-minute lockout.
+- **The OIDC implicit flow is disabled by default.** `POST /api/v1/auth/oidc`
+  turned any valid ID token for the configured client into a dashboard session
+  with no nonce binding, so a token captured from a URL fragment, or minted by an
+  attacker for their own account, created a session. The authorization-code flow,
+  which binds the token to a login this server started with PKCE and a
+  server-sealed nonce, is unaffected and is what the dashboard uses.
+  `oidc.allow_implicit_flow` re-enables the old path for a provider that supports
+  nothing newer.
+- **JWTs are no longer accepted from the URL on the admin API.** The `?token=`
+  fallback existed for browser download links and applied to every route, so a
+  token that leaked through a proxy log, browser history or a Referer header
+  worked anywhere. It is now accepted only on the download routes that need it.
+- `golang.org/x/text` upgraded to v0.39.0 for CVE-2026-56852, an infinite loop on
+  invalid UTF-8. The package is not imported by application code, so this is
+  supply-chain hygiene rather than a reachable bug.
+
+**Operator actions.**
+
+1. **Rotate the admin credentials on any deployment that has ever run with
+   `vaults3-secret-change-me`.** 4.4.55 stopped shipping that secret, but an
+   installation that already booted with it has it persisted, and persisted
+   credentials win over configuration, so upgrading does not replace it. Set
+   `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY`, or change the password from the
+   dashboard, which now also rotates the signing key.
+2. **Set `cluster.secret` before upgrading a clustered deployment.** A clustered
+   server now refuses to start without one. The Helm chart already derives it
+   from the admin secret, so chart users need no action.
+3. **Every existing dashboard session is invalidated** by the signing-key change.
+   Users log in again once.
+4. If you scrape `/metrics` anonymously and rely on the per-bucket series, either
+   send the cluster secret with the scrape or set `metrics.public_bucket_labels`.
+
 ## [4.4.55] - 2026-08-22
 ### Fixed
 - **A freshly downloaded binary would not start.** The release archive ships the
@@ -18,7 +126,7 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 - **The first thing a new user saw was a URL they could not open.** The startup
   line printed the bind address, so a default install advertised its dashboard
   at `http://0.0.0.0:9000/dashboard/`. A wildcard bind is where the server
-  listens, not somewhere a browser can go; it now prints `127.0.0.1` for a
+  listens, not somewhere a browser can go. It now prints `127.0.0.1` for a
   wildcard.
 - **Relative paths did not work inside the container.** The image set no working
   directory, so `./data` and friends resolved at `/`, which the unprivileged
@@ -48,7 +156,7 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 ### Added
 - **`vaults3 setup`**, an interactive first-run command (issue #51). It asks for
   the data, metadata and log locations, the listen address and port, the admin
-  credentials and any buckets to create at startup; creates the directories;
+  credentials and any buckets to create at startup, creates the directories,
   and writes a config file. It writes only what you chose, so clustering,
   encryption, replication and the rest stay out of the file rather than
   appearing as a wall of disabled blocks. The file is written `0600` because it
@@ -115,7 +223,7 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   are unaffected.
 - **A multi-object delete of 1000 keys with long names could be rejected as
   malformed.** The request body was capped at 256 KiB, under the 1 MiB a legal
-  1000-key request can reach; the cap is now 4 MiB. Same shape as the
+  1000-key request can reach. The cap is now 4 MiB, the same shape as the
   `CompleteMultipartUpload` body cap fixed in 4.4.5.
 - **A follower could not forward a write to its leader unless the API was on port
   9000.** The Raft address carries the raft port and says nothing about the API

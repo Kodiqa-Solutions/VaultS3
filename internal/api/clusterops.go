@@ -248,7 +248,7 @@ func (h *APIHandler) forwardDrain(nodeID string, drain bool) error {
 // gate. state=true ⇒ writable, state=false ⇒ drained.
 func (h *APIHandler) ClusterDrainHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -267,7 +267,7 @@ func (h *APIHandler) ClusterDrainHandler(secret string) http.HandlerFunc {
 // authed; best-effort — a missing file is not an error.
 func (h *APIHandler) ClusterObjectDeleteHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -298,7 +298,7 @@ func (h *APIHandler) ClusterObjectDeleteBatchHandler(secret string) http.Handler
 	// limit; a well-behaved batch is at most 1000 keys (the S3 cap).
 	const maxBatchBody = 4 << 20
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -330,7 +330,7 @@ func (h *APIHandler) ClusterObjectDeleteBatchHandler(secret string) http.Handler
 // unavailable (issue #37, replica_count > 1). Cluster-secret authed.
 func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -362,4 +362,20 @@ func (h *APIHandler) handleClusterRebalance(w http.ResponseWriter, _ *http.Reque
 		running = h.rebalanceRunning()
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "triggered", "running": running})
+}
+
+// clusterAuthOK authorizes an inter-node request, and fails CLOSED.
+//
+// These handlers used to authorize only when a secret was configured, so a
+// cluster running the shipped default, which set none, served every one of them
+// to anonymous callers on the public S3 port: object deletion, reclaim, an
+// existence oracle, multipart state and node inventory. An unset secret is now a
+// refusal rather than a bypass, and the server will not start clustered without
+// one, so reaching this branch means a misconfiguration that has already been
+// reported loudly (security assessment finding 7).
+func clusterAuthOK(r *http.Request, secret string) bool {
+	if secret == "" {
+		return false
+	}
+	return hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret))
 }

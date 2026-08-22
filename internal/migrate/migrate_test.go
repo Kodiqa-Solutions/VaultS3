@@ -120,6 +120,7 @@ func TestMigrateCopiesAllObjects(t *testing.T) {
 	endpoint := stubS3(t, objects)
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 
 	id, err := m.Start(StartConfig{Endpoint: endpoint, AccessKey: "k", SecretKey: "s"})
 	if err != nil {
@@ -161,6 +162,7 @@ func TestMigrateSelectedBucketOnly(t *testing.T) {
 	endpoint := stubS3(t, objects)
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 
 	id, err := m.Start(StartConfig{Endpoint: endpoint, AccessKey: "k", SecretKey: "s", Buckets: []string{"keep"}})
 	if err != nil {
@@ -181,7 +183,8 @@ func TestMigrateSelectedBucketOnly(t *testing.T) {
 
 func TestMigrateTestConnection(t *testing.T) {
 	endpoint := stubS3(t, map[string][]byte{"b1/x": []byte("1"), "b2/y": []byte("2")})
-	m := NewManager(nil, nil) // TestConnection doesn't touch store/engine
+	m := NewManager(nil, nil)
+	m.AllowPrivateSources(true) // httptest listens on loopback // TestConnection doesn't touch store/engine
 	buckets, err := m.TestConnection(StartConfig{Endpoint: endpoint, AccessKey: "k", SecretKey: "s"})
 	if err != nil {
 		t.Fatalf("TestConnection: %v", err)
@@ -224,6 +227,7 @@ func TestMigrateRetriesTransient(t *testing.T) {
 
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	id, err := m.Start(StartConfig{Endpoint: srv.URL, AccessKey: "k", SecretKey: "s"})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -278,6 +282,7 @@ func TestMigratePermanentErrorNotRetried(t *testing.T) {
 
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	id, _ := m.Start(StartConfig{Endpoint: srv.URL, AccessKey: "k", SecretKey: "s"})
 	job := waitDone(t, m, id)
 	_ = eng
@@ -295,6 +300,7 @@ func TestMigratePermanentErrorNotRetried(t *testing.T) {
 
 func TestMigrateBadEndpoint(t *testing.T) {
 	m := NewManager(nil, nil)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	if _, err := m.TestConnection(StartConfig{Endpoint: "http://127.0.0.1:1", AccessKey: "k", SecretKey: "s"}); err == nil {
 		t.Fatal("expected error connecting to a dead endpoint")
 	}
@@ -322,7 +328,7 @@ func TestGetObjectSpecialCharsSignature(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	obj, err := NewSource(srv.URL, access, secret, region, 10).GetObject(bucket, key)
+	obj, err := newSourceAllowingPrivate(srv.URL, access, secret, region, 10).GetObject(bucket, key)
 	if err != nil {
 		t.Fatalf("GetObject with special chars (&, $, space): %v", err)
 	}
@@ -379,6 +385,7 @@ func TestMigrateCancel(t *testing.T) {
 
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	id, err := m.Start(StartConfig{Endpoint: srv.URL, AccessKey: "k", SecretKey: "s"})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -432,6 +439,7 @@ func TestMigrateRejectsDuplicate(t *testing.T) {
 
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	cfg := StartConfig{Endpoint: srv.URL, AccessKey: "k", SecretKey: "s", Buckets: []string{"b"}}
 
 	id1, err := m.Start(cfg)
@@ -482,6 +490,7 @@ func TestMigratePreservesMetadata(t *testing.T) {
 
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	id, err := m.Start(StartConfig{Endpoint: srv.URL, AccessKey: "k", SecretKey: "s", Buckets: []string{"old"}})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -552,6 +561,7 @@ func TestMigrateCopiesBucketPolicyAndTags(t *testing.T) {
 
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	id, err := m.Start(StartConfig{Endpoint: srv.URL, AccessKey: "k", SecretKey: "s", Buckets: []string{"secured"}})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -589,6 +599,7 @@ func TestMigrateResumeSkipsExisting(t *testing.T) {
 	endpoint := stubS3(t, objects)
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 
 	// First run copies everything.
 	id, err := m.Start(StartConfig{Endpoint: endpoint, AccessKey: "k", SecretKey: "s"})
@@ -669,6 +680,7 @@ func TestMigrateCopiesConcurrently(t *testing.T) {
 
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 	id, err := m.Start(StartConfig{Endpoint: srv.URL, AccessKey: "k", SecretKey: "s", Concurrency: 4})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -701,6 +713,7 @@ func TestMigrateResumePartial(t *testing.T) {
 	endpoint := stubS3(t, objects)
 	store, eng := newLocal(t)
 	m := NewManager(store, eng)
+	m.AllowPrivateSources(true) // httptest listens on loopback
 
 	// Simulate a prior run that copied only docs/a.txt before it died.
 	if err := store.CreateBucket("docs"); err != nil {
@@ -770,7 +783,7 @@ func TestSourceSlowBodyNotTimedOut(t *testing.T) {
 
 	// timeoutSecs=1: the total body read (~1.5s) exceeds it. With the old
 	// http.Client.Timeout this would fail; now it only bounds the response header.
-	src := NewSource(srv.URL, "k", "s", "us-east-1", 1)
+	src := newSourceAllowingPrivate(srv.URL, "k", "s", "us-east-1", 1)
 	obj, err := src.GetObject("bucket", "key")
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)

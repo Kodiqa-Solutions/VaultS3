@@ -165,7 +165,7 @@ cluster.
 
 Several Raft groups run on one node, sharing the existing Raft port. A connection
 announces which group it is for by writing four magic bytes and a shard id
-immediately after connecting; a connection that announces nothing is control
+immediately after connecting. A connection that announces nothing is control
 traffic, exactly as every existing node already sends. That asymmetry is what
 keeps a rolling upgrade safe, and it is unambiguous because Raft's first byte is
 an rpcType in the range 0 to 4 and can never be the magic byte. Shard transports
@@ -179,7 +179,7 @@ into one shard where no other node could see it.
 
 `ShardedStore` answers the control-group surface exactly as before and routes the
 object surface to the group that owns the bucket. When this node holds a copy of
-that shard the call is local; when it does not, it is one store-level RPC to a
+that shard the call is local, and when it does not, it is one store-level RPC to a
 member. Writes are ordered by the shard's leader and nowhere else: a member that
 is not the leader names the leader rather than forwarding, so a leadership flap
 cannot make a write bounce between nodes. Listings are leader-only for the same
@@ -200,7 +200,7 @@ keyed by upload id, which carries no bucket to route by.
 ### P4, membership
 
 Three jobs with one owner each. The planner, on the control-group leader,
-recomputes which nodes should hold each shard from the ring and commits it; it
+recomputes which nodes should hold each shard from the ring and commits it. It
 refuses a reassignment that would keep no current member of a shard, since that
 does not move the metadata, it abandons it. The supervisor, on every node, starts
 the groups this node is listed for and stops the ones it is not, but only once the

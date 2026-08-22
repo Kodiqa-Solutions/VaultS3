@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/migrate"
@@ -42,7 +43,12 @@ func (h *APIHandler) handleMigrateTest(w http.ResponseWriter, r *http.Request) {
 	}
 	buckets, err := h.migrator.TestConnection(req.toConfig())
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "could not connect to source: "+err.Error())
+		// Do not reflect the source's response or the connection error: it used
+		// to return up to 4 KiB of whatever an internal service replied with,
+		// which turned a connection test into a read primitive (security
+		// assessment finding 6). The detail goes to the log instead.
+		slog.Warn("migration source test failed", "error", err)
+		writeError(w, http.StatusBadGateway, "could not connect to the source with the supplied endpoint and credentials")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"buckets": buckets})

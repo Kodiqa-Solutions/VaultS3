@@ -1,7 +1,6 @@
 package api
 
 import (
-	"crypto/hmac"
 	"net/http"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -30,7 +29,7 @@ import (
 // cluster channel: this node's own in-progress uploads for that bucket.
 func (h *APIHandler) ClusterMultipartListHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -61,7 +60,7 @@ func (h *APIHandler) ClusterMultipartListHandler(secret string) http.HandlerFunc
 // so an upload stranded by a ring change stays reachable.
 func (h *APIHandler) ClusterMultipartFindHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}

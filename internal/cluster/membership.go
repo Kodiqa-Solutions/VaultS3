@@ -17,12 +17,19 @@ import (
 // requests (join/leave/apply). Empty secret = auth disabled (single-tenant/dev).
 const clusterSecretHeader = "X-Cluster-Secret"
 
-// authOK reports whether an inter-node request is authorized. When no secret is
-// configured it allows everything (backward compatible); otherwise it requires a
-// constant-time match.
+// authOK reports whether an inter-node request is authorized.
+//
+// It fails CLOSED. This used to return true whenever no secret was configured,
+// in the name of backward compatibility, which made every /cluster/* endpoint
+// anonymous on a default clustered deployment: topology disclosure, an object
+// existence oracle, arbitrary object deletion, and a rogue node joining the Raft
+// quorum were all reachable without credentials. A cluster with no secret now
+// refuses inter-node requests instead of serving them to anyone, and the server
+// refuses to start in that state, so the only way to reach this branch is a
+// misconfiguration that has already been reported loudly.
 func (n *Node) authOK(r *http.Request) bool {
 	if n.cfg.Secret == "" {
-		return true
+		return false
 	}
 	return hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(n.cfg.Secret))
 }

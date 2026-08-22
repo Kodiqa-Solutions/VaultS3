@@ -80,12 +80,15 @@ type Job struct {
 
 // Manager runs migrations from S3-compatible sources into the local store/engine.
 type Manager struct {
-	store   metadata.StoreAPI
-	engine  storage.Engine
-	mu      sync.RWMutex
-	jobs    map[string]*Job
-	cancels map[string]context.CancelFunc // running job -> its cancel func
-	seq     int
+	store metadata.StoreAPI
+	// allowPrivateSources lifts the SSRF guard for operators migrating from a
+	// source inside their own network.
+	allowPrivateSources bool
+	engine              storage.Engine
+	mu                  sync.RWMutex
+	jobs                map[string]*Job
+	cancels             map[string]context.CancelFunc // running job -> its cancel func
+	seq                 int
 }
 
 // NewManager creates a migration manager.
@@ -110,14 +113,34 @@ type StartConfig struct {
 	Concurrency int
 }
 
+// AllowPrivateSources lets this manager migrate from loopback, private and
+// link-local addresses. Off by default: a caller-supplied endpoint is otherwise
+// a server-side request primitive pointed at the internal network and the cloud
+// metadata service (security assessment finding 6). Operators migrating from a
+// source on their own network turn it on deliberately.
+func (m *Manager) AllowPrivateSources(allow bool) { m.allowPrivateSources = allow }
+
+func (m *Manager) newSource(cfg StartConfig, timeoutSecs int) *Source {
+	if m.allowPrivateSources {
+		return newSourceAllowingPrivate(cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, cfg.Region, timeoutSecs)
+	}
+	return NewSource(cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, cfg.Region, timeoutSecs)
+}
+
 // TestConnection validates credentials by listing the source buckets.
 func (m *Manager) TestConnection(cfg StartConfig) ([]string, error) {
-	return NewSource(cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, cfg.Region, 30).ListBuckets()
+	if err := ValidateEndpoint(cfg.Endpoint); err != nil {
+		return nil, err
+	}
+	return m.newSource(cfg, 30).ListBuckets()
 }
 
 // Start validates the source then launches an async migration; returns the job ID.
 func (m *Manager) Start(cfg StartConfig) (string, error) {
-	src := NewSource(cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, cfg.Region, 300)
+	if err := ValidateEndpoint(cfg.Endpoint); err != nil {
+		return "", err
+	}
+	src := m.newSource(cfg, 300)
 
 	buckets := cfg.Buckets
 	if len(buckets) == 0 {

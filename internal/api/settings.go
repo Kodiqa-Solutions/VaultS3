@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/hmac"
+	"log/slog"
 	"net/http"
 )
 
@@ -136,8 +137,20 @@ func (h *APIHandler) handleChangeCredentials(w http.ResponseWriter, r *http.Requ
 		h.s3Auth.UpdateAdminCredentials(req.NewAccessKey, req.NewSecretKey)
 	}
 
-	// Re-initialize JWT service with new secret key
-	h.jwt = NewJWTService(req.NewSecretKey)
+	// Rotate the console signing key so sessions issued under the old password
+	// stop working, which is what changing a password is supposed to do. The new
+	// key is random rather than derived from the new secret: a key derived from a
+	// credential is forgeable by anyone who learns that credential.
+	if key, err := NewRandomJWTKey(); err == nil {
+		h.jwt = NewJWTService(key)
+		if h.jwtKeyStore != nil {
+			if err := h.jwtKeyStore.SetJWTSigningKey(key); err != nil {
+				slog.Error("could not persist the rotated console signing key, sessions will not survive a restart", "error", err)
+			}
+		}
+	} else {
+		slog.Error("could not rotate the console signing key", "error", err)
+	}
 
 	// Persist to metadata store
 	if h.store != nil {

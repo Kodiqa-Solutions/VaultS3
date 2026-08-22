@@ -338,9 +338,17 @@ func TestShardListingsComeFromTheShardLeader(t *testing.T) {
 	}
 	bucket := bucketInShard(t, 0, m.Shards)
 
-	// One record committed through the group: every member has it.
-	if err := follower.store.PutObjectMeta(metadata.ObjectMeta{Bucket: bucket, Key: "committed"}); err != nil {
-		t.Fatalf("write: %v", err)
+	// One record committed through the group: every member has it. A follower
+	// learns who leads a moment after the election, and the router correctly
+	// refuses a write it cannot route, so retry the way a client would on the
+	// 503 that refusal becomes.
+	var writeErr error
+	eventually(t, 15*time.Second, "the write routes to the shard leader", func() bool {
+		writeErr = follower.store.PutObjectMeta(metadata.ObjectMeta{Bucket: bucket, Key: "committed"})
+		return writeErr == nil
+	})
+	if writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
 	}
 	eventually(t, 15*time.Second, "the follower applies the committed write", func() bool {
 		g, err := follower.rt.Group(0)
@@ -359,6 +367,13 @@ func TestShardListingsComeFromTheShardLeader(t *testing.T) {
 	}
 	if err := g.Store().PutObjectMeta(metadata.ObjectMeta{Bucket: bucket, Key: "follower-only"}); err != nil {
 		t.Fatal(err)
+	}
+
+	// Leadership can move between the write above and the listing below, and if
+	// this node became the leader the listing is legitimately served locally.
+	// Assert the premise still holds rather than failing on a race.
+	if g.IsLeader() {
+		t.Skip("this node became the shard leader, so a local listing is correct here")
 	}
 
 	listed, _, err := follower.store.ListLatestObjects(bucket, "", "", 100)

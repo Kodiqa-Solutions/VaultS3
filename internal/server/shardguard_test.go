@@ -27,6 +27,9 @@ func shardTestConfig(t *testing.T, shards int) *config.Config {
 	cfg.Cluster.BindAddr = "127.0.0.1"
 	cfg.Cluster.RaftPort = 0
 	cfg.Cluster.DataDir = filepath.Join(dir, "raft")
+	// Inter-node endpoints authenticate with this, and the server refuses to
+	// start clustered without one.
+	cfg.Cluster.Secret = "test-cluster-secret"
 	cfg.Cluster.MetadataShards = shards
 	return cfg
 }
@@ -99,4 +102,22 @@ func TestServerStartsShardedOnAnEmptyStore(t *testing.T) {
 		t.Fatalf("sharded server refused to start on an empty store: %v", err)
 	}
 	srv.Close()
+}
+
+// A clustered server with no shared secret cannot authenticate its own
+// inter-node traffic, and those endpoints are reachable on the public API port.
+// It used to start anyway and serve them to anyone: object deletion, reclaim,
+// an object-existence oracle and Raft membership changes, all unauthenticated
+// (security assessment finding 7).
+func TestServerRefusesToClusterWithoutASecret(t *testing.T) {
+	cfg := shardTestConfig(t, 1)
+	cfg.Cluster.Secret = ""
+	srv, err := New(cfg)
+	if err == nil {
+		srv.Close()
+		t.Fatal("server started clustered with no cluster secret")
+	}
+	if !strings.Contains(err.Error(), "cluster.secret") {
+		t.Fatalf("error does not name the missing setting: %v", err)
+	}
 }

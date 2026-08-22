@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"crypto/hmac"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -248,7 +247,7 @@ func (h *APIHandler) fetchPeerReclaim(id, addr, rawQuery string) nodeReclaim {
 // coordinator fans out to every node because a node can only see its own disk.
 func (h *APIHandler) ClusterReclaimHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}

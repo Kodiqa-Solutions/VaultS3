@@ -338,6 +338,19 @@ func New(cfg *config.Config) (*Server, error) {
 		// Normalise here rather than letting each component default its own copy,
 		// so the shard service and the Raft node agree on the replica count.
 		cluster.ApplyDefaults(&cfg.Cluster)
+		// A cluster with no shared secret cannot authenticate its own inter-node
+		// traffic, and those endpoints are registered on the public S3 port. They
+		// now fail closed, so an unset secret would mean a cluster that cannot
+		// talk to itself: better to say so at startup than to fail on the first
+		// replication call. It also closes the hole where an unset secret left
+		// object deletion, reclaim and Raft membership open to anyone who could
+		// reach the port (security assessment finding 7).
+		if cfg.Cluster.Secret == "" {
+			store.Close()
+			return nil, fmt.Errorf("cluster.enabled is true but cluster.secret is empty: " +
+				"inter-node endpoints are served on the API port and are authenticated with this secret, " +
+				"so set cluster.secret (or VAULTS3_CLUSTER_SECRET) to a value shared by every node")
+		}
 		// Sharding splits object metadata across independent Raft groups, so the
 		// shard count fixes which bucket lives in which group and cannot change
 		// afterwards. A count larger than a node could run is refused rather than
@@ -1075,6 +1088,14 @@ func (s *Server) Run() error {
 	// must ask the local store whether an upload still exists rather than the
 	// Raft-backed one, which never sees it.
 	apiHandler.SetLocalStore(s.store)
+	// The console signing key: random, per installation, persisted. Installed
+	// before the handler serves anything (issue: security assessment finding 5).
+	if key, err := resolveJWTSigningKey(s.store); err != nil {
+		slog.Error("could not load the console signing key, sessions will not survive a restart", "error", err)
+	} else {
+		apiHandler.SetJWTSigningKey(key)
+		apiHandler.SetJWTKeyStore(s.store)
+	}
 	// Cluster membership + rebalance operations for the admin API / vaults3-cli.
 	if s.clusterNode != nil {
 		apiHandler.SetClusterController(
@@ -1162,7 +1183,11 @@ func (s *Server) Run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler(s.metrics.StartTime()))
 	mux.HandleFunc("/ready", readyHandler(s.store))
-	mux.Handle("/metrics", s.metrics)
+	// Metrics carry per-bucket names, object counts and sizes, which is the same
+	// inventory ListBuckets requires credentials for. Unauthenticated scrapes get
+	// the process-level series with those labels dropped, unless the operator has
+	// deliberately opened them up (security assessment finding 10).
+	mux.Handle("/metrics", s.metricsHandler())
 	if !splitConsole {
 		mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/dashboard/favicon.svg", http.StatusMovedPermanently)
@@ -1193,7 +1218,10 @@ func (s *Server) Run() error {
 		ownershipHandler := func(w http.ResponseWriter, r *http.Request) {
 			// Reveals object existence + cluster topology, and this is the public S3
 			// port, so require the cluster secret when one is configured.
-			if s.cfg.Cluster.Secret != "" && !hmac.Equal([]byte(r.Header.Get("X-Cluster-Secret")), []byte(s.cfg.Cluster.Secret)) {
+			// Fails closed: an unset secret refuses, it does not wave the request
+			// through (security assessment finding 7).
+			if s.cfg.Cluster.Secret == "" ||
+				!hmac.Equal([]byte(r.Header.Get("X-Cluster-Secret")), []byte(s.cfg.Cluster.Secret)) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
@@ -1274,7 +1302,11 @@ func (s *Server) Run() error {
 
 	// Register bidirectional replication sync endpoint
 	if s.biDirWorker != nil {
-		mux.HandleFunc("/_replication/sync", s.biDirWorker.HandleSyncRequest)
+		// Authenticated with the cluster secret. It used to be anonymous on the
+		// public port and returns the full change log: every bucket name, object
+		// key, ETag and size written since replication was enabled, which the S3
+		// API otherwise protects behind SigV4 (security assessment finding 9).
+		mux.HandleFunc("/_replication/sync", s.requireClusterSecret(s.biDirWorker.HandleSyncRequest))
 		slog.Info("bidirectional replication sync endpoint registered", "path", "/_replication/sync")
 	}
 

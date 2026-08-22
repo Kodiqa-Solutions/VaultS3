@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,16 @@ type meResponse struct {
 }
 
 func (h *APIHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
+	// Lock out an address that has spent its allowance of wrong passwords. This
+	// endpoint guards the admin credential pair, so an unlimited guess rate is
+	// the whole attack (security assessment finding 4).
+	ip := clientIPOf(r)
+	if blocked, retryIn := h.logins.blocked(ip); blocked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryIn.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many failed login attempts, try again later")
+		return
+	}
+
 	var req loginRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -37,9 +48,11 @@ func (h *APIHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	akMatch := hmac.Equal([]byte(req.AccessKey), []byte(h.cfg.Auth.AdminAccessKey))
 	skMatch := hmac.Equal([]byte(req.SecretKey), []byte(h.cfg.Auth.AdminSecretKey))
 	if !akMatch || !skMatch {
+		h.logins.fail(ip)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
+	h.logins.succeed(ip)
 
 	token, err := h.jwt.Generate("admin", 24*time.Hour)
 	if err != nil {
@@ -84,9 +97,35 @@ type oidcLoginResponse struct {
 	Email string `json:"email"`
 }
 
+// handleOIDCLogin is the legacy implicit flow: it turns an ID token the client
+// presents into a dashboard session.
+//
+// It is disabled unless an operator opts in, because the token it accepts is
+// bound to nothing this server issued. The nonce in the implicit flow is minted
+// by the browser and never registered here, so any valid, unexpired token for
+// the configured client works: one captured from a URL fragment, or one the
+// attacker obtained by logging in as themselves and then pushing through a
+// victim's browser. The authorization-code flow binds the token to a login this
+// server started, with PKCE and a server-sealed nonce, and is unaffected
+// (security assessment finding 3).
 func (h *APIHandler) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 	if h.oidc == nil {
 		writeError(w, http.StatusNotFound, "OIDC not configured")
+		return
+	}
+	if !h.cfg.OIDC.AllowImplicitFlow {
+		writeError(w, http.StatusForbidden,
+			"the OIDC implicit flow is disabled; use the authorization-code flow, "+
+				"or set oidc.allow_implicit_flow if your provider supports nothing newer")
+		return
+	}
+
+	// The implicit flow hands out sessions, so it is throttled like the password
+	// endpoint.
+	ip := clientIPOf(r)
+	if blocked, retryIn := h.logins.blocked(ip); blocked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryIn.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many failed login attempts, try again later")
 		return
 	}
 
@@ -98,9 +137,11 @@ func (h *APIHandler) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 
 	claims, err := h.oidc.ValidateToken(req.IDToken)
 	if err != nil {
+		h.logins.fail(ip)
 		writeError(w, http.StatusUnauthorized, "invalid token")
 		return
 	}
+	h.logins.succeed(ip)
 
 	h.issueOIDCSession(w, claims)
 }
@@ -303,8 +344,11 @@ func (h *APIHandler) authenticateUser(r *http.Request) (string, error) {
 		return claims.Sub, nil
 	}
 
-	// Fall back to query param (for browser download links)
-	if token := r.URL.Query().Get("token"); token != "" {
+	// Fall back to the query parameter, but only for the browser download links
+	// that need it. A token in a URL leaks into proxy logs, browser history and
+	// Referer headers, so it is accepted on the handful of routes a browser
+	// navigates to directly and nowhere else.
+	if token := r.URL.Query().Get("token"); token != "" && allowsTokenInURL(r.URL.Path) {
 		claims, err := h.jwt.Validate(token)
 		if err != nil {
 			return "", err
@@ -313,6 +357,15 @@ func (h *APIHandler) authenticateUser(r *http.Request) (string, error) {
 	}
 
 	return "", fmt.Errorf("missing authorization")
+}
+
+// allowsTokenInURL reports whether a path may authenticate with ?token=.
+//
+// Only routes a browser navigates to directly, where no Authorization header can
+// be set, qualify. Everything else must use the header, so a leaked URL cannot
+// be replayed against the admin API.
+func allowsTokenInURL(path string) bool {
+	return strings.Contains(path, "/download") || strings.HasSuffix(path, "/export")
 }
 
 // isAdminUser returns true if the user is the admin user.

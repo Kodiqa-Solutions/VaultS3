@@ -1,12 +1,16 @@
 package server
 
 import (
+	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 
+	"github.com/Kodiqa-Solutions/VaultS3/internal/api"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/s3"
@@ -146,4 +150,91 @@ func splitHostPort(addr string) (host, port string, ok bool) {
 		return "", "", false
 	}
 	return addr[:i], addr[i+1:], true
+}
+
+// resolveJWTSigningKey loads this installation's console signing key, creating
+// and persisting one on first run.
+//
+// The key is random and independent of every credential. Deriving it from the
+// admin secret, as this used to, meant the signing key was a function of a
+// password: anyone who learned that password could mint a `sub=admin` session
+// offline and never touch the login endpoint, and while the shipped default
+// secret was public that was true of every default installation.
+func resolveJWTSigningKey(store *metadata.Store) ([]byte, error) {
+	key, err := store.GetJWTSigningKey()
+	if err != nil {
+		return nil, fmt.Errorf("read console signing key: %w", err)
+	}
+	if len(key) > 0 {
+		return key, nil
+	}
+	key, err = api.NewRandomJWTKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := store.SetJWTSigningKey(key); err != nil {
+		return nil, fmt.Errorf("save console signing key: %w", err)
+	}
+	slog.Info("generated this installation's console signing key")
+	return key, nil
+}
+
+// requireClusterSecret wraps an inter-node handler so it authenticates with the
+// shared cluster secret. It fails closed when no secret is set, matching every
+// other inter-node endpoint.
+func (s *Server) requireClusterSecret(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		secret := s.cfg.Cluster.Secret
+		if secret == "" || !hmac.Equal([]byte(r.Header.Get("X-Cluster-Secret")), []byte(secret)) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// metricsHandler serves Prometheus metrics, withholding the per-bucket series
+// from anonymous callers.
+//
+// The per-bucket labels carry bucket names, object counts, sizes and quotas,
+// which is exactly the inventory the S3 API protects behind ListBuckets. An
+// operator who scrapes from a trusted network can keep the old behaviour by
+// setting metrics.public_bucket_labels.
+func (s *Server) metricsHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.Metrics.PublicBucketLabels || s.metricsCallerIsTrusted(r) {
+			s.metrics.ServeHTTP(w, r)
+			return
+		}
+		rec := &bucketLabelFilter{ResponseWriter: w}
+		s.metrics.ServeHTTP(rec, r)
+		rec.flush()
+	})
+}
+
+// metricsCallerIsTrusted reports whether the scrape carries the cluster secret,
+// which is how a monitoring sidecar inside the deployment identifies itself.
+func (s *Server) metricsCallerIsTrusted(r *http.Request) bool {
+	secret := s.cfg.Cluster.Secret
+	if secret == "" {
+		return false
+	}
+	return hmac.Equal([]byte(r.Header.Get("X-Cluster-Secret")), []byte(secret))
+}
+
+// bucketLabelFilter buffers the metrics body and drops the per-bucket series.
+type bucketLabelFilter struct {
+	http.ResponseWriter
+	buf bytes.Buffer
+}
+
+func (f *bucketLabelFilter) Write(p []byte) (int, error) { return f.buf.Write(p) }
+
+func (f *bucketLabelFilter) flush() {
+	for _, line := range strings.Split(f.buf.String(), "\n") {
+		if strings.Contains(line, "bucket=\"") {
+			continue
+		}
+		f.ResponseWriter.Write([]byte(line + "\n"))
+	}
 }

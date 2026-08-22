@@ -21,27 +21,22 @@ type Statement struct {
 // Evaluate checks all statements against an action and resource.
 // Returns true if access is allowed, false if denied.
 // Logic: explicit Deny wins, then explicit Allow, else default deny.
+// Evaluate checks policies with no request context.
+//
+// It delegates to EvaluateWithContext so that NotAction, NotResource and
+// Condition are honoured rather than silently ignored, which is what this used
+// to do: a policy that allowed access only from one IP range, or that denied an
+// action under a condition, was evaluated as unconditional. Operators who
+// believed they had locked access down had no such protection (security
+// assessment finding 12).
+//
+// With no context, a statement carrying a Condition cannot be shown to apply, so
+// EvaluateWithContext fails it closed: an Allow that depends on an unproven
+// condition does not grant, and a Deny that depends on one does not block a
+// request the caller could not have proven anyway. Callers that can supply
+// context should use EvaluateWithContext directly.
 func Evaluate(policies []Policy, action, resource string) bool {
-	hasAllow := false
-
-	for _, pol := range policies {
-		for _, stmt := range pol.Statement {
-			if !matchesAny(stmt.Action, action) {
-				continue
-			}
-			if !matchesAny(stmt.Resource, resource) {
-				continue
-			}
-			if stmt.Effect == "Deny" {
-				return false
-			}
-			if stmt.Effect == "Allow" {
-				hasAllow = true
-			}
-		}
-	}
-
-	return hasAllow
+	return EvaluateWithContext(policies, action, resource, nil)
 }
 
 // matchesAny checks if the value matches any of the patterns.

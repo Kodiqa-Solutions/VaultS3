@@ -40,15 +40,30 @@ type quotaRequest struct {
 	MaxObjects   int64 `json:"maxObjects"`
 }
 
-func (h *APIHandler) handleListBuckets(w http.ResponseWriter, _ *http.Request) {
+func (h *APIHandler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	buckets, err := h.store.ListBuckets()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list buckets")
 		return
 	}
 
+	// Show only the buckets the caller may list. Returning every name told a
+	// low-privileged user exactly what existed and what to aim at, and the
+	// console then let them open it (security assessment finding 14).
+	names := make([]string, 0, len(buckets))
+	for _, b := range buckets {
+		names = append(names, b.Name)
+	}
+	allowed := make(map[string]bool)
+	for _, n := range h.visibleBuckets(r, names) {
+		allowed[n] = true
+	}
+
 	items := make([]bucketListItem, 0, len(buckets))
 	for _, b := range buckets {
+		if !allowed[b.Name] {
+			continue
+		}
 		size, count := h.bucketStatCounter(b.Name)
 		items = append(items, bucketListItem{
 			Name:         b.Name,

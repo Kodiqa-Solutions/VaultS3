@@ -86,8 +86,18 @@ func TestAuthOK(t *testing.T) {
 	if secured.authOK(withHdr("")) {
 		t.Fatal("missing secret must be rejected when one is configured")
 	}
+	// An unset secret must REFUSE, not wave everything through. This test used to
+	// assert the opposite, in the name of backward compatibility, which is how a
+	// default clustered deployment ended up serving /cluster/* to anonymous
+	// callers: topology disclosure, an object-existence oracle, arbitrary object
+	// deletion and a rogue node joining the Raft quorum (security assessment
+	// finding 7). The server now refuses to start clustered without a secret, so
+	// this branch is only reachable by misconfiguration.
 	open := &Node{cfg: ClusterConfig{}}
-	if !open.authOK(withHdr("")) {
-		t.Fatal("no configured secret should allow all (backward compatible)")
+	if open.authOK(withHdr("")) {
+		t.Fatal("an unset cluster secret authorized an anonymous inter-node request")
+	}
+	if open.authOK(withHdr("anything")) {
+		t.Fatal("an unset cluster secret authorized a request carrying an arbitrary secret")
 	}
 }

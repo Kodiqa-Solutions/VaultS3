@@ -30,9 +30,19 @@ func EvaluateWithContext(policies []Policy, action, resource string, ctx map[str
 				continue
 			}
 
-			// Evaluate conditions
-			if len(stmt.Condition) > 0 && !evaluateConditions(stmt.Condition, ctx) {
-				continue
+			// Evaluate conditions. Undetermined ones resolve conservatively:
+			// a Deny still blocks, an Allow does not grant.
+			if len(stmt.Condition) > 0 {
+				ok, determined := evaluateConditions(stmt.Condition, ctx)
+				switch {
+				case !determined:
+					if stmt.Effect == "Deny" {
+						return false
+					}
+					continue
+				case !ok:
+					continue
+				}
 			}
 
 			if stmt.Effect == "Deny" {
@@ -48,16 +58,27 @@ func EvaluateWithContext(policies []Policy, action, resource string, ctx map[str
 }
 
 // evaluateConditions checks all condition operators.
-func evaluateConditions(conditions map[string]map[string][]string, ctx map[string]string) bool {
+// evaluateConditions reports whether every condition holds, and whether that
+// could be determined at all.
+//
+// A condition on a key the caller supplied no value for is UNDETERMINED, not
+// false. The difference decides the safe answer: an Allow that depends on an
+// unproven condition must not grant, and a Deny that depends on one must still
+// block. Collapsing both to "false" would have let a conditional Deny be
+// bypassed simply by evaluating it without context.
+func evaluateConditions(conditions map[string]map[string][]string, ctx map[string]string) (ok, determined bool) {
 	for operator, kvs := range conditions {
 		for key, values := range kvs {
-			ctxVal := ctx[key]
+			ctxVal, present := ctx[key]
+			if !present {
+				return false, false
+			}
 			if !evaluateOperator(operator, ctxVal, values) {
-				return false
+				return false, true
 			}
 		}
 	}
-	return true
+	return true, true
 }
 
 func evaluateOperator(operator, actual string, expected []string) bool {

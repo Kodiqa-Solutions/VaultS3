@@ -71,7 +71,27 @@ type APIHandler struct {
 	// node-local (issue #32), so anything asking "does this upload exist here?"
 	// must ask this one. Nil ⇒ same as store.
 	localStore metadata.StoreAPI
+	// jwtKeyStore persists the console signing key across restarts and across a
+	// credential rotation. Nil leaves the key in memory only.
+	jwtKeyStore jwtKeyStore
+	// logins throttles the credential endpoints, always on and independent of
+	// the general rate limiter.
+	logins *loginThrottle
 }
+
+// jwtKeyStore is the slice of the metadata store that holds the console signing
+// key. Narrow on purpose: the console does not need the rest of the store to
+// rotate a key.
+type jwtKeyStore interface {
+	SetJWTSigningKey(key []byte) error
+}
+
+// SetJWTSigningKey installs the per-installation console signing key, which the
+// server loads or generates at startup and persists. Called before serving.
+func (h *APIHandler) SetJWTSigningKey(key []byte) { h.jwt = NewJWTService(key) }
+
+// SetJWTKeyStore wires where a rotated signing key is persisted.
+func (h *APIHandler) SetJWTKeyStore(s jwtKeyStore) { h.jwtKeyStore = s }
 
 // SetLocalStore wires the node-local metadata store, used for state that is
 // deliberately not replicated (in-progress multipart uploads). No-op single-node.
@@ -103,11 +123,16 @@ func (h *APIHandler) SetClusterInfo(selfID string, nodeAddrs func() map[string]s
 
 func NewAPIHandler(store metadata.StoreAPI, engine storage.Engine, mc *metrics.Collector, cfg *config.Config, activity *ActivityLog) *APIHandler {
 	return &APIHandler{
-		store:    store,
-		engine:   engine,
-		metrics:  mc,
-		cfg:      cfg,
-		jwt:      NewJWTService(cfg.Auth.AdminSecretKey),
+		store:   store,
+		engine:  engine,
+		metrics: mc,
+		cfg:     cfg,
+		// A random key until the server installs the persisted one. Signing with
+		// an ephemeral key means a bug that loses the real one costs everyone
+		// their session, which is recoverable; signing with a derived one meant
+		// anyone holding the admin secret could forge sessions, which is not.
+		jwt:      NewJWTService(nil),
+		logins:   newLoginThrottle(),
 		activity: activity,
 	}
 }
@@ -243,6 +268,18 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		strings.HasPrefix(path, "/scanner/") ||
 		strings.HasPrefix(path, "/tiering/") ||
 		strings.HasPrefix(path, "/settings") ||
+		// Maintenance and cross-bucket routes. Each of these was reachable by any
+		// authenticated subject: version rollback silently rewrote live object
+		// content, tags mutated persistent metadata, reclaim deletes data files,
+		// heal and speedtest burn disk, migrate drives server-side HTTP requests
+		// to any address the caller names, and search and versions answer across
+		// every bucket (security assessment findings 6 and 8).
+		strings.HasPrefix(path, "/versions") ||
+		strings.HasPrefix(path, "/migrate") ||
+		path == "/reclaim" ||
+		path == "/heal" ||
+		path == "/speedtest" ||
+		path == "/search" ||
 		path == "/compact" ||
 		path == "/presign" ||
 		path == "/cluster/join" ||
@@ -254,6 +291,18 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if adminPaths && !h.isAdminUser(r) {
 		writeError(w, http.StatusForbidden, "admin access required")
 		return
+	}
+
+	// Every route that names a bucket is authorized against the caller's IAM
+	// policies, the same ones the S3 API enforces. Without this the console was
+	// a complete bypass of the authorization model: any valid session could
+	// read, overwrite and delete objects in any bucket, and change bucket
+	// configuration (security assessment finding 14).
+	if rest, ok := strings.CutPrefix(path, "/buckets/"); ok {
+		if err := h.authorizeConsoleBucket(r, rest); err != nil {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 	}
 
 	switch {

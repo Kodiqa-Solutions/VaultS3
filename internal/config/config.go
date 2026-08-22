@@ -33,6 +33,7 @@ type Config struct {
 	Memory        MemoryConfig        `yaml:"memory"`
 	Vector        VectorConfig        `yaml:"vector"`
 	AutoUpdate    AutoUpdateConfig    `yaml:"auto_update"`
+	Metrics       MetricsConfig       `yaml:"metrics"`
 	Debug         bool                `yaml:"debug"`
 }
 
@@ -119,6 +120,16 @@ type RebalanceConfig struct {
 	BatchSize        int `yaml:"batch_size"`
 }
 
+// MetricsConfig controls what the Prometheus endpoint exposes anonymously.
+type MetricsConfig struct {
+	// PublicBucketLabels serves the per-bucket series (names, object counts,
+	// sizes, quotas) to unauthenticated scrapes. Off by default: that is the same
+	// inventory the S3 API protects behind ListBuckets, and it was readable by
+	// anyone who could reach the port. A scrape carrying the cluster secret
+	// always receives the full set.
+	PublicBucketLabels bool `yaml:"public_bucket_labels"`
+}
+
 type MemoryConfig struct {
 	MaxSearchEntries int `yaml:"max_search_entries"`
 	GoMemLimitMB     int `yaml:"go_mem_limit_mb"`
@@ -146,7 +157,12 @@ type OIDCConfig struct {
 	AllowedDomains  []string          `yaml:"allowed_domains"`
 	RoleMapping     map[string]string `yaml:"role_mapping"`
 	AutoCreateUsers bool              `yaml:"auto_create_users"`
-	JWKSCacheSecs   int               `yaml:"jwks_cache_secs"`
+	// AllowImplicitFlow re-enables POST /api/v1/auth/oidc, which accepts an ID
+	// token the client presents. Off by default: that token is bound to nothing
+	// this server issued, so a captured or attacker-minted one creates a session
+	// (security assessment finding 3). The authorization-code flow is unaffected.
+	AllowImplicitFlow bool `yaml:"allow_implicit_flow"`
+	JWKSCacheSecs     int  `yaml:"jwks_cache_secs"`
 }
 
 type LambdaConfig struct {

@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -26,10 +27,45 @@ type JWTClaims struct {
 	Exp int64  `json:"exp"`
 }
 
-func NewJWTService(adminSecret string) *JWTService {
-	h := hmac.New(sha256.New, []byte("vaults3-jwt-signing-key"))
-	h.Write([]byte(adminSecret))
-	return &JWTService{secret: h.Sum(nil)}
+// NewJWTService signs sessions with key, which must be random and per
+// installation.
+//
+// It used to be derived from the admin secret, `HMAC-SHA256(fixed salt,
+// adminSecret)`. That made the signing key a function of a credential: anyone
+// who learned the admin secret, including everyone who read the default config
+// that used to ship one, could mint a `sub=admin` token offline and never touch
+// the login endpoint. The key is now independent of every credential, so
+// learning a password no longer yields the ability to forge sessions.
+//
+// An empty key is refused rather than silently accepted, since a zero-length
+// HMAC key would be trivially guessable.
+func NewJWTService(key []byte) *JWTService {
+	if len(key) == 0 {
+		// Better an unusable service than a predictable one. Callers construct
+		// this from a persisted random key; a bug that loses it must not
+		// downgrade to a guessable signer.
+		key = mustRandomKey()
+	}
+	return &JWTService{secret: append([]byte(nil), key...)}
+}
+
+// NewRandomJWTKey returns a fresh 32-byte signing key.
+func NewRandomJWTKey() ([]byte, error) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate jwt signing key: %w", err)
+	}
+	return key, nil
+}
+
+func mustRandomKey() []byte {
+	key, err := NewRandomJWTKey()
+	if err != nil {
+		// crypto/rand failing is unrecoverable; a predictable fallback would be
+		// worse than refusing to run.
+		panic("vaults3: cannot generate a JWT signing key: " + err.Error())
+	}
+	return key
 }
 
 func (j *JWTService) Generate(subject string, ttl time.Duration) (string, error) {

@@ -66,8 +66,8 @@ S3 is the API VaultS3 implements, not a competitor you would swap it for. If you
 | | VaultS3 | Amazon S3 |
 |---|---|---|
 | Durability | Your disks and configuration | 11 nines, across 3+ availability zones by default |
-| Scale | ~10M objects per node; a billion needs ~30 nodes | Effectively unlimited |
-| Operations & compliance | Yours, including any certification | No infrastructure to run; AWS is certified, your configuration still isn't |
+| Scale | ~10M objects per node, a billion needs ~30 nodes | Effectively unlimited |
+| Operations & compliance | Yours, including any certification | No infrastructure to run. AWS is certified, your configuration still isn't |
 | Cost | Hardware. **No per-request or egress charges** | Per GB, per request, per GB egressed |
 | Exit path | Ordinary files and a BoltDB index behind the S3 API | S3 API |
 
@@ -1676,6 +1676,29 @@ auto_update:
 ```
 
 The current/latest version is also exposed at `GET /api/v1/version`.
+
+### Upgrading to 4.4.56 (security release)
+
+**This release closes 14 findings from an external security assessment, several
+of them remotely exploitable against a default deployment.** The full list is in
+[CHANGELOG.md](CHANGELOG.md). Four things need your attention:
+
+1. **Rotate the admin credentials on any deployment that has ever run with
+   `vaults3-secret-change-me`.** 4.4.55 stopped shipping that secret, but an
+   installation that already booted with it has it persisted, and persisted
+   credentials win over configuration, so upgrading does not replace it. Set
+   `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY`, or change the password from the
+   dashboard.
+2. **Set `cluster.secret` before upgrading a clustered deployment.** Inter-node
+   endpoints are authenticated with it and now fail closed, so a clustered server
+   refuses to start without one. The Helm chart already sets it for you.
+3. **Everyone is logged out once.** The console signing key is now random per
+   installation rather than derived from the admin secret, so existing sessions
+   stop working.
+4. **Non-admin dashboard users are now subject to IAM policies.** The console
+   used to allow any authenticated user into any bucket. If you have non-admin
+   users, give them policies covering the buckets they need, the same ones the S3
+   API already required.
 
 ### Upgrading to 4.4.55
 

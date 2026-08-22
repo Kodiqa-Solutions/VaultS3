@@ -2912,3 +2912,31 @@ func (s *Store) GetAdminCredentials() (accessKey, secretKey string, err error) {
 	})
 	return
 }
+
+// jwtSigningKeyKey holds the console's JWT signing key. It is per installation
+// and random, never derived from a credential: deriving it from the admin secret
+// meant anyone who learned that secret could mint admin sessions offline,
+// forever, without ever logging in.
+var jwtSigningKeyKey = []byte("jwt_signing_key")
+
+// GetJWTSigningKey returns the persisted console signing key, or nil when this
+// installation has never had one.
+func (s *Store) GetJWTSigningKey() ([]byte, error) {
+	var out []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket(serverSettingsBucket).Get(jwtSigningKeyKey); v != nil {
+			out = append([]byte(nil), v...)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// SetJWTSigningKey persists the console signing key. Replacing it invalidates
+// every session signed with the previous one, which is what a credential change
+// should do.
+func (s *Store) SetJWTSigningKey(key []byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(serverSettingsBucket).Put(jwtSigningKeyKey, key)
+	})
+}

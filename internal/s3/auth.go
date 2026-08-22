@@ -85,7 +85,7 @@ func (a *Authenticator) UpdateAdminCredentials(accessKey, secretKey string) {
 
 // resolveIdentity looks up the identity for a given access key.
 // Returns the identity with user info and policies.
-func (a *Authenticator) resolveIdentity(accessKey string) (*iam.Identity, string, error) {
+func (a *Authenticator) resolveIdentity(accessKey string, r *http.Request) (*iam.Identity, string, error) {
 	if accessKey == a.adminAccessKey {
 		return &iam.Identity{
 			AccessKey: accessKey,
@@ -99,9 +99,33 @@ func (a *Authenticator) resolveIdentity(accessKey string) (*iam.Identity, string
 				return nil, "", fmt.Errorf("credentials have expired")
 			}
 
-			// For STS keys, resolve policies from SourceUserID
+			// A session credential must present the session token it was issued
+			// with. It was never read anywhere, so the access key and secret alone
+			// were sufficient and any token value, or none, was accepted
+			// (security assessment finding 11).
+			if key.SessionToken != "" {
+				presented := r.Header.Get("X-Amz-Security-Token")
+				if presented == "" {
+					presented = r.URL.Query().Get("X-Amz-Security-Token")
+				}
+				if !hmac.Equal([]byte(presented), []byte(key.SessionToken)) {
+					return nil, "", fmt.Errorf("invalid session token")
+				}
+			}
+
+			// An STS key resolves against its OWN synthetic user, which carries the
+			// session policy supplied when the token was minted. It used to resolve
+			// against SourceUserID, the user the session was derived from, so the
+			// scoped-down credential inherited that user's full permissions and the
+			// session policy was never evaluated at all: a session created to allow
+			// only GetObject could PUT, and one that explicitly denied GetObject
+			// could read (security assessment finding 11).
+			//
+			// The fall back to the source user applies only when the session was
+			// created with no policy of its own, which is the unscoped case where
+			// inheriting is the intent.
 			userID := key.UserID
-			if key.SourceUserID != "" {
+			if key.SourceUserID != "" && !a.hasOwnPolicies(key.UserID) {
 				userID = key.SourceUserID
 			}
 
@@ -205,7 +229,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (*iam.Identity, error) {
 	region := credParts[2]
 	service := credParts[3]
 
-	identity, secretKey, err := a.resolveIdentity(reqAccessKey)
+	identity, secretKey, err := a.resolveIdentity(reqAccessKey, r)
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +277,7 @@ func (a *Authenticator) authenticatePresigned(r *http.Request) (*iam.Identity, e
 		return nil, fmt.Errorf("invalid credential")
 	}
 
-	identity, secretKey, err := a.resolveIdentity(credParts[0])
+	identity, secretKey, err := a.resolveIdentity(credParts[0], r)
 	if err != nil {
 		return nil, err
 	}
@@ -339,10 +363,24 @@ func (a *Authenticator) authenticatePresigned(r *http.Request) (*iam.Identity, e
 
 // Authorize checks if an identity is allowed to perform an action on a resource.
 func (a *Authenticator) Authorize(identity *iam.Identity, action, resource string) error {
+	return a.AuthorizeWithContext(identity, action, resource, nil)
+}
+
+// AuthorizeWithContext is Authorize with the request context that IAM conditions
+// evaluate against, at minimum aws:SourceIp and aws:username. Without it a
+// policy scoped to a source IP range was treated as unconditional (security
+// assessment finding 12).
+func (a *Authenticator) AuthorizeWithContext(identity *iam.Identity, action, resource string, ctx map[string]string) error {
 	if identity.IsAdmin {
 		return nil
 	}
-	if iam.Evaluate(identity.Policies, action, resource) {
+	if ctx == nil {
+		ctx = map[string]string{}
+	}
+	if _, ok := ctx["aws:username"]; !ok && identity.UserID != "" {
+		ctx["aws:username"] = identity.UserID
+	}
+	if iam.EvaluateWithContext(identity.Policies, action, resource, ctx) {
 		return nil
 	}
 	return fmt.Errorf("access denied: %s on %s", action, resource)
@@ -504,4 +542,21 @@ func hmacSHA256(key, data []byte) []byte {
 
 func (a *Authenticator) GetAccessKey() string {
 	return a.adminAccessKey
+}
+
+// hasOwnPolicies reports whether an identity carries policies of its own. For an
+// STS session this is the inline session policy: when it exists it is the whole
+// permission set, and it must not be widened by the source user's policies.
+func (a *Authenticator) hasOwnPolicies(userID string) bool {
+	if userID == "" || a.store == nil {
+		return false
+	}
+	policies, err := a.store.GetUserPolicies(userID)
+	if err != nil {
+		// An unreadable policy set is not an empty one. Treat the session as
+		// scoped so a store error cannot silently promote it to the source
+		// user's full permissions.
+		return true
+	}
+	return len(policies) > 0
 }

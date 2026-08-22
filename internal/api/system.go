@@ -1,7 +1,6 @@
 package api
 
 import (
-	"crypto/hmac"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -150,7 +149,7 @@ func (h *APIHandler) handleSystemInfo(w http.ResponseWriter, _ *http.Request) {
 // It is authenticated by the shared cluster secret when one is configured.
 func (h *APIHandler) ClusterSysInfoHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if secret != "" && !hmac.Equal([]byte(r.Header.Get(clusterSecretHeader)), []byte(secret)) {
+		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}

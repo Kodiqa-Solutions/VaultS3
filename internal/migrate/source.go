@@ -32,6 +32,16 @@ type Source struct {
 
 // NewSource creates a source client. region defaults to "us-east-1".
 func NewSource(endpoint, accessKey, secretKey, region string, timeoutSecs int) *Source {
+	return newSource(endpoint, accessKey, secretKey, region, timeoutSecs, false)
+}
+
+// newSourceAllowingPrivate is NewSource for an operator who has opted into
+// migrating from a source on a private network.
+func newSourceAllowingPrivate(endpoint, accessKey, secretKey, region string, timeoutSecs int) *Source {
+	return newSource(endpoint, accessKey, secretKey, region, timeoutSecs, true)
+}
+
+func newSource(endpoint, accessKey, secretKey, region string, timeoutSecs int, allowPrivate bool) *Source {
 	endpoint = strings.TrimRight(endpoint, "/")
 	if region == "" {
 		region = "us-east-1"
@@ -58,8 +68,10 @@ func NewSource(endpoint, accessKey, secretKey, region string, timeoutSecs int) *
 				// response with Content-Encoding: gzip — which would store DECODED bytes
 				// while we record Content-Encoding: gzip (corruption) and also strips the
 				// header we want to preserve (issue #13).
-				DisableCompression:    true,
-				DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				DisableCompression: true,
+				// Guarded at dial time so a hostname cannot resolve to something
+				// harmless during validation and to loopback a moment later.
+				DialContext:           dialContextGuarded(&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}, allowPrivate),
 				TLSHandshakeTimeout:   15 * time.Second,
 				ResponseHeaderTimeout: time.Duration(timeoutSecs) * time.Second,
 				ExpectContinueTimeout: 5 * time.Second,

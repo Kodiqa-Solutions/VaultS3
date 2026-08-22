@@ -69,9 +69,14 @@ func asShardLeaderRedirect(err error, out **shardLeaderRedirect) bool {
 	return false
 }
 
+// authorize checks an inter-node shard RPC, and fails CLOSED.
+//
+// This first shipped copying the control plane's fail-open pattern, which is
+// exactly how that hole got there. A shard RPC moves object metadata, so an
+// unauthenticated one is an anonymous write to another node's store.
 func (r *ShardRouter) authorize(req *http.Request) bool {
 	if r.secret == "" {
-		return true
+		return false
 	}
 	return hmac.Equal([]byte(req.Header.Get(clusterSecretHeader)), []byte(r.secret))
 }

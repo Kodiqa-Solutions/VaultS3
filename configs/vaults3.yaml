@@ -204,6 +204,12 @@ oidc:
   allowed_domains: []      # restrict to email domains (empty = allow all)
   role_mapping: {}         # map OIDC groups to VaultS3 policies
   auto_create_users: true  # auto-create IAM user on first OIDC login
+  # Accept an ID token the client presents (the legacy implicit flow). OFF by
+  # default: that token is bound to nothing this server issued, so one captured
+  # from a URL fragment, or minted for an attacker's own account, creates a
+  # session. The authorization-code flow is unaffected and is what the dashboard
+  # uses.
+  allow_implicit_flow: false
   jwks_cache_secs: 3600    # JWKS key cache duration
 
 lambda:
@@ -260,6 +266,13 @@ erasure:
 # Distributed clustering (optional)
 cluster:
   enabled: false
+  # REQUIRED when enabled is true, and the server refuses to start without it.
+  # Inter-node endpoints are served on the API port and authenticate with this
+  # value. It used to be optional, and an unset secret meant those endpoints
+  # accepted anyone: cluster topology, an object-existence oracle, arbitrary
+  # object deletion and Raft membership changes were all anonymous. Share the
+  # same value across every node, from a secret manager rather than this file.
+  secret: ""
   node_id: "node-1"
   bind_addr: "0.0.0.0"
   raft_port: 9001
@@ -318,3 +331,12 @@ cluster:
 #   self_signed: false         # use self-signed cert (for development)
 
 debug: false                   # enable /debug/pprof/* endpoints
+
+# Prometheus metrics at /metrics.
+metrics:
+  # Serve the per-bucket series (bucket names, object counts, sizes, quotas) to
+  # unauthenticated scrapes. OFF by default: that is the same inventory the S3
+  # API protects behind ListBuckets, and it used to be readable by anyone who
+  # could reach the port. A scrape carrying the cluster secret always gets the
+  # full set, so a monitoring sidecar inside the deployment is unaffected.
+  public_bucket_labels: false

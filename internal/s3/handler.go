@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 
@@ -384,12 +385,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !identity.IsAdmin {
 			action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
 			resource := formatResource(bucket, key)
-			if err := h.auth.Authorize(identity, action, resource); err != nil {
+			reqCtx := map[string]string{"aws:SourceIp": clientIP}
+			if err := h.auth.AuthorizeWithContext(identity, action, resource, reqCtx); err != nil {
 				if h.onAudit != nil {
 					h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Deny", clientIP, http.StatusForbidden)
 				}
 				writeS3Error(w, "AccessDenied", err.Error(), http.StatusForbidden)
 				return
+			}
+			// A copy reads its SOURCE as well as writing its destination, and the
+			// action above only covers the destination. Without this a user with
+			// write access to one bucket could copy any object out of any other
+			// bucket and then read it from their own, which defeats the read side
+			// of the policy model entirely (security assessment finding 13).
+			if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
+				srcBucket, srcKey := parseCopySource(strings.TrimPrefix(copySourcePath(src), "/"))
+				if srcBucket != "" {
+					srcResource := formatResource(srcBucket, srcKey)
+					if err := h.auth.AuthorizeWithContext(identity, "s3:GetObject", srcResource, reqCtx); err != nil {
+						if h.onAudit != nil {
+							h.onAudit(identity.AccessKey, identity.UserID, "s3:GetObject", srcResource, "Deny", clientIP, http.StatusForbidden)
+						}
+						writeS3Error(w, "AccessDenied", "s3:GetObject on "+srcResource, http.StatusForbidden)
+						return
+					}
+				}
 			}
 			// Record allowed access
 			if h.onAudit != nil {
@@ -1103,4 +1123,20 @@ func extractAccessKeyFromAuth(r *http.Request) string {
 		}
 	}
 	return ""
+}
+
+// copySourcePath normalises an X-Amz-Copy-Source header to "/bucket/key". The
+// header is URL-encoded and may or may not carry a leading slash.
+func copySourcePath(src string) string {
+	if decoded, err := url.PathUnescape(src); err == nil {
+		src = decoded
+	}
+	if !strings.HasPrefix(src, "/") {
+		src = "/" + src
+	}
+	// A versionId suffix names the same object; authorization is per key.
+	if i := strings.Index(src, "?"); i >= 0 {
+		src = src[:i]
+	}
+	return src
 }
