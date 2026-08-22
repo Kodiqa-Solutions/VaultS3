@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -422,7 +423,12 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		// Mark previous latest as not latest
 		if oldMeta, err := h.store.GetObjectMeta(bucket, key); err == nil && oldMeta.VersionID != "" {
 			oldMeta.IsLatest = false
-			h.store.PutObjectVersion(*oldMeta)
+			if err := h.store.PutObjectVersion(*oldMeta); err != nil {
+				// Losing this write would leave two versions both claiming to be
+				// latest, so the request fails rather than half-applying.
+				metaWriteFailed(w, err, "demote previous version", bucket, key)
+				return
+			}
 		}
 
 		meta := metadata.ObjectMeta{
@@ -449,8 +455,14 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 
 		h.applyObjectLock(r, &meta, bucket, now)
 
-		h.store.PutObjectVersion(meta)
-		h.store.PutObjectMeta(meta) // update "latest pointer"
+		if err := h.store.PutObjectVersion(meta); err != nil {
+			metaWriteFailed(w, err, "PutObjectVersion", bucket, key)
+			return
+		}
+		if err := h.store.PutObjectMeta(meta); err != nil { // update "latest pointer"
+			metaWriteFailed(w, err, "PutObjectMeta", bucket, key)
+			return
+		}
 
 		w.Header().Set("ETag", etag)
 		w.Header().Set("X-Amz-Version-Id", versionID)
@@ -494,7 +506,10 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		// Remove any existing null version
 		if oldMeta, err := h.store.GetObjectVersion(bucket, key, "null"); err == nil {
 			oldMeta.IsLatest = false
-			h.store.PutObjectVersion(*oldMeta)
+			if err := h.store.PutObjectVersion(*oldMeta); err != nil {
+				metaWriteFailed(w, err, "demote null version", bucket, key)
+				return
+			}
 		}
 
 		meta := metadata.ObjectMeta{
@@ -520,8 +535,14 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		}
 		h.applyObjectLock(r, &meta, bucket, now)
 
-		h.store.PutObjectVersion(meta)
-		h.store.PutObjectMeta(meta)
+		if err := h.store.PutObjectVersion(meta); err != nil {
+			metaWriteFailed(w, err, "PutObjectVersion", bucket, key)
+			return
+		}
+		if err := h.store.PutObjectMeta(meta); err != nil {
+			metaWriteFailed(w, err, "PutObjectMeta", bucket, key)
+			return
+		}
 
 		w.Header().Set("ETag", etag)
 		w.Header().Set("X-Amz-Version-Id", "null")
@@ -613,7 +634,10 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	h.applyObjectLock(r, &meta, bucket, now)
 
-	h.store.PutObjectMeta(meta)
+	if err := h.store.PutObjectMeta(meta); err != nil {
+		metaWriteFailed(w, err, "PutObjectMeta", bucket, key)
+		return
+	}
 	if h.replicatePlacement != nil {
 		h.replicatePlacement(bucket, key) // copy data to replica-set peers (issue #37)
 	}
@@ -662,6 +686,9 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		// Get specific version
 		meta, err = h.store.GetObjectVersion(bucket, key, versionID)
 		if err != nil {
+			if metadataUnavailable(w, err) {
+				return
+			}
 			writeS3Error(w, "NoSuchVersion", "Version not found", http.StatusNotFound)
 			return
 		}
@@ -685,7 +712,11 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 	} else {
 		// Get latest version. Consistent read: barrier-on-miss so a GET right after
 		// a PUT on another cluster node doesn't spuriously 404 (issue #37).
-		meta, _ = h.store.GetObjectMetaConsistent(bucket, key)
+		var metaErr error
+		meta, metaErr = h.store.GetObjectMetaConsistent(bucket, key)
+		if meta == nil && metadataUnavailable(w, metaErr) {
+			return
+		}
 		if meta != nil && meta.DeleteMarker {
 			w.Header().Set("X-Amz-Delete-Marker", "true")
 			if meta.VersionID != "" {
@@ -919,150 +950,192 @@ func (h *ObjectHandler) DeleteObject(w http.ResponseWriter, r *http.Request, buc
 
 	versionID := r.URL.Query().Get("versionId")
 	versioning, _ := h.store.GetBucketVersioning(bucket)
+	bypassGov := strings.EqualFold(r.Header.Get("X-Amz-Bypass-Governance-Retention"), "true")
 
-	if versionID != "" {
-		// Delete specific version permanently
-		// Check object lock first (with governance bypass if header present)
-		bypassGov := strings.EqualFold(r.Header.Get("X-Amz-Bypass-Governance-Retention"), "true")
-		if err := h.checkObjectLock(bucket, key, versionID, bypassGov); err != nil {
-			writeS3Error(w, "AccessDenied", err.Error(), http.StatusForbidden)
+	del, err := h.deleteOneObject(bucket, key, versionID, versioning, bypassGov)
+	if err != nil {
+		var refused *deleteRefused
+		if errors.As(err, &refused) {
+			writeS3Error(w, "AccessDenied", refused.Error(), http.StatusForbidden)
 			return
 		}
-
-		h.engine.DeleteObjectVersion(bucket, key, versionID)
-		h.store.DeleteObjectVersion(bucket, key, versionID)
-		h.reapElsewhere(bucket, key, versionID)
-
-		// If we deleted the latest, find the new latest
-		versions, _, _ := h.store.ListObjectVersions(bucket, key, "", "", 1)
-		if len(versions) > 0 {
-			// There's still a version — make it latest
-			versions[0].IsLatest = true
-			h.store.UpdateObjectVersionMeta(versions[0])
-		} else {
-			// No versions left — remove from objects bucket
-			h.store.DeleteObjectMeta(bucket, key)
+		var notRecorded *deleteNotRecorded
+		if errors.As(err, &notRecorded) {
+			metaWriteFailed(w, notRecorded.err, notRecorded.op, bucket, key)
+			return
 		}
-
-		w.Header().Set("X-Amz-Version-Id", versionID)
-		w.WriteHeader(http.StatusNoContent)
-		if h.onNotification != nil {
-			h.onNotification("s3:ObjectRemoved:Delete", bucket, key, 0, "", versionID)
-		}
-		if h.onReplication != nil {
-			h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", versionID)
-		}
-		if h.onLambda != nil {
-			h.onLambda("s3:ObjectRemoved:Delete", bucket, key, 0, "", versionID)
-		}
-		if h.onSearchUpdate != nil {
-			h.onSearchUpdate("delete", bucket, key)
-		}
-		return
-	}
-
-	if versioning == "Enabled" {
-		// Create a delete marker instead of actually deleting
-		dmVersionID := generateVersionID()
-
-		// Mark previous latest as not latest
-		if oldMeta, err := h.store.GetObjectMeta(bucket, key); err == nil && oldMeta.VersionID != "" {
-			oldMeta.IsLatest = false
-			h.store.PutObjectVersion(*oldMeta)
-		}
-
-		dm := metadata.ObjectMeta{
-			Bucket:       bucket,
-			Key:          key,
-			VersionID:    dmVersionID,
-			IsLatest:     true,
-			DeleteMarker: true,
-			LastModified: time.Now().UTC().Unix(),
-		}
-		h.store.PutObjectVersion(dm)
-		h.store.PutObjectMeta(dm) // latest pointer now points to delete marker
-
-		w.Header().Set("X-Amz-Delete-Marker", "true")
-		w.Header().Set("X-Amz-Version-Id", dmVersionID)
-		w.WriteHeader(http.StatusNoContent)
-		if h.onNotification != nil {
-			h.onNotification("s3:ObjectRemoved:Delete", bucket, key, 0, "", dmVersionID)
-		}
-		if h.onReplication != nil {
-			h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", dmVersionID)
-		}
-		if h.onLambda != nil {
-			h.onLambda("s3:ObjectRemoved:Delete", bucket, key, 0, "", dmVersionID)
-		}
-		if h.onSearchUpdate != nil {
-			h.onSearchUpdate("delete", bucket, key)
-		}
-		return
-	}
-
-	if versioning == "Suspended" {
-		// Suspended versioning: create a null-version delete marker
-		// Remove existing null version if any
-		h.engine.DeleteObjectVersion(bucket, key, "null")
-		h.store.DeleteObjectVersion(bucket, key, "null")
-		h.reapElsewhere(bucket, key, "null")
-
-		dm := metadata.ObjectMeta{
-			Bucket:       bucket,
-			Key:          key,
-			VersionID:    "null",
-			IsLatest:     true,
-			DeleteMarker: true,
-			LastModified: time.Now().UTC().Unix(),
-		}
-		h.store.PutObjectVersion(dm)
-		h.store.PutObjectMeta(dm)
-
-		w.Header().Set("X-Amz-Delete-Marker", "true")
-		w.Header().Set("X-Amz-Version-Id", "null")
-		w.WriteHeader(http.StatusNoContent)
-		if h.onNotification != nil {
-			h.onNotification("s3:ObjectRemoved:Delete", bucket, key, 0, "", "null")
-		}
-		if h.onReplication != nil {
-			h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", "null")
-		}
-		if h.onLambda != nil {
-			h.onLambda("s3:ObjectRemoved:Delete", bucket, key, 0, "", "null")
-		}
-		if h.onSearchUpdate != nil {
-			h.onSearchUpdate("delete", bucket, key)
-		}
-		return
-	}
-
-	// Non-versioned: enforce any WORM retention / legal hold before deleting.
-	// Without this, an object under a COMPLIANCE (or non-bypassed GOVERNANCE)
-	// retention lock could be permanently deleted, defeating object lock.
-	bypassGovNV := strings.EqualFold(r.Header.Get("X-Amz-Bypass-Governance-Retention"), "true")
-	if err := h.checkObjectLock(bucket, key, "", bypassGovNV); err != nil {
-		writeS3Error(w, "AccessDenied", err.Error(), http.StatusForbidden)
-		return
-	}
-
-	// Non-versioned: delete normally
-	if err := h.engine.DeleteObject(bucket, key); err != nil {
 		slog.Error("internal error", "error", err)
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 		return
 	}
-
-	h.store.DeleteObjectMeta(bucket, key)
-	h.reapElsewhere(bucket, key, "")
+	if del.Reap {
+		h.reapElsewhere(bucket, key, del.ReapVersion)
+	}
+	if del.DeleteMarker {
+		w.Header().Set("X-Amz-Delete-Marker", "true")
+	}
+	if del.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", del.VersionID)
+	}
 	w.WriteHeader(http.StatusNoContent)
+	h.notifyDeleted(bucket, key, del.VersionID)
+}
+
+// One key's delete, applied the same way whichever request asked for it.
+//
+// DeleteObject and BatchDelete used to decide independently what a delete means,
+// and they disagreed: the multi-object path removed the data and the metadata
+// unconditionally, so on a versioning-enabled bucket it DESTROYED the object
+// where a single delete would have written a delete marker and kept every
+// version. That is silent data loss on the operation Spark and Hadoop S3A use to
+// clean up, and it is invisible until someone asks for an old version. Both
+// paths now go through deleteOneObject so they cannot drift again.
+
+// objectDeletion says what a delete actually did, so the caller can answer with
+// the right headers or the right entry in a multi-object result.
+type objectDeletion struct {
+	// VersionID is the version removed, or the delete marker written. Empty on a
+	// non-versioned bucket, where a delete names no version.
+	VersionID string
+	// DeleteMarker reports that a marker was written rather than data removed.
+	DeleteMarker bool
+	// Reap reports that a data file was removed here, so the copies other nodes
+	// hold have to go too (issue #47). ReapVersion is the version to remove.
+	Reap        bool
+	ReapVersion string
+}
+
+// deleteRefused means object lock refused the delete. It is a permanent answer,
+// not something to retry.
+type deleteRefused struct{ err error }
+
+func (e *deleteRefused) Error() string { return e.err.Error() }
+func (e *deleteRefused) Unwrap() error { return e.err }
+
+// deleteNotRecorded means a metadata write failed. The bytes may already be
+// gone, so the caller must report the delete as UNSUCCESSFUL: metadata is
+// authoritative (issue #34), and a delete reported as done while the object
+// still lists is the failure mode issue #50 P0 closed on the write path.
+type deleteNotRecorded struct {
+	op  string
+	err error
+}
+
+func (e *deleteNotRecorded) Error() string { return e.op + ": " + e.err.Error() }
+func (e *deleteNotRecorded) Unwrap() error { return e.err }
+
+// deleteOneObject applies the versioning-correct delete of one key.
+//
+// versionID names a specific version to remove permanently; empty means "delete
+// the object", which on a versioned bucket means writing a delete marker and
+// keeping the data.
+func (h *ObjectHandler) deleteOneObject(bucket, key, versionID, versioning string, bypassGovernance bool) (objectDeletion, error) {
+	if versionID != "" {
+		return h.deleteObjectVersion(bucket, key, versionID, bypassGovernance)
+	}
+	switch versioning {
+	case "Enabled":
+		return h.writeDeleteMarker(bucket, key, generateVersionID())
+	case "Suspended":
+		// Suspended versioning replaces the null version with a null delete
+		// marker, so the previous null version's data does go.
+		h.engine.DeleteObjectVersion(bucket, key, "null")
+		if err := h.store.DeleteObjectVersion(bucket, key, "null"); err != nil {
+			return objectDeletion{}, &deleteNotRecorded{op: "DeleteObjectVersion", err: err}
+		}
+		del, err := h.writeDeleteMarker(bucket, key, "null")
+		if err != nil {
+			return del, err
+		}
+		del.Reap, del.ReapVersion = true, "null"
+		return del, nil
+	}
+	return h.deleteCurrentObject(bucket, key, bypassGovernance)
+}
+
+// deleteObjectVersion removes one version permanently and repoints "latest" if
+// that version was the current one.
+func (h *ObjectHandler) deleteObjectVersion(bucket, key, versionID string, bypassGovernance bool) (objectDeletion, error) {
+	if err := h.checkObjectLock(bucket, key, versionID, bypassGovernance); err != nil {
+		return objectDeletion{}, &deleteRefused{err: err}
+	}
+	h.engine.DeleteObjectVersion(bucket, key, versionID)
+	if err := h.store.DeleteObjectVersion(bucket, key, versionID); err != nil {
+		return objectDeletion{}, &deleteNotRecorded{op: "DeleteObjectVersion", err: err}
+	}
+
+	// The newest surviving version becomes current. Both records have to move:
+	// the version entry carries IsLatest, and the objects bucket holds the
+	// "latest" pointer, which still names the version just removed. Repointing
+	// only one of them is what left a deleted delete marker hiding a live object.
+	latest, _ := h.store.LatestObjectVersion(bucket, key)
+	if latest != nil {
+		latest.IsLatest = true
+		if err := h.store.UpdateObjectVersionMeta(*latest); err != nil {
+			return objectDeletion{}, &deleteNotRecorded{op: "promote next version", err: err}
+		}
+		if err := h.store.PutObjectMeta(*latest); err != nil {
+			return objectDeletion{}, &deleteNotRecorded{op: "repoint latest version", err: err}
+		}
+	} else if err := h.store.DeleteObjectMeta(bucket, key); err != nil {
+		return objectDeletion{}, &deleteNotRecorded{op: "DeleteObjectMeta", err: err}
+	}
+	return objectDeletion{VersionID: versionID, Reap: true, ReapVersion: versionID}, nil
+}
+
+// writeDeleteMarker hides the object behind a marker, keeping every version.
+// No object-lock check: nothing is destroyed, which is also why S3 allows it on
+// a locked object.
+func (h *ObjectHandler) writeDeleteMarker(bucket, key, markerVersionID string) (objectDeletion, error) {
+	if old, err := h.store.GetObjectMeta(bucket, key); err == nil && old.VersionID != "" {
+		old.IsLatest = false
+		if err := h.store.PutObjectVersion(*old); err != nil {
+			return objectDeletion{}, &deleteNotRecorded{op: "demote previous version", err: err}
+		}
+	}
+	dm := metadata.ObjectMeta{
+		Bucket:       bucket,
+		Key:          key,
+		VersionID:    markerVersionID,
+		IsLatest:     true,
+		DeleteMarker: true,
+		LastModified: time.Now().UTC().Unix(),
+	}
+	if err := h.store.PutObjectVersion(dm); err != nil {
+		return objectDeletion{}, &deleteNotRecorded{op: "write delete marker", err: err}
+	}
+	if err := h.store.PutObjectMeta(dm); err != nil { // the latest pointer now names the marker
+		return objectDeletion{}, &deleteNotRecorded{op: "write delete marker", err: err}
+	}
+	return objectDeletion{VersionID: markerVersionID, DeleteMarker: true}, nil
+}
+
+// deleteCurrentObject removes an unversioned object's data and metadata.
+func (h *ObjectHandler) deleteCurrentObject(bucket, key string, bypassGovernance bool) (objectDeletion, error) {
+	// Enforce WORM retention and legal hold before destroying anything, or an
+	// object under a COMPLIANCE lock could be deleted outright.
+	if err := h.checkObjectLock(bucket, key, "", bypassGovernance); err != nil {
+		return objectDeletion{}, &deleteRefused{err: err}
+	}
+	if err := h.engine.DeleteObject(bucket, key); err != nil {
+		return objectDeletion{}, err
+	}
+	if err := h.store.DeleteObjectMeta(bucket, key); err != nil {
+		return objectDeletion{}, &deleteNotRecorded{op: "DeleteObjectMeta", err: err}
+	}
+	return objectDeletion{Reap: true}, nil
+}
+
+// notifyDeleted fires the four delete hooks, which every delete path shares.
+func (h *ObjectHandler) notifyDeleted(bucket, key, versionID string) {
 	if h.onNotification != nil {
-		h.onNotification("s3:ObjectRemoved:Delete", bucket, key, 0, "", "")
+		h.onNotification("s3:ObjectRemoved:Delete", bucket, key, 0, "", versionID)
 	}
 	if h.onReplication != nil {
-		h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", "")
+		h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", versionID)
 	}
 	if h.onLambda != nil {
-		h.onLambda("s3:ObjectRemoved:Delete", bucket, key, 0, "", "")
+		h.onLambda("s3:ObjectRemoved:Delete", bucket, key, 0, "", versionID)
 	}
 	if h.onSearchUpdate != nil {
 		h.onSearchUpdate("delete", bucket, key)
@@ -1148,6 +1221,9 @@ func (h *ObjectHandler) HeadObject(w http.ResponseWriter, r *http.Request, bucke
 		var err error
 		meta, err = h.store.GetObjectVersion(bucket, key, versionID)
 		if err != nil {
+			if metadataUnavailable(w, err) {
+				return
+			}
 			writeS3Error(w, "NoSuchVersion", "Version not found", http.StatusNotFound)
 			return
 		}
@@ -1161,7 +1237,11 @@ func (h *ObjectHandler) HeadObject(w http.ResponseWriter, r *http.Request, bucke
 	} else {
 		// Consistent read (barrier-on-miss) so a HEAD right after a PUT on another
 		// cluster node doesn't spuriously 404 (issue #37).
-		meta, _ = h.store.GetObjectMetaConsistent(bucket, key)
+		var metaErr error
+		meta, metaErr = h.store.GetObjectMetaConsistent(bucket, key)
+		if meta == nil && metadataUnavailable(w, metaErr) {
+			return
+		}
 		if meta != nil && meta.DeleteMarker {
 			w.Header().Set("X-Amz-Delete-Marker", "true")
 			if meta.VersionID != "" {
@@ -1339,7 +1419,10 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 		meta.ContentType = "application/octet-stream"
 	}
 
-	h.store.PutObjectMeta(meta)
+	if err := h.store.PutObjectMeta(meta); err != nil {
+		metaWriteFailed(w, err, "PutObjectMeta (copy)", bucket, key)
+		return
+	}
 
 	type copyResult struct {
 		XMLName      xml.Name `xml:"CopyObjectResult"`
@@ -1376,7 +1459,18 @@ func parseCopySource(source string) (bucket, key string) {
 	return parts[0], parts[1]
 }
 
+// maxDeleteRequestBody bounds a multi-object delete body. S3 caps the request
+// at 1000 keys, and a key can be 1024 bytes, so the old 256 KiB limit could
+// reject a legal request; this leaves room for the envelope as well.
+const maxDeleteRequestBody = 4 << 20
+
 // BatchDelete handles POST /{bucket}?delete.
+//
+// Every key goes through the same deleteOneObject the single-object DELETE uses.
+// It used to have its own logic that removed the data and the metadata
+// unconditionally, so on a versioning-enabled bucket a multi-object delete
+// DESTROYED objects that a single delete would only have hidden behind a delete
+// marker. Nothing reported it: the response said "Deleted" either way.
 func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.store.BucketExists(bucket) {
 		writeS3Error(w, "NoSuchBucket", "Bucket does not exist", http.StatusNotFound)
@@ -1384,12 +1478,13 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	var req deleteRequest
-	if err := xml.NewDecoder(io.LimitReader(r.Body, 256*1024)).Decode(&req); err != nil {
+	if err := xml.NewDecoder(io.LimitReader(r.Body, maxDeleteRequestBody)).Decode(&req); err != nil {
 		writeS3Error(w, "MalformedXML", "Could not parse request body", http.StatusBadRequest)
 		return
 	}
 
 	versioning, _ := h.store.GetBucketVersioning(bucket)
+	bypassGov := strings.EqualFold(r.Header.Get("X-Amz-Bypass-Governance-Retention"), "true")
 
 	var result deleteResult
 	// Keys whose data must also be dropped on the other nodes. This request was
@@ -1416,46 +1511,33 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 			continue
 		}
 
-		// Check object lock for versioned objects
-		if versioning == "Enabled" {
-			if meta, err := h.store.GetObjectMeta(bucket, obj.Key); err == nil && meta.VersionID != "" {
-				if lockErr := h.checkObjectLock(bucket, obj.Key, meta.VersionID); lockErr != nil {
-					result.Errors = append(result.Errors, deleteError{
-						Key:     obj.Key,
-						Code:    "AccessDenied",
-						Message: lockErr.Error(),
-					})
-					continue
-				}
-			}
+		del, err := h.deleteOneObject(bucket, obj.Key, obj.VersionID, versioning, bypassGov)
+		if err != nil {
+			result.Errors = append(result.Errors, batchDeleteError(obj, err))
+			continue
 		}
 
-		err := h.engine.DeleteObject(bucket, obj.Key)
-		if err != nil {
-			result.Errors = append(result.Errors, deleteError{
-				Key:     obj.Key,
-				Code:    "InternalError",
-				Message: err.Error(),
-			})
-		} else {
-			h.store.DeleteObjectMeta(bucket, obj.Key)
+		switch {
+		case !del.Reap:
+			// A delete marker removed nothing, so there is nothing to reap.
+		case del.ReapVersion == "":
 			reaped = append(reaped, obj.Key)
-			if !req.Quiet {
-				result.Deleted = append(result.Deleted, deletedObject{Key: obj.Key})
-			}
-			if h.onNotification != nil {
-				h.onNotification("s3:ObjectRemoved:Delete", bucket, obj.Key, 0, "", "")
-			}
-			if h.onReplication != nil {
-				h.onReplication("s3:ObjectRemoved:Delete", bucket, obj.Key, 0, "", "")
-			}
-			if h.onLambda != nil {
-				h.onLambda("s3:ObjectRemoved:Delete", bucket, obj.Key, 0, "", "")
-			}
-			if h.onSearchUpdate != nil {
-				h.onSearchUpdate("delete", bucket, obj.Key)
-			}
+		default:
+			// A version-specific delete cannot go through the batch reaper, which
+			// only ever removes a key's CURRENT data. Sending it there would make
+			// the peers delete the wrong file.
+			h.reapElsewhere(bucket, obj.Key, del.ReapVersion)
 		}
+
+		if !req.Quiet {
+			entry := deletedObject{Key: obj.Key, VersionID: obj.VersionID}
+			if del.DeleteMarker {
+				entry.DeleteMarker = true
+				entry.DeleteMarkerVersionID = del.VersionID
+			}
+			result.Deleted = append(result.Deleted, entry)
+		}
+		h.notifyDeleted(bucket, obj.Key, del.VersionID)
 	}
 
 	if len(reaped) > 0 {
@@ -1469,6 +1551,29 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	writeXML(w, http.StatusOK, result)
+}
+
+// batchDeleteError turns one key's failure into its entry in the result. The
+// codes match what the single-object path answers with, so a client sees the
+// same reason whichever call it made.
+func batchDeleteError(obj deleteObject, err error) deleteError {
+	entry := deleteError{Key: obj.Key, VersionID: obj.VersionID}
+	var refused *deleteRefused
+	if errors.As(err, &refused) {
+		entry.Code, entry.Message = "AccessDenied", refused.Error()
+		return entry
+	}
+	var notRecorded *deleteNotRecorded
+	if errors.As(err, &notRecorded) {
+		// Metadata is authoritative, so a key whose record survives must not be
+		// reported as deleted: it would still list (issue #34).
+		slog.Error("metadata delete failed in multi-object delete",
+			"key", obj.Key, "op", notRecorded.op, "error", notRecorded.err)
+		entry.Code, entry.Message = "SlowDown", "The delete could not be recorded, please retry"
+		return entry
+	}
+	entry.Code, entry.Message = "InternalError", err.Error()
+	return entry
 }
 
 // PutObjectTagging handles PUT /{bucket}/{key}?tagging.
@@ -1565,7 +1670,10 @@ func (h *ObjectHandler) DeleteObjectTagging(w http.ResponseWriter, r *http.Reque
 	}
 
 	meta.Tags = nil
-	h.store.PutObjectMeta(*meta)
+	if err := h.store.PutObjectMeta(*meta); err != nil {
+		metaWriteFailed(w, err, "DeleteObjectTagging", bucket, key)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 	if h.onSearchUpdate != nil {
 		h.onSearchUpdate("put", bucket, key)

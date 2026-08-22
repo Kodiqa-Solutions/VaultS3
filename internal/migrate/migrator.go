@@ -80,7 +80,7 @@ type Job struct {
 
 // Manager runs migrations from S3-compatible sources into the local store/engine.
 type Manager struct {
-	store   *metadata.Store
+	store   metadata.StoreAPI
 	engine  storage.Engine
 	mu      sync.RWMutex
 	jobs    map[string]*Job
@@ -89,7 +89,7 @@ type Manager struct {
 }
 
 // NewManager creates a migration manager.
-func NewManager(store *metadata.Store, engine storage.Engine) *Manager {
+func NewManager(store metadata.StoreAPI, engine storage.Engine) *Manager {
 	return &Manager{
 		store:   store,
 		engine:  engine,

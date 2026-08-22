@@ -54,7 +54,7 @@ type RealtimeEvent struct {
 
 // Worker handles async replication to peer VaultS3 instances.
 type Worker struct {
-	store      *metadata.Store
+	store      metadata.StoreAPI
 	engine     storage.Engine
 	peers      map[string]config.ReplicationPeer
 	interval   time.Duration
@@ -64,7 +64,7 @@ type Worker struct {
 	eventCh    chan RealtimeEvent
 }
 
-func NewWorker(store *metadata.Store, engine storage.Engine, cfg config.ReplicationConfig) *Worker {
+func NewWorker(store metadata.StoreAPI, engine storage.Engine, cfg config.ReplicationConfig) *Worker {
 	peers := make(map[string]config.ReplicationPeer)
 	for _, p := range cfg.Peers {
 		// Validate peer URLs against SSRF on startup

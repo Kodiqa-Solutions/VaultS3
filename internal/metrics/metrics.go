@@ -24,7 +24,7 @@ type bucketMetrics struct {
 
 // Collector tracks request metrics and exposes Prometheus-compatible /metrics.
 type Collector struct {
-	store  *metadata.Store
+	store  metadata.StoreAPI
 	engine storage.Engine
 
 	// Request counters by method
@@ -101,7 +101,7 @@ func methodLabel(idx int) string {
 	}
 }
 
-func NewCollector(store *metadata.Store, engine storage.Engine) *Collector {
+func NewCollector(store metadata.StoreAPI, engine storage.Engine) *Collector {
 	return &Collector{
 		store:         store,
 		engine:        engine,

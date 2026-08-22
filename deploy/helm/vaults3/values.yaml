@@ -90,11 +90,27 @@ service:
 #
 # Metadata writes are replicated across nodes via Raft consensus (a write to any
 # node is forwarded to the leader and committed), so the cluster stays consistent.
+# With metadataShards at 1 that means EVERY pod holds a complete copy of the
+# metadata (object data is sharded across pods, metadata is not), which is what
+# caps the object count per cluster: budget about 600 bytes of metadata per object
+# per pod. See docs/SCALING.md.
 # BETA: functional but newer/less battle-tested than single-node + erasure coding;
 # for maximum production durability prefer a single node with erasure coding.
 cluster:
   enabled: false
   raftPort: 9001
+  # Metadata sharding. Above 1, object metadata is split across that many
+  # independent Raft groups and each pod holds only the shards it is a member of,
+  # so metadata capacity grows with the cluster instead of being copied to every
+  # pod. Read docs/design/sharded-metadata.md before enabling it:
+  #   - the shard count is FIXED once the cluster commits its assignment, because
+  #     buckets hash to a shard. There is no resharding.
+  #   - it cannot be enabled on a cluster that already holds objects; the pods
+  #     refuse to start rather than hide the metadata already written.
+  #   - the cluster needs at least metadataReplicas pods before the assignment can
+  #     be created, so replicaCount must be >= metadataReplicas.
+  metadataShards: 1
+  metadataReplicas: 3
 
 ingress:
   enabled: false

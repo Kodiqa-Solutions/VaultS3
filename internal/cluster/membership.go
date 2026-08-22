@@ -122,7 +122,7 @@ func (n *Node) JoinHandler() http.HandlerFunc {
 					http.Error(w, "no leader available", http.StatusServiceUnavailable)
 					return
 				}
-				w.Header().Set("Location", fmt.Sprintf("http://%s/cluster/join", apiAddrFromRaft(leaderAddr)))
+				w.Header().Set("Location", fmt.Sprintf("http://%s/cluster/join", apiAddrFromRaft(leaderAddr, n.cfg.APIPort)))
 				http.Error(w, "not leader, redirect to: "+leaderAddr, http.StatusTemporaryRedirect)
 				return
 			}
@@ -253,11 +253,11 @@ func postJoin(ctx context.Context, client *http.Client, addr string, body []byte
 // leader's /cluster/apply endpoint to be committed. Used by the DistributedStore
 // when a write lands on a follower, so clients can write to any node.
 func (n *Node) ForwardToLeader(data []byte) error {
-	leaderRaft := n.LeaderAddr()
-	if leaderRaft == "" {
+	leaderAPI, err := n.leaderAPIAddr()
+	if err != nil {
 		return fmt.Errorf("cluster: no leader to forward write to")
 	}
-	url := fmt.Sprintf("http://%s/cluster/apply", apiAddrFromRaft(leaderRaft))
+	url := fmt.Sprintf("http://%s/cluster/apply", leaderAPI)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -315,13 +315,42 @@ func (n *Node) ApplyHandler() http.HandlerFunc {
 	}
 }
 
-// apiAddrFromRaft converts a Raft address (host:raftPort) to an API address (host:apiPort).
-// Since we can't know the API port from the Raft port, we use a convention:
-// Raft port 9001 → API port 9000 (raftPort - 1).
-func apiAddrFromRaft(raftAddr string) string {
-	parts := strings.Split(raftAddr, ":")
-	if len(parts) != 2 {
+// defaultAPIPort is the API port assumed for a peer when nothing better is
+// known. It is the port the image, the chart and the sample config all use.
+const defaultAPIPort = 9000
+
+// leaderAPIAddr resolves the leader's API address, which is where a follower
+// sends a write it cannot commit itself.
+//
+// A Raft address carries the raft port and says nothing about the API port, so
+// there are three sources in order of how much they actually know: an explicit
+// cluster.peer_apis entry for that node, this node's own api_port (nodes on one
+// host must differ, but a uniform deployment does not), and the default. Before
+// this the answer was always the default, so any cluster not serving the API on
+// 9000 could not forward a write to its leader at all.
+func (n *Node) leaderAPIAddr() (string, error) {
+	addr, id := n.raft.LeaderWithID()
+	if addr == "" {
+		return "", fmt.Errorf("cluster: no leader")
+	}
+	if configured := n.cfg.PeerAPIs[string(id)]; configured != "" {
+		return configured, nil
+	}
+	return apiAddrFromRaft(string(addr), n.cfg.APIPort), nil
+}
+
+// apiAddrFromRaft converts a Raft address (host:raftPort) to an API address
+// (host:apiPort), using apiPort when the caller knows one.
+func apiAddrFromRaft(raftAddr string, apiPort int) string {
+	host := raftAddr
+	if i := strings.LastIndex(raftAddr, ":"); i >= 0 {
+		host = raftAddr[:i]
+	}
+	if host == "" {
 		return raftAddr
 	}
-	return parts[0] + ":9000"
+	if apiPort <= 0 {
+		apiPort = defaultAPIPort
+	}
+	return fmt.Sprintf("%s:%d", host, apiPort)
 }

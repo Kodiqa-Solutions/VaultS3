@@ -55,14 +55,20 @@ func (h *ObjectHandler) SnowballUpload(w http.ResponseWriter, r *http.Request, b
 		}
 
 		ct := "application/octet-stream"
-		h.store.PutObjectMeta(metadata.ObjectMeta{
+		if err := h.store.PutObjectMeta(metadata.ObjectMeta{
 			Bucket:       bucket,
 			Key:          key,
 			Size:         size,
 			ETag:         etag,
 			ContentType:  ct,
 			LastModified: time.Now().UTC().UnixNano(),
-		})
+		}); err != nil {
+			// One entry of a batch import: record it and keep going, but never
+			// count it as imported.
+			slog.Error("snowball: metadata write failed, entry not imported",
+				"bucket", bucket, "key", key, "error", err)
+			continue
+		}
 
 		if h.onNotification != nil {
 			h.onNotification("s3:ObjectCreated:Put", bucket, key, size, etag, "")

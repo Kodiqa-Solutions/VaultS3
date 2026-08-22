@@ -65,17 +65,34 @@ func reservedTopLevel(name string) bool {
 		strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")
 }
 
+// Presence is the answer to "does metadata still refer to this data". It is
+// deliberately three-valued: a lookup that FAILED is not the same as a lookup
+// that found nothing, and collapsing the two is how a scanner deletes live data.
+// This is the issue #47 rule ("only delete what is positively understood") made
+// impossible to get wrong by accident.
+type Presence int
+
+const (
+	// Unknown means the lookup could not be answered: the metadata store errored,
+	// or the shard holding this bucket was unreachable. Never delete on Unknown.
+	Unknown Presence = iota
+	// Present means metadata refers to this data. Keep it.
+	Present
+	// Absent means metadata positively does not refer to it. Reclaimable.
+	Absent
+)
+
 // Lookup answers whether metadata still refers to a piece of data. Implemented by
 // the metadata store; kept as an interface so this package does not depend on it
 // and can be tested with a map.
 type Lookup interface {
 	// HasObject reports whether a current object exists at bucket/key.
-	HasObject(bucket, key string) bool
+	HasObject(bucket, key string) Presence
 	// HasVersion reports whether a specific version still exists.
-	HasVersion(bucket, key, versionID string) bool
+	HasVersion(bucket, key, versionID string) Presence
 	// HasUpload reports whether an in-progress multipart upload still exists.
 	// Multipart state is node-local (issue #32), so this is a local answer.
-	HasUpload(uploadID string) bool
+	HasUpload(uploadID string) Presence
 }
 
 // Orphan is a single reclaimable path.
@@ -99,6 +116,13 @@ type Report struct {
 	// Skipped counts files that looked orphaned but were too new to touch, which
 	// is the expected state of a busy cluster and not a problem.
 	SkippedTooNew uint64 `json:"skippedTooNew"`
+	// SkippedUnknown counts files whose metadata could not be read at all. These
+	// are never deleted and never counted as orphans: the scan simply cannot say.
+	SkippedUnknown uint64 `json:"skippedUnknown"`
+	// Incomplete lists the buckets that produced at least one unanswerable
+	// lookup. A caller must not conclude anything about these buckets from this
+	// report, and Run refuses to delete inside them.
+	Incomplete []string `json:"incomplete,omitempty"`
 	// Deleted and DeletedBytes are zero on a dry run.
 	Deleted      uint64 `json:"deleted"`
 	DeletedBytes uint64 `json:"deletedBytes"`
@@ -114,6 +138,12 @@ type Report struct {
 	MinAge    string    `json:"minAge"`
 	StartedAt time.Time `json:"startedAt"`
 	TookMs    int64     `json:"tookMs"`
+
+	// pending holds the orphans found in a bucket until its scan finishes. A
+	// bucket can be revealed as incomplete at any point in the walk, including
+	// after files that would otherwise have been deleted, so nothing is removed
+	// until the whole bucket has been read.
+	pending map[string][]Orphan
 }
 
 const maxSamples = 20
@@ -179,6 +209,7 @@ func Run(opts Options, look Lookup) (*Report, error) {
 		if name == multipartDir {
 			if len(only) == 0 {
 				scanMultipart(filepath.Join(opts.DataDir, name), cutoff, look, rep)
+				flushDeletions(rep, "")
 			}
 			continue
 		}
@@ -191,6 +222,7 @@ func Run(opts Options, look Lookup) (*Report, error) {
 			continue
 		}
 		scanBucket(filepath.Join(opts.DataDir, name), name, cutoff, look, rep)
+		flushDeletions(rep, name)
 	}
 
 	finish(rep, nowFn().Sub(start))
@@ -242,12 +274,22 @@ func scanBucket(root, bucket string, cutoff time.Time, look Lookup, rep *Report)
 				return nil
 			}
 			key, version := vrel[:idx], vrel[idx+1:]
-			if look.HasVersion(bucket, key, version) {
+			switch look.HasVersion(bucket, key, version) {
+			case Present:
+				return nil
+			case Unknown:
+				markUnknown(rep, bucket)
 				return nil
 			}
 			o = Orphan{Bucket: bucket, Key: key, Version: version}
 		} else {
-			if look.HasObject(bucket, rel) {
+			switch look.HasObject(bucket, rel) {
+			case Present:
+				return nil
+			case Unknown:
+				// The metadata for this bucket could not be read, so the file may
+				// well be live. It is neither deleted nor counted as an orphan.
+				markUnknown(rep, bucket)
 				return nil
 			}
 			o = Orphan{Bucket: bucket, Key: rel}
@@ -286,7 +328,11 @@ func scanMultipart(root string, cutoff time.Time, look Lookup, rep *Report) {
 			continue
 		}
 		uploadID := u.Name()
-		if look.HasUpload(uploadID) {
+		switch look.HasUpload(uploadID) {
+		case Present:
+			continue
+		case Unknown:
+			markUnknown(rep, "")
 			continue
 		}
 		dir := filepath.Join(root, uploadID)
@@ -303,6 +349,29 @@ func scanMultipart(root string, cutoff time.Time, look Lookup, rep *Report) {
 			return nil
 		})
 	}
+}
+
+// markUnknown records that a bucket produced an unanswerable lookup. The bucket
+// is then reported as incomplete and Run refuses to delete anything inside it,
+// so an unreachable metadata shard can never be read as "these files are junk".
+func markUnknown(rep *Report, bucket string) {
+	rep.SkippedUnknown++
+	for _, b := range rep.Incomplete {
+		if b == bucket {
+			return
+		}
+	}
+	rep.Incomplete = append(rep.Incomplete, bucket)
+}
+
+// bucketIncomplete reports whether any lookup in this bucket went unanswered.
+func bucketIncomplete(rep *Report, bucket string) bool {
+	for _, b := range rep.Incomplete {
+		if b == bucket {
+			return true
+		}
+	}
+	return false
 }
 
 // record applies the age guard and accounts (and optionally deletes) one orphan.
@@ -327,9 +396,30 @@ func record(rep *Report, bucket string, o Orphan, d fs.DirEntry, cutoff time.Tim
 	rep.Samples = append(rep.Samples, o)
 
 	if !rep.DryRun {
+		if rep.pending == nil {
+			rep.pending = map[string][]Orphan{}
+		}
+		rep.pending[bucket] = append(rep.pending[bucket], o)
+	}
+}
+
+// flushDeletions removes the orphans found in one bucket, once its scan has
+// finished and is known to be complete.
+//
+// A bucket with even one unanswerable lookup is not understood well enough to
+// delete from: the metadata source that went silent may hold the very entry that
+// makes one of these files live. That bucket keeps its data and is reported as
+// incomplete (the issue #47 rule: only delete what is positively understood).
+func flushDeletions(rep *Report, bucket string) {
+	orphans := rep.pending[bucket]
+	delete(rep.pending, bucket)
+	if rep.DryRun || bucketIncomplete(rep, bucket) {
+		return
+	}
+	for _, o := range orphans {
 		if err := os.Remove(o.Path); err != nil {
 			rep.Errors = append(rep.Errors, o.Path+": "+err.Error())
-			return
+			continue
 		}
 		rep.Deleted++
 		rep.DeletedBytes += o.Bytes

@@ -262,6 +262,22 @@ cluster:
   # membership, which knows only the raft port and assumes this node's API port.
   # An entry here always wins over the derived address.
   peer_apis: {}
+  # Metadata sharding (issue #50). At 1, every node holds a complete copy of the
+  # object metadata (it is replicated by Raft, while object DATA is spread across
+  # nodes by hash), which is what caps a cluster's object count: budget about 600
+  # bytes per object, on every node.
+  #
+  # Above 1, object metadata is split across that many independent Raft groups
+  # and each node holds only the shards it is a member of, so metadata capacity
+  # grows with the cluster. Read docs/design/sharded-metadata.md first:
+  #   - the shard count is FIXED when the cluster first commits its assignment,
+  #     because buckets hash to a shard. There is no resharding.
+  #   - it cannot be turned on for a cluster that already holds object metadata.
+  #     The server refuses to start rather than hide the existing records.
+  #   - a bucket's metadata lives on metadata_replicas nodes, so the cluster needs
+  #     at least that many nodes before the assignment can be created.
+  metadata_shards: 1
+  metadata_replicas: 3         # nodes holding each shard
   placement:
     # Default number of nodes holding each object; override per bucket with
     # `vaults3-cli bucket durability <bucket> --replicas=N`.

@@ -13,13 +13,13 @@ import (
 // It records each put/delete with the site's vector clock so remote sites
 // can request only changes they haven't seen yet.
 type ChangeLog struct {
-	store  *metadata.Store
+	store  metadata.StoreAPI
 	siteID string
 	mu     sync.Mutex
 }
 
 // NewChangeLog creates a change log backed by the metadata store.
-func NewChangeLog(store *metadata.Store, siteID string) *ChangeLog {
+func NewChangeLog(store metadata.StoreAPI, siteID string) *ChangeLog {
 	return &ChangeLog{
 		store:  store,
 		siteID: siteID,

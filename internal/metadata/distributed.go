@@ -153,14 +153,25 @@ type raftCommand struct {
 	Data json.RawMessage `json:"d"`
 }
 
-func (d *DistributedStore) apply(cmdType uint16, payload interface{}) error {
+// marshalRaftCommand serializes one metadata command in the wire format the
+// cluster FSM decodes. Shared with the ShardedStore, which sends the same
+// commands to a shard group instead of the control group.
+func marshalRaftCommand(cmdType uint16, payload interface{}) ([]byte, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal command payload: %w", err)
+		return nil, fmt.Errorf("marshal command payload: %w", err)
 	}
 	cmdData, err := json.Marshal(raftCommand{Type: cmdType, Data: data})
 	if err != nil {
-		return fmt.Errorf("marshal command: %w", err)
+		return nil, fmt.Errorf("marshal command: %w", err)
+	}
+	return cmdData, nil
+}
+
+func (d *DistributedStore) apply(cmdType uint16, payload interface{}) error {
+	cmdData, err := marshalRaftCommand(cmdType, payload)
+	if err != nil {
+		return err
 	}
 	// Writes must be committed on the leader. If this node is a follower, forward
 	// the command to the leader rather than failing — so a client can write to

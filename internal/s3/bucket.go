@@ -167,6 +167,18 @@ func (h *BucketHandler) DeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
+	// Two phases, object metadata first. With sharded metadata a bucket's object
+	// records live in the shard that owns the bucket rather than beside the
+	// bucket record, so removing the bucket while that shard is unreachable
+	// would leave records nothing owns, which a bucket recreated under the same
+	// name would then inherit (issue #50).
+	if err := h.store.DeleteBucketObjectMeta(bucket); err != nil {
+		slog.Error("could not clear a bucket's object metadata before deleting it",
+			"bucket", bucket, "error", err)
+		writeS3Error(w, "ServiceUnavailable",
+			"The bucket's object metadata could not be cleared, retry the request", http.StatusServiceUnavailable)
+		return
+	}
 	if err := h.store.DeleteBucket(bucket); err != nil {
 		slog.Error("internal error", "error", err)
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)

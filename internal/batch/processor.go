@@ -34,14 +34,14 @@ type Job struct {
 
 // Processor handles batch operations.
 type Processor struct {
-	store  *metadata.Store
+	store  metadata.StoreAPI
 	engine storage.Engine
 	mu     sync.RWMutex
 	jobs   map[string]*Job
 }
 
 // NewProcessor creates a new batch processor.
-func NewProcessor(store *metadata.Store, engine storage.Engine) *Processor {
+func NewProcessor(store metadata.StoreAPI, engine storage.Engine) *Processor {
 	return &Processor{
 		store:  store,
 		engine: engine,

@@ -19,7 +19,7 @@ import (
 // Rebalancer handles background migration of objects when cluster membership changes.
 // When a node joins or leaves, some objects need to move to their new primary node.
 type Rebalancer struct {
-	store        *metadata.Store
+	store        metadata.StoreAPI
 	engine       storage.Engine
 	ring         *HashRing
 	proxy        *Proxy
@@ -46,7 +46,7 @@ func applyRebalanceDefaults(c *RebalanceConfig) {
 
 // NewRebalancer creates a new rebalancer.
 func NewRebalancer(
-	store *metadata.Store,
+	store metadata.StoreAPI,
 	engine storage.Engine,
 	ring *HashRing,
 	proxy *Proxy,

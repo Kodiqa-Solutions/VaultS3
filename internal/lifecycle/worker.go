@@ -14,7 +14,7 @@ import (
 )
 
 type Worker struct {
-	store              *metadata.Store
+	store              metadata.StoreAPI
 	engine             storage.Engine
 	interval           time.Duration
 	auditRetentionDays int
@@ -36,7 +36,7 @@ func (w *Worker) reapElsewhere(bucket, key, versionID string) {
 	}
 }
 
-func NewWorker(store *metadata.Store, engine storage.Engine, intervalSecs, auditRetentionDays int) *Worker {
+func NewWorker(store metadata.StoreAPI, engine storage.Engine, intervalSecs, auditRetentionDays int) *Worker {
 	return &Worker{
 		store:              store,
 		engine:             engine,

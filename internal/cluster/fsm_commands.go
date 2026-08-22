@@ -82,6 +82,9 @@ const (
 
 	// Per-bucket durability overrides (erasure coding, replica count)
 	CmdSetBucketDurability
+
+	// Metadata shard assignment (issue #50)
+	CmdPutShardMap
 )
 
 // Command is the serialized Raft log entry.

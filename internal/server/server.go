@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -69,13 +70,64 @@ var replClient = cluster.InterNodeClient(0)
 
 // clusterControllerAdapter adapts *cluster.Node to api.ClusterController so the
 // admin API can drive membership without importing internal/cluster's raft types.
-type clusterControllerAdapter struct{ n *cluster.Node }
+type clusterControllerAdapter struct {
+	n  *cluster.Node
+	rt *cluster.ShardRuntime
+}
 
 func (a clusterControllerAdapter) SelfID() string             { return a.n.NodeID() }
 func (a clusterControllerAdapter) IsLeader() bool             { return a.n.IsLeader() }
 func (a clusterControllerAdapter) LeaderID() string           { return a.n.LeaderID() }
 func (a clusterControllerAdapter) Join(id, addr string) error { return a.n.Join(id, addr) }
 func (a clusterControllerAdapter) Leave(id string) error      { return a.n.Leave(id) }
+
+// ShardMap reports the committed metadata shard assignment. A read error is
+// reported as "no map" after logging: this endpoint is informational, and an
+// unreadable map is not an assignment the caller should act on.
+func (a clusterControllerAdapter) ShardMap() *api.ShardAssignment {
+	m, err := a.n.CommittedShardMap()
+	if err != nil {
+		slog.Warn("cluster: cannot read the committed shard map", "error", err)
+		return nil
+	}
+	if m == nil {
+		return nil
+	}
+	return &api.ShardAssignment{
+		Version:  m.Version,
+		Epoch:    m.Epoch,
+		Shards:   m.Shards,
+		Replicas: m.Replicas,
+		Members:  m.Members,
+		Founders: m.Founders,
+	}
+}
+
+// LocalShards reports the metadata shard groups this node is running, which is
+// how an operator watches reconciliation: a group whose Raft members differ from
+// the committed assignment is one the reconciler is still working on.
+func (a clusterControllerAdapter) LocalShards() []api.LocalShard {
+	if a.rt == nil {
+		return nil
+	}
+	shards := a.rt.Shards()
+	sort.Ints(shards)
+	out := make([]api.LocalShard, 0, len(shards))
+	for _, shard := range shards {
+		g, err := a.rt.Group(shard)
+		if err != nil {
+			continue
+		}
+		ls := api.LocalShard{Shard: shard, IsLeader: g.IsLeader(), LeaderID: g.LeaderID()}
+		if servers, err := g.Members(); err == nil {
+			for _, srv := range servers {
+				ls.Members = append(ls.Members, string(srv.ID))
+			}
+		}
+		out = append(out, ls)
+	}
+	return out
+}
 
 func (a clusterControllerAdapter) Members() []api.ClusterMember {
 	leaderID := a.n.LeaderID()
@@ -116,6 +168,9 @@ type Server struct {
 	accessUpdater   *metadata.AccessUpdater
 	clusterNode     *cluster.Node
 	clusterProxy    *cluster.Proxy
+	shardService    *cluster.ShardService
+	shardRuntime    *cluster.ShardRuntime
+	shardRouter     *cluster.ShardRouter
 	failoverProxy   *cluster.FailoverProxy
 	failureDetector *cluster.FailureDetector
 	rebalancer      *cluster.Rebalancer
@@ -272,26 +327,45 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("init metadata: %w", err)
 	}
 
-	// Initialize erasure healer if EC is enabled
-	if ecEngine != nil {
-		healInterval := cfg.Erasure.HealInterval
-		if healInterval <= 0 {
-			healInterval = 3600
-		}
-		ecHealer = erasure.NewHealer(store, ecEngine, healInterval)
-
-		// Let a bucket opt out of erasure coding, so data that is cheap to
-		// recreate can be stored once instead of carrying parity (issue #39).
-		// The global setting remains the default for buckets that say nothing.
-		ecEngine.SetBucketPolicy(func(bucket string) bool {
-			return store.BucketDurability(bucket, true, 0).ErasureEnabled
-		})
-	}
-
 	// Initialize cluster if enabled
 	var clusterNode *cluster.Node
 	var clusterProxy *cluster.Proxy
+	var shardService *cluster.ShardService
+	var shardRuntime *cluster.ShardRuntime
+	var shardRouter *cluster.ShardRouter
 	if cfg.Cluster.Enabled {
+		// Normalise here rather than letting each component default its own copy,
+		// so the shard service and the Raft node agree on the replica count.
+		cluster.ApplyDefaults(&cfg.Cluster)
+		// Sharding splits object metadata across independent Raft groups, so the
+		// shard count fixes which bucket lives in which group and cannot change
+		// afterwards. A count larger than a node could run is refused rather than
+		// clamped: a silent adjustment would leave an operator believing their
+		// metadata is spread differently than it is (issue #50).
+		if cfg.Cluster.MetadataShards > cluster.MaxMetadataShards {
+			store.Close()
+			return nil, fmt.Errorf("cluster.metadata_shards is %d, which is more than the %d this build supports",
+				cfg.Cluster.MetadataShards, cluster.MaxMetadataShards)
+		}
+		// Turning sharding on for a cluster that already holds object metadata
+		// would leave every existing record in the control group, which nothing
+		// reads once objects are routed to shards: the data would still be on
+		// disk and every object would 404. There is no in-place migration, so
+		// this is refused rather than attempted.
+		if cfg.Cluster.MetadataShards > 1 {
+			hasObjects, err := store.HasObjectMetadata()
+			if err != nil {
+				store.Close()
+				return nil, fmt.Errorf("check existing object metadata: %w", err)
+			}
+			if hasObjects {
+				store.Close()
+				return nil, fmt.Errorf("cluster.metadata_shards is %d, but this node's metadata store already holds object metadata "+
+					"that was written unsharded; there is no in-place migration, so either set metadata_shards back to 1 "+
+					"or start a new sharded cluster and copy the objects across (see docs/design/sharded-metadata.md)",
+					cfg.Cluster.MetadataShards)
+			}
+		}
 		node, err := cluster.NewNode(cfg.Cluster, store)
 		if err != nil {
 			store.Close()
@@ -332,6 +406,30 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 
 		clusterProxy = cluster.NewProxy(ring, node, cfg.Cluster.Placement, nodeAddrs)
+		// Metadata sharding (issue #50). The shard groups share the control
+		// group's Raft port through the transport mux, resolve peer addresses
+		// through the control group's live membership, and are supervised by one
+		// loop that creates the assignment, keeps this node's groups in step with
+		// it, and reconciles each shard's own Raft configuration.
+		if cfg.Cluster.MetadataShards > 1 {
+			mux := node.TransportMux()
+			if mux == nil {
+				node.Shutdown()
+				store.Close()
+				return nil, fmt.Errorf("cluster: metadata sharding needs the shared Raft transport, which this node did not start")
+			}
+			shardRuntime = cluster.NewShardRuntime(cfg.Cluster.NodeID, cfg.Cluster.DataDir, mux, node.ShardAddressProvider())
+			proxy := clusterProxy
+			shardRouter = cluster.NewShardRouter(cfg.Cluster.NodeID, shardRuntime, func(nodeID string) (string, bool) {
+				addr, ok := proxy.NodeAddrs()[nodeID]
+				return addr, ok && addr != ""
+			}, cfg.Cluster.Secret)
+			shardService = cluster.NewShardService(cfg.Cluster.NodeID, node, node.CommittedShardMap,
+				ring, shardRuntime, shardRouter, node.ShardAddressProvider(),
+				cfg.Cluster.MetadataShards, cfg.Cluster.MetadataReplicas)
+			slog.Info("cluster: metadata sharding enabled",
+				"shards", cfg.Cluster.MetadataShards, "replicas", cfg.Cluster.MetadataReplicas)
+		}
 		// Pin peers to their configured API addresses so the Raft-derived ones,
 		// which assume every node shares this node's API port, cannot replace them.
 		clusterProxy.SetPeerAPIs(cfg.Cluster.PeerAPIs)
@@ -340,6 +438,38 @@ func New(cfg *config.Config) (*Server, error) {
 			"ring_nodes", ring.NodeCount(),
 			"replica_count", cfg.Cluster.Placement.ReplicaCount,
 		)
+	}
+
+	// When clustered, route metadata WRITES through Raft consensus so every node
+	// converges; reads stay local. Single-node uses the store directly. Handlers
+	// depend on the metadata.StoreAPI interface, which both satisfy.
+	var metaStore metadata.StoreAPI = store
+	if clusterNode != nil {
+		distributed := metadata.NewDistributedStore(store, clusterNode)
+		metaStore = distributed
+		slog.Info("cluster: metadata writes routed through Raft consensus")
+		if shardRouter != nil {
+			// Object metadata now lives in the shard that owns its bucket, and is
+			// reached with one store-level hop when this node holds no copy of
+			// that shard. Everything else stays in the control group (issue #50).
+			metaStore = metadata.NewShardedStore(distributed, shardRouter)
+		}
+	}
+
+	// Initialize erasure healer if EC is enabled
+	if ecEngine != nil {
+		healInterval := cfg.Erasure.HealInterval
+		if healInterval <= 0 {
+			healInterval = 3600
+		}
+		ecHealer = erasure.NewHealer(metaStore, ecEngine, healInterval)
+
+		// Let a bucket opt out of erasure coding, so data that is cheap to
+		// recreate can be stored once instead of carrying parity (issue #39).
+		// The global setting remains the default for buckets that say nothing.
+		ecEngine.SetBucketPolicy(func(bucket string) bool {
+			return metaStore.BucketDurability(bucket, true, 0).ErasureEnabled
+		})
 	}
 
 	// Initialize failure detector and failover proxy if cluster is enabled
@@ -357,7 +487,7 @@ func New(cfg *config.Config) (*Server, error) {
 		failoverProxy = cluster.NewFailoverProxy(clusterProxy, failureDetector)
 
 		// Wire callbacks: node down/recover → failover + rebalance
-		rebalancer = cluster.NewRebalancer(store, engine, clusterProxy.Ring(), clusterProxy, cfg.Cluster.NodeID, cfg.Cluster.Rebalance)
+		rebalancer = cluster.NewRebalancer(metaStore, engine, clusterProxy.Ring(), clusterProxy, cfg.Cluster.NodeID, cfg.Cluster.Rebalance)
 		failureDetector.SetCallbacks(
 			func(nodeID string) {
 				failoverProxy.OnNodeDown(nodeID)
@@ -387,19 +517,10 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	// Initialize metrics collector
-	mc := metrics.NewCollector(store, engine)
+	mc := metrics.NewCollector(metaStore, engine)
 
 	// Initialize activity log
 	activityLog := api.NewActivityLog()
-
-	// When clustered, route metadata WRITES through Raft consensus so every node
-	// converges; reads stay local. Single-node uses the store directly. Handlers
-	// depend on the metadata.StoreAPI interface, which both satisfy.
-	var metaStore metadata.StoreAPI = store
-	if clusterNode != nil {
-		metaStore = metadata.NewDistributedStore(store, clusterNode)
-		slog.Info("cluster: metadata writes routed through Raft consensus")
-	}
 
 	// Initialize S3 handler
 	s3h := s3.NewHandler(metaStore, engine, auth, cfg.Encryption.Enabled, cfg.Server.Domain, mc)
@@ -664,7 +785,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// Initialize notification dispatcher
 	nc := cfg.Notifications
-	notifyDispatcher := notify.NewDispatcher(store, nc.MaxWorkers, nc.QueueSize, nc.TimeoutSecs, nc.MaxRetries)
+	notifyDispatcher := notify.NewDispatcher(metaStore, nc.MaxWorkers, nc.QueueSize, nc.TimeoutSecs, nc.MaxRetries)
 
 	// Register notification backends
 	if nc.Kafka.Enabled && len(nc.Kafka.Brokers) > 0 && nc.Kafka.Topic != "" {
@@ -713,7 +834,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 		if cfg.Replication.Mode == "active-active" {
 			// Active-active bidirectional replication
-			biDirWorker = replication.NewBiDirectionalWorker(store, engine, cfg.Replication)
+			biDirWorker = replication.NewBiDirectionalWorker(metaStore, engine, cfg.Replication)
 			changeLog := biDirWorker.ChangeLog()
 			siteID := biDirWorker.SiteID()
 			replicationFunc = func(eventType, bucket, key string, size int64, etag, versionID string) {
@@ -740,7 +861,7 @@ func New(cfg *config.Config) (*Server, error) {
 			)
 		} else {
 			// Traditional push-based replication
-			replWorker = replication.NewWorker(store, engine, cfg.Replication)
+			replWorker = replication.NewWorker(metaStore, engine, cfg.Replication)
 			replicationFunc = func(eventType, bucket, key string, size int64, etag, versionID string) {
 				evtType := "put"
 				if eventType == "s3:ObjectRemoved:Delete" {
@@ -763,7 +884,7 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	// Build search index
-	searchIdx := search.NewIndex(store, cfg.Memory.MaxSearchEntries)
+	searchIdx := search.NewIndex(metaStore, cfg.Memory.MaxSearchEntries)
 	if err := searchIdx.Build(); err != nil {
 		slog.Warn("search index build failed", "error", err)
 	}
@@ -799,7 +920,7 @@ func New(cfg *config.Config) (*Server, error) {
 	// Initialize scanner if enabled
 	var scanWorker *scanner.Scanner
 	if cfg.Scanner.Enabled && cfg.Scanner.WebhookURL != "" {
-		scanWorker = scanner.NewScanner(store, engine,
+		scanWorker = scanner.NewScanner(metaStore, engine,
 			cfg.Scanner.WebhookURL, cfg.Scanner.Workers,
 			cfg.Scanner.TimeoutSecs, cfg.Scanner.QuarantineBucket,
 			cfg.Scanner.FailClosed, cfg.Scanner.MaxScanSizeBytes, 256)
@@ -816,14 +937,14 @@ func New(cfg *config.Config) (*Server, error) {
 			store.Close()
 			return nil, fmt.Errorf("init cold storage: %w", err)
 		}
-		tieringMgr = tiering.NewManager(store, fs, coldFS, cfg.Tiering.MigrateAfterDays, cfg.Tiering.ScanIntervalSecs)
+		tieringMgr = tiering.NewManager(metaStore, fs, coldFS, cfg.Tiering.MigrateAfterDays, cfg.Tiering.ScanIntervalSecs)
 		slog.Info("tiering enabled", "cold_dir", cfg.Tiering.ColdDataDir, "migrate_after_days", cfg.Tiering.MigrateAfterDays)
 	}
 
 	// Initialize backup scheduler if enabled
 	var backupSched *backup.Scheduler
 	if cfg.Backup.Enabled && len(cfg.Backup.Targets) > 0 {
-		backupSched = backup.NewScheduler(store, engine, cfg.Backup)
+		backupSched = backup.NewScheduler(metaStore, engine, cfg.Backup)
 		slog.Info("backup enabled", "targets", len(cfg.Backup.Targets), "schedule", cfg.Backup.ScheduleCron)
 	}
 
@@ -843,7 +964,7 @@ func New(cfg *config.Config) (*Server, error) {
 	// Initialize lambda trigger manager if enabled
 	var lambdaMgr *lambda.TriggerManager
 	if cfg.Lambda.Enabled {
-		lambdaMgr = lambda.NewTriggerManager(store, engine, cfg.Lambda)
+		lambdaMgr = lambda.NewTriggerManager(metaStore, engine, cfg.Lambda)
 		s3h.SetLambdaFunc(func(eventType, bucket, key string, size int64, etag, versionID string) {
 			lambdaMgr.Dispatch(bucket, key, eventType, size, etag, versionID)
 		})
@@ -851,7 +972,7 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	// Initialize batched access updater
-	accessUpdater := metadata.NewAccessUpdater(store, 30*time.Second)
+	accessUpdater := metadata.NewAccessUpdater(metaStore, 30*time.Second)
 	s3h.SetAccessUpdater(accessUpdater)
 
 	// Initialize built-in IAM policies
@@ -882,6 +1003,9 @@ func New(cfg *config.Config) (*Server, error) {
 		accessUpdater:   accessUpdater,
 		clusterNode:     clusterNode,
 		clusterProxy:    clusterProxy,
+		shardService:    shardService,
+		shardRuntime:    shardRuntime,
+		shardRouter:     shardRouter,
 		failoverProxy:   failoverProxy,
 		failureDetector: failureDetector,
 		rebalancer:      rebalancer,
@@ -907,8 +1031,8 @@ func (s *Server) Run() error {
 	// same flag the S3 handler enforces.
 	apiHandler.SetWritable(s.writable)
 	apiHandler.SetSearchIndex(s.searchIndex)
-	apiHandler.SetMigrator(migrate.NewManager(s.store, s.engine))
-	apiHandler.SetSnapshotManager(snapshot.NewManager(s.store))
+	apiHandler.SetMigrator(migrate.NewManager(s.metaStore, s.engine))
+	apiHandler.SetSnapshotManager(snapshot.NewManager(s.metaStore))
 	// Per-bucket encryption controls (enable/rotate/shred) for the dashboard share
 	// the SAME manager as the engine, so a shred evicts the live key cache too.
 	if s.keyMgr != nil {
@@ -940,7 +1064,7 @@ func (s *Server) Run() error {
 	// Cluster membership + rebalance operations for the admin API / vaults3-cli.
 	if s.clusterNode != nil {
 		apiHandler.SetClusterController(
-			clusterControllerAdapter{n: s.clusterNode},
+			clusterControllerAdapter{n: s.clusterNode, rt: s.shardRuntime},
 			func() {
 				if s.rebalancer != nil {
 					s.rebalancer.Trigger()
@@ -1127,6 +1251,10 @@ func (s *Server) Run() error {
 		mux.HandleFunc("/cluster/join", s.clusterNode.JoinHandler())
 		mux.HandleFunc("/cluster/leave", s.clusterNode.LeaveHandler())
 		mux.HandleFunc("/cluster/apply", s.clusterNode.ApplyHandler())
+		if s.shardRouter != nil {
+			mux.HandleFunc("/cluster/shard-call", s.shardRouter.CallHandler())
+			mux.HandleFunc("/cluster/shard-apply", s.shardRouter.ApplyHandler())
+		}
 		slog.Info("cluster endpoints registered", "paths", []string{"/cluster/status", "/cluster/sysinfo", "/cluster/join", "/cluster/leave", "/cluster/apply"})
 	}
 
@@ -1197,7 +1325,7 @@ func (s *Server) Run() error {
 	// Start lifecycle worker
 	lcCtx, lcCancel := context.WithCancel(context.Background())
 	defer lcCancel()
-	lcWorker := lifecycle.NewWorker(s.store, s.engine, s.cfg.Lifecycle.ScanIntervalSecs, s.cfg.Security.AuditRetentionDays)
+	lcWorker := lifecycle.NewWorker(s.metaStore, s.engine, s.cfg.Lifecycle.ScanIntervalSecs, s.cfg.Security.AuditRetentionDays)
 	// Expiry removes the metadata through Raft, so the first node to sweep hides the
 	// object from every other node's next sweep; without reaping, their copies of the
 	// data are stranded forever (issue #47).
@@ -1284,6 +1412,15 @@ func (s *Server) Run() error {
 		go s.clusterProxy.RunMembershipSync(syncCtx, apiPort)
 	}
 
+	// Create the metadata shard assignment once the cluster has settled, then keep
+	// this node's shard groups and their memberships in step with it. Not started
+	// at all unless metadata sharding is configured.
+	if s.shardService != nil {
+		shardCtx, shardCancel := context.WithCancel(context.Background())
+		defer shardCancel()
+		go s.shardService.Run(shardCtx)
+	}
+
 	// Start backup scheduler if enabled
 	if s.backupSched != nil {
 		backupCtx, backupCancel := context.WithCancel(context.Background())
@@ -1322,6 +1459,10 @@ func (s *Server) Run() error {
 		interNodeMux.HandleFunc("/cluster/join", s.clusterNode.JoinHandler())
 		interNodeMux.HandleFunc("/cluster/leave", s.clusterNode.LeaveHandler())
 		interNodeMux.HandleFunc("/cluster/apply", s.clusterNode.ApplyHandler())
+		if s.shardRouter != nil {
+			interNodeMux.HandleFunc("/cluster/shard-call", s.shardRouter.CallHandler())
+			interNodeMux.HandleFunc("/cluster/shard-apply", s.shardRouter.ApplyHandler())
+		}
 		if s.biDirWorker != nil {
 			interNodeMux.HandleFunc("/_replication/sync", s.biDirWorker.HandleSyncRequest)
 		}
@@ -1487,6 +1628,11 @@ func validateExternalURL(rawURL string) error {
 func (s *Server) Close() {
 	if s.rebalancer != nil {
 		s.rebalancer.Stop()
+	}
+	// Shard groups first: they take their stream layers from the mux the control
+	// node owns, and the node closes that mux on shutdown.
+	if s.shardRuntime != nil {
+		s.shardRuntime.Close()
 	}
 	if s.clusterNode != nil {
 		s.clusterNode.Shutdown()

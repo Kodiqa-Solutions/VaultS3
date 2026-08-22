@@ -421,6 +421,8 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Cluster membership + operations (status readable; mutations admin-only above)
 	case path == "/cluster/status" && r.Method == http.MethodGet:
 		h.handleClusterStatus(w, r)
+	case path == "/cluster/shards" && r.Method == http.MethodGet:
+		h.handleClusterShards(w, r)
 	case path == "/cluster/join" && r.Method == http.MethodPost:
 		h.handleClusterJoin(w, r)
 	case path == "/cluster/leave" && r.Method == http.MethodPost:

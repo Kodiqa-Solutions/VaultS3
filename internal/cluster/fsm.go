@@ -16,10 +16,32 @@ import (
 type FSM struct {
 	store        *metadata.Store
 	appliedIndex atomic.Uint64 // last log index whose store mutation has completed (issue #37)
+	// objectsOnly marks a metadata shard's state machine. A shard group holds
+	// object metadata and nothing else, so a command outside that set arriving
+	// here means a routing bug, and applying it would put a cluster-wide record
+	// (a bucket, an IAM user) into one shard where no other node can see it.
+	// Refusing is loud and reversible; applying is silent and is not (issue #50).
+	objectsOnly bool
 }
 
 func NewFSM(store *metadata.Store) *FSM {
 	return &FSM{store: store}
+}
+
+// NewShardFSM builds the state machine of a metadata shard group.
+func NewShardFSM(store *metadata.Store) *FSM {
+	return &FSM{store: store, objectsOnly: true}
+}
+
+// isObjectCommand reports whether a command belongs in a metadata shard.
+func isObjectCommand(t CommandType) bool {
+	switch t {
+	case CmdPutObjectMeta, CmdDeleteObjectMeta, CmdSetObjectTier,
+		CmdPutObjectVersion, CmdDeleteObjectVersion, CmdSetLatestVersion,
+		CmdUpdateObjectVersionMeta, CmdDeleteBucketObjectMeta:
+		return true
+	}
+	return false
 }
 
 // AppliedIndex returns the last log index this FSM has finished applying to the
@@ -41,6 +63,130 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	return f.applyCommand(cmd)
 }
 
+// ApplyBatch applies a batch of committed entries, satisfying raft.BatchingFSM.
+// Raft hands the FSM up to MaxAppendEntries (64) committed entries at once;
+// applying each in its own BoltDB transaction cost one fsync per object on every
+// node, which is what capped clustered ingest (issue #50). Consecutive object
+// metadata writes are coalesced into a single transaction instead.
+//
+// Only RUNS of consecutive object writes are merged, so log order is preserved
+// exactly: any other command breaks the run and applies on its own.
+func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
+	if len(logs) == 0 {
+		return nil
+	}
+	// The last index is recorded only after every mutation below has run, so a
+	// reader waiting on AppliedIndex() sees the whole batch's effect (#37).
+	defer f.appliedIndex.Store(logs[len(logs)-1].Index)
+
+	resps := make([]interface{}, len(logs))
+	cmds := make([]*Command, len(logs))
+	// batchable[i] holds the decoded record when entry i can join a coalesced
+	// run. Decoding happens here, once, so the pass below only has to group.
+	batchable := make([]*metadata.ObjectMeta, len(logs))
+	for i, l := range logs {
+		// Raft also sends configuration entries; this FSM has no state for them.
+		if l.Type != raft.LogCommand {
+			continue
+		}
+		var cmd Command
+		if err := json.Unmarshal(l.Data, &cmd); err != nil {
+			slog.Error("fsm: failed to unmarshal command", "error", err)
+			resps[i] = fmt.Errorf("unmarshal command: %w", err)
+			continue
+		}
+		cmds[i] = &cmd
+		if cmd.Type != CmdPutObjectMeta {
+			continue
+		}
+		var m metadata.ObjectMeta
+		if err := json.Unmarshal(cmd.Data, &m); err != nil {
+			// Leave it unbatchable: applyCommand reports the same error below.
+			continue
+		}
+		batchable[i] = &m
+	}
+
+	for i := 0; i < len(logs); {
+		if batchable[i] == nil {
+			if cmds[i] != nil {
+				resps[i] = f.applyCommand(*cmds[i])
+			}
+			i++
+			continue
+		}
+		// Gather the run of consecutive object-metadata writes.
+		j := i
+		metas := make([]metadata.ObjectMeta, 0, len(logs)-i)
+		for ; j < len(logs) && batchable[j] != nil; j++ {
+			metas = append(metas, *batchable[j])
+		}
+		if err := f.store.PutObjectMetaBatch(metas); err != nil {
+			// The batch is atomic, so a failure discarded records Raft has already
+			// committed. Replay them one at a time: each then either applies or is
+			// reported individually, and none is silently dropped.
+			slog.Warn("fsm: batched metadata write failed, applying individually",
+				"error", err, "count", len(metas))
+			for k := range metas {
+				resps[i+k] = f.store.PutObjectMeta(metas[k])
+			}
+		}
+		i = j
+	}
+	return resps
+}
+
+// applyShardMap commits a metadata shard assignment, refusing any change to the
+// parts of it that must never move (issue #50).
+//
+// The check runs here, in the state machine, rather than at the proposing node,
+// so every node reaches the same verdict from the same committed log. A map whose
+// shard count, epoch or founding sets differed from the committed one would leave
+// members of a shard disagreeing about which Raft group they belong to, and two
+// groups serving one shard is unrecoverable: both would be authoritative for
+// metadata that the other cannot see.
+func (f *FSM) applyShardMap(data []byte) interface{} {
+	var next ShardMap
+	if err := json.Unmarshal(data, &next); err != nil {
+		return fmt.Errorf("shard map: decode proposed map: %w", err)
+	}
+	current, err := f.currentShardMap()
+	if err != nil {
+		return err
+	}
+	if err := ValidateSuccession(current, &next); err != nil {
+		return err
+	}
+	// Re-encode rather than storing the caller's bytes, so what is persisted is
+	// exactly what was validated.
+	encoded, err := json.Marshal(&next)
+	if err != nil {
+		return fmt.Errorf("shard map: encode: %w", err)
+	}
+	if err := f.store.PutShardMap(encoded); err != nil {
+		return err
+	}
+	slog.Info("cluster: shard map committed",
+		"version", next.Version, "epoch", next.Epoch, "shards", next.Shards, "replicas", next.Replicas)
+	return nil
+}
+
+// currentShardMap reads the committed assignment, or nil when there is none.
+func (f *FSM) currentShardMap() (*ShardMap, error) {
+	raw, err := f.store.GetShardMap()
+	if err != nil {
+		return nil, fmt.Errorf("shard map: read committed map: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var m ShardMap
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("shard map: decode committed map: %w", err)
+	}
+	return &m, nil
+}
+
 // Snapshot returns a snapshot of the current state for Raft snapshotting.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &fsmSnapshot{store: f.store}, nil
@@ -53,6 +199,9 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 }
 
 func (f *FSM) applyCommand(cmd Command) interface{} {
+	if f.objectsOnly && !isObjectCommand(cmd.Type) {
+		return fmt.Errorf("cluster: command type %d does not belong in a metadata shard", cmd.Type)
+	}
 	switch cmd.Type {
 
 	// --- Bucket operations ---
@@ -108,6 +257,9 @@ func (f *FSM) applyCommand(cmd Command) interface{} {
 			return err
 		}
 		return f.store.SetBucketDurability(p.Name, p.ErasureEnabled, p.ReplicaCount)
+
+	case CmdPutShardMap:
+		return f.applyShardMap(cmd.Data)
 
 	case CmdPutBucketTags:
 		var p struct {

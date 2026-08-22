@@ -19,6 +19,38 @@ type ClusterController interface {
 	Members() []ClusterMember
 	Join(nodeID, addr string) error
 	Leave(nodeID string) error
+	// ShardMap returns the committed metadata shard assignment, or nil when the
+	// cluster has not committed one, which is the case for every cluster that
+	// runs unsharded (issue #50).
+	ShardMap() *ShardAssignment
+	// LocalShards reports the metadata shard groups running on this node. Empty
+	// when the node runs none, which is normal on an unsharded cluster and is
+	// also how an operator sees a node that has not caught up with the map yet.
+	LocalShards() []LocalShard
+}
+
+// ShardAssignment is the committed metadata shard map as the admin API reports
+// it. Object metadata is replicated to every node today, which is what caps a
+// cluster's object count; sharding splits it across independent Raft groups.
+type ShardAssignment struct {
+	Version  uint64     `json:"version"`
+	Epoch    uint64     `json:"epoch"`
+	Shards   int        `json:"shards"`
+	Replicas int        `json:"replicas"`
+	Members  [][]string `json:"members"`
+	Founders [][]string `json:"founders"`
+}
+
+// LocalShard is one metadata shard group running on this node, as the admin API
+// reports it. Members is the shard's own Raft configuration, which is what the
+// reconciler drives towards the committed assignment: a member listed here but
+// not in the assignment is one that is still being removed, and the reverse is
+// one still being added.
+type LocalShard struct {
+	Shard    int      `json:"shard"`
+	IsLeader bool     `json:"isLeader"`
+	LeaderID string   `json:"leaderId"`
+	Members  []string `json:"members"`
 }
 
 // ClusterMember is one Raft member as reported by the cluster status endpoint.
@@ -44,6 +76,34 @@ func (h *APIHandler) SetClusterController(ctl ClusterController, triggerRebalanc
 
 // isWritable reports whether this node currently accepts writes.
 func (h *APIHandler) isWritable() bool { return h.writable == nil || h.writable.Load() }
+
+// handleClusterShards handles GET /api/v1/cluster/shards: how object metadata is
+// distributed. A cluster with no committed map replicates all metadata to every
+// node, so it reports sharded=false rather than an empty assignment, which would
+// read as "sharded, and holding nothing".
+func (h *APIHandler) handleClusterShards(w http.ResponseWriter, _ *http.Request) {
+	if h.clusterCtl == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"clustered": false, "sharded": false})
+		return
+	}
+	m := h.clusterCtl.ShardMap()
+	if m == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"clustered": true,
+			"sharded":   false,
+			"selfId":    h.clusterCtl.SelfID(),
+			"note":      "object metadata is replicated to every node; adding nodes adds data capacity, not metadata capacity",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"clustered":   true,
+		"sharded":     true,
+		"selfId":      h.clusterCtl.SelfID(),
+		"shardMap":    m,
+		"localShards": h.clusterCtl.LocalShards(),
+	})
+}
 
 // handleClusterStatus handles GET /api/v1/cluster/status: Raft membership, the
 // current leader, and this node's write (drain) state.

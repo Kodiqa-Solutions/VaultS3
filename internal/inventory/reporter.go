@@ -23,14 +23,14 @@ type Config struct {
 
 // Reporter generates periodic inventory CSV reports of bucket contents.
 type Reporter struct {
-	store        *metadata.Store
+	store        metadata.StoreAPI
 	engine       storage.Engine
 	cfg          Config
 	intervalSecs int
 }
 
 // NewReporter creates a new inventory reporter.
-func NewReporter(store *metadata.Store, engine storage.Engine, cfg Config) *Reporter {
+func NewReporter(store metadata.StoreAPI, engine storage.Engine, cfg Config) *Reporter {
 	interval := cfg.IntervalSecs
 	if interval <= 0 {
 		if cfg.Schedule == "weekly" {

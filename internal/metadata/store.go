@@ -820,21 +820,48 @@ func objectMetaKey(bucket, key string) []byte {
 
 func (s *Store) PutObjectMeta(meta ObjectMeta) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(objectsBucket)
-		key := objectMetaKey(meta.Bucket, meta.Key)
-		// Read the prior meta (if any) so we can adjust the cached bucket
-		// counters by the delta rather than re-walking the filesystem.
-		oSize, oCount := metaWeight(getObjectMetaTx(b, key))
-		data, err := json.Marshal(meta)
-		if err != nil {
-			return err
-		}
-		if err := b.Put(key, data); err != nil {
-			return err
-		}
-		nSize, nCount := metaWeight(&meta)
-		return adjustBucketStatsTx(tx, meta.Bucket, nSize-oSize, nCount-oCount)
+		return putObjectMetaTx(tx, meta)
 	})
+}
+
+// PutObjectMetaBatch writes several records in ONE transaction, which is one
+// fsync for the whole batch instead of one per object. Records are applied in
+// slice order, so a batch holding two writes of the same key ends in the same
+// state as applying them one at a time.
+//
+// This exists for the Raft FSM: it receives committed entries in batches, and
+// giving each its own transaction made clustered ingest cost one fsync per
+// object on every node (issue #50). The batch is atomic, so a caller that needs
+// per-record error attribution must fall back to PutObjectMeta on failure.
+func (s *Store) PutObjectMetaBatch(metas []ObjectMeta) error {
+	if len(metas) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		for i := range metas {
+			if err := putObjectMetaTx(tx, metas[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func putObjectMetaTx(tx *bolt.Tx, meta ObjectMeta) error {
+	b := tx.Bucket(objectsBucket)
+	key := objectMetaKey(meta.Bucket, meta.Key)
+	// Read the prior meta (if any) so we can adjust the cached bucket
+	// counters by the delta rather than re-walking the filesystem.
+	oSize, oCount := metaWeight(getObjectMetaTx(b, key))
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	if err := b.Put(key, data); err != nil {
+		return err
+	}
+	nSize, nCount := metaWeight(&meta)
+	return adjustBucketStatsTx(tx, meta.Bucket, nSize-oSize, nCount-oCount)
 }
 
 // GetObjectMetaConsistent is GetObjectMeta on a single node (no cluster, no
@@ -855,6 +882,22 @@ func (s *Store) GetObjectMeta(bucket, key string) (*ObjectMeta, error) {
 		return json.Unmarshal(data, meta)
 	})
 	return meta, err
+}
+
+// HasObjectMetadata reports whether this store holds any object metadata at all.
+// It reads one key, so it is cheap on a store with millions of records.
+//
+// It exists for the metadata sharding guard: a cluster that already holds object
+// metadata in its control group cannot simply be switched to sharded, because
+// the records would stay where nothing reads them any more (issue #50).
+func (s *Store) HasObjectMetadata() (bool, error) {
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		k, _ := tx.Bucket(objectsBucket).Cursor().First()
+		found = k != nil
+		return nil
+	})
+	return found, err
 }
 
 func (s *Store) DeleteObjectMeta(bucket, key string) error {
@@ -1022,19 +1065,54 @@ func (s *Store) UpdateLastAccess(bucket, key string) {
 
 // AccessUpdater batches last-access time updates and flushes to BoltDB periodically.
 type AccessUpdater struct {
-	store    *Store
+	store    accessBatchWriter
 	mu       sync.Mutex
 	dirty    map[string]int64
 	interval time.Duration
 }
 
+// accessBatchWriter is a store that can stamp a whole batch of last-access times
+// at once. *Store does it in one transaction; a store that routes to metadata
+// shards does it per record, since the records are in different Raft groups.
+type accessBatchWriter interface {
+	updateLastAccessBatch(stamps map[string]int64)
+}
+
 // NewAccessUpdater creates an updater that flushes every flushInterval.
-func NewAccessUpdater(store *Store, flushInterval time.Duration) *AccessUpdater {
-	return &AccessUpdater{
-		store:    store,
+func NewAccessUpdater(store StoreAPI, flushInterval time.Duration) *AccessUpdater {
+	u := &AccessUpdater{
 		dirty:    make(map[string]int64),
 		interval: flushInterval,
 	}
+	if w, ok := store.(accessBatchWriter); ok {
+		u.store = w
+	} else {
+		u.store = perKeyAccessWriter{store: store}
+	}
+	return u
+}
+
+// perKeyAccessWriter stamps records one at a time, for a store that cannot do it
+// in one transaction because the records are not all in one place.
+type perKeyAccessWriter struct{ store StoreAPI }
+
+func (p perKeyAccessWriter) updateLastAccessBatch(stamps map[string]int64) {
+	for composite := range stamps {
+		bucket, key, ok := splitAccessKey(composite)
+		if !ok {
+			continue
+		}
+		p.store.UpdateLastAccess(bucket, key)
+	}
+}
+
+// splitAccessKey undoes the bucket+key packing MarkAccess does.
+func splitAccessKey(composite string) (bucket, key string, ok bool) {
+	parts := strings.SplitN(composite, "\x00", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 // MarkAccess records an access without writing to BoltDB.
@@ -1056,7 +1134,13 @@ func (u *AccessUpdater) Flush() {
 	u.dirty = make(map[string]int64)
 	u.mu.Unlock()
 
-	u.store.db.Update(func(tx *bolt.Tx) error {
+	u.store.updateLastAccessBatch(snapshot)
+}
+
+// updateLastAccessBatch stamps every pending record in one transaction, which is
+// one fsync for the whole flush rather than one per object.
+func (s *Store) updateLastAccessBatch(snapshot map[string]int64) {
+	s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectsBucket)
 		for compositeKey, ts := range snapshot {
 			parts := strings.SplitN(compositeKey, "\x00", 2)
@@ -1400,6 +1484,41 @@ func (s *Store) GetObjectVersion(bucket, key, versionID string) (*ObjectMeta, er
 		}
 		meta = &ObjectMeta{}
 		return json.Unmarshal(data, meta)
+	})
+	return meta, err
+}
+
+// LatestObjectVersion returns the newest surviving version of a key, or nil when
+// the key has none.
+//
+// Version IDs are time-ordered and the index is sorted, so the newest version is
+// the LAST entry under the key's prefix: the cursor seeks past the end and steps
+// back once, rather than reading every version of the key. Callers that took the
+// first entry of a listing were taking the OLDEST version, which is how deleting
+// a delete marker used to resurrect a stale copy of the object.
+func (s *Store) LatestObjectVersion(bucket, key string) (*ObjectMeta, error) {
+	prefix := versionPrefix(bucket, key)
+	var meta *ObjectMeta
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(objectVersionsBucket).Cursor()
+		// Seek past every version of this key, then step back to the last one.
+		// Seek lands on the first key at or after the target; if the key sorts
+		// beyond everything in the bucket, Last() is the candidate instead.
+		k, v := c.Seek(append(append([]byte{}, prefix...), 0xff))
+		if k == nil {
+			k, v = c.Last()
+		} else {
+			k, v = c.Prev()
+		}
+		if k == nil || !bytes.HasPrefix(k, prefix) {
+			return nil
+		}
+		var m ObjectMeta
+		if err := json.Unmarshal(v, &m); err != nil {
+			return err
+		}
+		meta = &m
+		return nil
 	})
 	return meta, err
 }
@@ -2737,6 +2856,34 @@ func (s *Store) DeleteReplicationConfig(bucket string) error {
 		b := tx.Bucket(replicationConfigBucket)
 		return b.Delete([]byte(bucket))
 	})
+}
+
+// shardMapKey is where the committed metadata-shard assignment lives. It is
+// cluster-wide singleton state, held as raw bytes so this package stays free of
+// any dependency on the cluster package (issue #50).
+var shardMapKey = []byte("shard_map")
+
+// PutShardMap persists the committed shard assignment. The bytes are opaque
+// here: the cluster package owns the format and validates a change before it
+// reaches the store.
+func (s *Store) PutShardMap(encoded []byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(serverSettingsBucket).Put(shardMapKey, encoded)
+	})
+}
+
+// GetShardMap returns the committed shard assignment, or nil when the cluster
+// has never committed one. A nil result means "not sharded yet", never "the
+// assignment is empty".
+func (s *Store) GetShardMap() ([]byte, error) {
+	var out []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket(serverSettingsBucket).Get(shardMapKey); v != nil {
+			out = append([]byte(nil), v...)
+		}
+		return nil
+	})
+	return out, err
 }
 
 // SetAdminCredentials persists admin credentials to the metadata store.

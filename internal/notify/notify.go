@@ -58,7 +58,7 @@ type deliveryJob struct {
 
 // Dispatcher handles async webhook delivery with retry.
 type Dispatcher struct {
-	store      *metadata.Store
+	store      metadata.StoreAPI
 	client     *http.Client
 	workerCh   chan deliveryJob
 	wg         sync.WaitGroup
@@ -69,7 +69,7 @@ type Dispatcher struct {
 	mu         sync.Mutex
 }
 
-func NewDispatcher(store *metadata.Store, maxWorkers, queueSize, timeoutSecs, maxRetries int) *Dispatcher {
+func NewDispatcher(store metadata.StoreAPI, maxWorkers, queueSize, timeoutSecs, maxRetries int) *Dispatcher {
 	return &Dispatcher{
 		store:      store,
 		client:     &http.Client{Timeout: time.Duration(timeoutSecs) * time.Second},

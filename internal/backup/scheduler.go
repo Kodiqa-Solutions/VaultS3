@@ -15,14 +15,14 @@ import (
 )
 
 type Scheduler struct {
-	store       *metadata.Store
+	store       metadata.StoreAPI
 	engine      storage.Engine
 	cfg         config.BackupConfig
 	lastRunHour int
 	running     atomic.Bool
 }
 
-func NewScheduler(store *metadata.Store, engine storage.Engine, cfg config.BackupConfig) *Scheduler {
+func NewScheduler(store metadata.StoreAPI, engine storage.Engine, cfg config.BackupConfig) *Scheduler {
 	return &Scheduler{
 		store:       store,
 		engine:      engine,

@@ -100,6 +100,26 @@ for the redundancy trade-offs.
 |---|---|---|
 | `cluster.enabled` | `false` | Auto-form a Raft cluster across the replicas (Beta). |
 | `cluster.raftPort` | `9001` | Port for inter-node Raft traffic. |
+| `cluster.metadataShards` | `1` | Split object metadata across this many independent Raft groups. |
+| `cluster.metadataReplicas` | `3` | Pods holding each metadata shard. |
+
+**With `metadataShards: 1`, adding pods adds capacity for object data, not for
+metadata.** Object data is sharded across the pods by consistent hash, metadata is
+Raft-replicated, so every pod carries a complete copy of the metadata index at
+roughly 600 bytes per object. Ten million objects per pod is comfortable, a
+hundred million is workable with a larger metadata PVC.
+[`docs/SCALING.md`](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/docs/SCALING.md)
+has the measured numbers.
+
+**Beyond that, set `cluster.metadataShards` above 1** and each pod holds only the
+shards it is a member of, so metadata capacity grows with the cluster. Three
+things to know before you do: the shard count is fixed once the cluster commits
+its assignment (buckets hash to a shard, and there is no resharding), it cannot be
+switched on for a cluster that already holds objects (the pods refuse to start
+rather than hide metadata already written), and `replicaCount` must be at least
+`cluster.metadataReplicas` or no assignment can be created.
+[`docs/design/sharded-metadata.md`](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/docs/design/sharded-metadata.md)
+is the design, and `vaults3-cli cluster shards` shows the result.
 
 **If a clustered install predates 4.4.49, reclaim its leaked space once after
 upgrading.** Until then the multi-object delete (what Spark/Hadoop S3A uses)

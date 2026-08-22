@@ -34,7 +34,7 @@ type SyncResponse struct {
 // BiDirectionalWorker handles active-active replication between VaultS3 sites.
 // It periodically pulls changes from each peer, resolves conflicts, and applies them locally.
 type BiDirectionalWorker struct {
-	store     *metadata.Store
+	store     metadata.StoreAPI
 	engine    storage.Engine
 	changeLog *ChangeLog
 	resolver  ConflictResolver
@@ -51,7 +51,7 @@ type BiDirectionalWorker struct {
 
 // NewBiDirectionalWorker creates a bidirectional replication worker.
 func NewBiDirectionalWorker(
-	store *metadata.Store,
+	store metadata.StoreAPI,
 	engine storage.Engine,
 	cfg config.ReplicationConfig,
 ) *BiDirectionalWorker {

@@ -15,9 +15,18 @@ type fakeLookup struct {
 	uploads  map[string]bool
 }
 
-func (f fakeLookup) HasObject(b, k string) bool     { return f.objects[b+"/"+k] }
-func (f fakeLookup) HasVersion(b, k, v string) bool { return f.versions[b+"/"+k+"@"+v] }
-func (f fakeLookup) HasUpload(id string) bool       { return f.uploads[id] }
+func known(found bool) Presence {
+	if found {
+		return Present
+	}
+	return Absent
+}
+
+func (f fakeLookup) HasObject(b, k string) Presence { return known(f.objects[b+"/"+k]) }
+func (f fakeLookup) HasVersion(b, k, v string) Presence {
+	return known(f.versions[b+"/"+k+"@"+v])
+}
+func (f fakeLookup) HasUpload(id string) Presence { return known(f.uploads[id]) }
 func newLookup() fakeLookup {
 	return fakeLookup{objects: map[string]bool{}, versions: map[string]bool{}, uploads: map[string]bool{}}
 }

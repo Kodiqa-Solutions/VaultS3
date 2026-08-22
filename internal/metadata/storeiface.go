@@ -85,6 +85,7 @@ type StoreAPI interface {
 	IsBucketPublicRead(bucket string) bool
 	IsBucketWebsite(bucket string) bool
 	IterateAllObjects(fn func(bucket, key string, meta ObjectMeta) bool) error
+	LatestObjectVersion(bucket, key string) (*ObjectMeta, error)
 	ListAccessKeys() ([]AccessKey, error)
 	ListAuditEntries(limit int, fromUnixNano, toUnixNano int64, user, bucket string) ([]AuditEntry, error)
 	ListBackupRecords(limit int) ([]BackupRecord, error)

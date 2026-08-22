@@ -14,13 +14,13 @@ import (
 
 // Healer periodically scans for degraded erasure-coded objects and repairs them.
 type Healer struct {
-	store        *metadata.Store
+	store        metadata.StoreAPI
 	engine       *Engine
 	intervalSecs int
 }
 
 // NewHealer creates a new erasure coding healer.
-func NewHealer(store *metadata.Store, engine *Engine, intervalSecs int) *Healer {
+func NewHealer(store metadata.StoreAPI, engine *Engine, intervalSecs int) *Healer {
 	if intervalSecs <= 0 {
 		intervalSecs = 3600 // default: scan every hour
 	}

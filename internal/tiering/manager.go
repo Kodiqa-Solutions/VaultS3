@@ -11,14 +11,14 @@ import (
 )
 
 type Manager struct {
-	store            *metadata.Store
+	store            metadata.StoreAPI
 	hotEngine        storage.Engine
 	coldEngine       storage.Engine
 	migrateAfterDays int
 	scanIntervalSecs int
 }
 
-func NewManager(store *metadata.Store, hotEngine, coldEngine storage.Engine, migrateAfterDays, scanIntervalSecs int) *Manager {
+func NewManager(store metadata.StoreAPI, hotEngine, coldEngine storage.Engine, migrateAfterDays, scanIntervalSecs int) *Manager {
 	return &Manager{
 		store:            store,
 		hotEngine:        hotEngine,

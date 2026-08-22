@@ -333,7 +333,7 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	now := time.Now().UTC()
 
-	h.store.PutObjectMeta(metadata.ObjectMeta{
+	if err := h.store.PutObjectMeta(metadata.ObjectMeta{
 		Bucket:         bucket,
 		Key:            key,
 		ContentType:    upload.ContentType,
@@ -342,7 +342,13 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		LastModified:   now.Unix(),
 		PartsCount:     len(req.Parts),
 		PartBoundaries: partBoundaries,
-	})
+	}); err != nil {
+		// The parts are assembled but the object is not recorded. Failing here
+		// leaves the upload completable on retry, which is far better than
+		// acknowledging an object that will never list.
+		metaWriteFailed(w, err, "CompleteMultipartUpload", bucket, key)
+		return
+	}
 
 	// Clean up. The record goes FIRST: stopping between the two steps (an OOM
 	// kill, an eviction) used to leave the record advertising parts whose files

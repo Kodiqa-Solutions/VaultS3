@@ -23,7 +23,15 @@ type Node struct {
 	raft  *raft.Raft
 	fsm   *FSM
 	store *metadata.Store
+	// mux owns the Raft port and hands connections to the group they name. Nil
+	// in tests that inject an in-memory transport.
+	mux *TransportMux
 }
+
+// TransportMux is the demultiplexer serving this node's Raft port, or nil when
+// the node was built with an injected transport. Metadata shard groups take
+// their stream layers from it.
+func (n *Node) TransportMux() *TransportMux { return n.mux }
 
 // NewNode creates and starts a Raft node.
 func NewNode(cfg ClusterConfig, metaStore *metadata.Store) (*Node, error) {
@@ -48,10 +56,27 @@ func NewNode(cfg ClusterConfig, metaStore *metadata.Store) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: resolve bind addr: %w", err)
 	}
-	transport, err := raft.NewTCPTransport(bindAddr, tcpAddr, 3, raftTimeout, os.Stderr)
-	if err != nil {
-		return nil, fmt.Errorf("cluster: create transport: %w", err)
+	// Raft records the advertised address in the cluster configuration, so a
+	// wildcard bind has to be rejected here rather than handed to peers.
+	if tcpAddr.IP == nil || tcpAddr.IP.IsUnspecified() {
+		return nil, fmt.Errorf("cluster: local bind address is not advertisable: %s "+
+			"(set cluster.bind_addr to this node's routable address)", bindAddr)
 	}
+	ln, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: listen on %s: %w", bindAddr, err)
+	}
+	// Every Raft group on this node shares the one port. The control group's
+	// connections carry no header, exactly as they always have, so a node running
+	// an older build is indistinguishable on the wire and a rolling upgrade does
+	// not split the control group (issue #50).
+	mux := NewTransportMuxWithAdvertise(ln, tcpAddr)
+	transport := raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
+		Stream:  mux.ControlLayer(),
+		MaxPool: 3,
+		Timeout: raftTimeout,
+		Logger:  nil,
+	})
 
 	// Log store and stable store (BoltDB)
 	logStore, err := raftboltdb.New(raftboltdb.Options{
@@ -67,12 +92,18 @@ func NewNode(cfg ClusterConfig, metaStore *metadata.Store) (*Node, error) {
 		return nil, fmt.Errorf("cluster: create snapshot store: %w", err)
 	}
 
-	return newNodeWithDeps(cfg, metaStore, raftDeps{
+	node, err := newNodeWithDeps(cfg, metaStore, raftDeps{
 		transport: transport,
 		logStore:  logStore,
 		stable:    logStore,
 		snapshots: snapshotStore,
 	})
+	if err != nil {
+		mux.Close()
+		return nil, err
+	}
+	node.mux = mux
+	return node, nil
 }
 
 // raftDeps bundles the pluggable Raft backends. Production uses a TCP transport
@@ -203,7 +234,7 @@ func (n *Node) leaderAppliedIndex(timeout time.Duration) (uint64, error) {
 	if leaderRaft == "" {
 		return 0, fmt.Errorf("cluster: no leader for read barrier")
 	}
-	url := fmt.Sprintf("http://%s/cluster/readindex", apiAddrFromRaft(leaderRaft))
+	url := fmt.Sprintf("http://%s/cluster/readindex", apiAddrFromRaft(leaderRaft, n.cfg.APIPort))
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
@@ -314,7 +345,15 @@ func (n *Node) Leave(nodeID string) error {
 
 // Shutdown gracefully shuts down the Raft node.
 func (n *Node) Shutdown() error {
-	return n.raft.Shutdown().Error()
+	err := n.raft.Shutdown().Error()
+	// The mux owns the Raft port and every group's stream layer, so it is closed
+	// after Raft, and only by the node that created it.
+	if n.mux != nil {
+		if e := n.mux.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
 }
 
 // Stats returns Raft stats.

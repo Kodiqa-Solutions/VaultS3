@@ -34,7 +34,7 @@ S3 API: `http://localhost:9000`
 - **Lifecycle rules** -- expiration, noncurrent version cleanup, abort incomplete multipart
 - **Event notifications** -- Kafka, NATS, Redis, AMQP/RabbitMQ, PostgreSQL, Elasticsearch, webhooks
 - **Replication** -- async push and active-active bidirectional with vector clocks
-- **Raft clustering** -- multi-node with consistent hashing and automatic failover
+- **Raft clustering** -- multi-node with consistent hashing and automatic failover, and optional sharded metadata so the index grows with the cluster
 - **Erasure coding** -- Reed-Solomon with background healer
 - **Compression** -- transparent zstd on write (gzip still read) with exclusions for already-compressed types
 - **FUSE mount** -- mount buckets as local filesystem directories

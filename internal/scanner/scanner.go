@@ -39,7 +39,7 @@ type Scanner struct {
 	maxScanSize      int64
 	timeout          time.Duration
 
-	store  *metadata.Store
+	store  metadata.StoreAPI
 	engine storage.Engine
 	client *http.Client
 
@@ -52,7 +52,7 @@ type Scanner struct {
 }
 
 // NewScanner creates a new virus scanner.
-func NewScanner(store *metadata.Store, engine storage.Engine, webhookURL string, workers int, timeoutSecs int, quarantineBucket string, failClosed bool, maxScanSize int64, queueSize int) *Scanner {
+func NewScanner(store metadata.StoreAPI, engine storage.Engine, webhookURL string, workers int, timeoutSecs int, quarantineBucket string, failClosed bool, maxScanSize int64, queueSize int) *Scanner {
 	if workers <= 0 {
 		workers = 2
 	}

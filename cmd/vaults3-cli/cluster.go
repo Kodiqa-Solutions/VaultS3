@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 func runCluster(args []string) {
@@ -14,6 +15,7 @@ func runCluster(args []string) {
 
 Subcommands:
   status                       Show cluster members, leader, and drain state
+  shards                       Show how object metadata is distributed
   join <nodeId> <raftAddr>     Add a member (run against the leader)
   leave <nodeId>               Remove a member (run against the leader)
   drain [nodeId]               Stop a node accepting writes (defaults to the node served)
@@ -28,6 +30,8 @@ Subcommands:
 	switch args[0] {
 	case "status":
 		clusterStatus()
+	case "shards":
+		clusterShards()
 	case "join":
 		if len(args) < 3 {
 			fatal("usage: vaults3-cli cluster join <nodeId> <raftAddr>")
@@ -81,6 +85,106 @@ func clusterPost(path string, body any) map[string]any {
 	var out map[string]any
 	json.Unmarshal(raw, &out)
 	return out
+}
+
+// clusterShards prints how object metadata is distributed: the committed
+// assignment, and the shard groups actually running on this node. On a cluster
+// that is not sharded it says so plainly, including the consequence, because
+// "metadata is replicated to every node" is the thing that decides how many
+// objects a cluster can hold (issue #50).
+func clusterShards() {
+	resp, err := apiRequest("GET", "/cluster/shards", nil)
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fatal(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(raw)))
+	}
+	var out struct {
+		Clustered bool   `json:"clustered"`
+		Sharded   bool   `json:"sharded"`
+		SelfID    string `json:"selfId"`
+		ShardMap  struct {
+			Version  uint64     `json:"version"`
+			Epoch    uint64     `json:"epoch"`
+			Shards   int        `json:"shards"`
+			Replicas int        `json:"replicas"`
+			Members  [][]string `json:"members"`
+			Founders [][]string `json:"founders"`
+		} `json:"shardMap"`
+		LocalShards []struct {
+			Shard    int      `json:"shard"`
+			IsLeader bool     `json:"isLeader"`
+			LeaderID string   `json:"leaderId"`
+			Members  []string `json:"members"`
+		} `json:"localShards"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		fatal("bad response: " + err.Error())
+	}
+	if !out.Clustered {
+		fmt.Println("Not clustered. All metadata is held by this node.")
+		return
+	}
+	if !out.Sharded {
+		fmt.Println("Metadata sharding: not enabled")
+		fmt.Println("Every node holds a complete copy of the object metadata, so adding")
+		fmt.Println("nodes adds capacity for object data but not for metadata. Budget about")
+		fmt.Println("600 bytes per object, per node. See docs/SCALING.md.")
+		return
+	}
+	m := out.ShardMap
+	fmt.Printf("Metadata sharding: %d shards, %d replicas each (map version %d, epoch %d)\n\n",
+		m.Shards, m.Replicas, m.Version, m.Epoch)
+	rows := make([][]string, 0, m.Shards)
+	for i := 0; i < m.Shards && i < len(m.Members); i++ {
+		here := ""
+		for _, id := range m.Members[i] {
+			if id == out.SelfID {
+				here = "yes"
+			}
+		}
+		founders := ""
+		if i < len(m.Founders) {
+			founders = strings.Join(m.Founders[i], ", ")
+		}
+		rows = append(rows, []string{
+			fmt.Sprintf("%d", i),
+			strings.Join(m.Members[i], ", "),
+			founders,
+			here,
+		})
+	}
+	printTable([]string{"SHARD", "MEMBERS", "FOUNDERS", "LOCAL"}, rows)
+
+	// The groups actually running here. Their membership is what the reconciler
+	// drives towards the assignment above, so a difference between the two tables
+	// is a membership change still in flight rather than a fault.
+	if len(out.LocalShards) == 0 {
+		fmt.Printf("\nThis node (%s) is running no metadata shard groups yet.\n", out.SelfID)
+		return
+	}
+	fmt.Printf("\nShard groups running on %s:\n\n", out.SelfID)
+	local := make([][]string, 0, len(out.LocalShards))
+	for _, g := range out.LocalShards {
+		role := "follower"
+		if g.IsLeader {
+			role = "leader"
+		}
+		leader := g.LeaderID
+		if leader == "" {
+			leader = "(none)"
+		}
+		local = append(local, []string{
+			fmt.Sprintf("%d", g.Shard),
+			role,
+			leader,
+			strings.Join(g.Members, ", "),
+		})
+	}
+	printTable([]string{"SHARD", "ROLE", "LEADER", "GROUP MEMBERS"}, local)
 }
 
 func clusterStatus() {

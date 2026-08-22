@@ -41,10 +41,16 @@ func (h *ObjectHandler) PutObjectLegalHold(w http.ResponseWriter, r *http.Reques
 
 	meta.LegalHold = req.Status == "ON"
 
+	var werr error
 	if meta.VersionID != "" {
-		h.store.UpdateObjectVersionMeta(*meta)
+		werr = h.store.UpdateObjectVersionMeta(*meta)
 	} else {
-		h.store.PutObjectMeta(*meta)
+		werr = h.store.PutObjectMeta(*meta)
+	}
+	// A legal hold that reports success without being recorded is a compliance
+	// failure, not a performance detail.
+	if metaWriteFailed(w, werr, "PutObjectLegalHold", bucket, key) {
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -129,10 +135,14 @@ func (h *ObjectHandler) PutObjectRetention(w http.ResponseWriter, r *http.Reques
 	meta.RetentionMode = req.Mode
 	meta.RetentionUntil = retainUntil.Unix()
 
+	var werr error
 	if meta.VersionID != "" {
-		h.store.UpdateObjectVersionMeta(*meta)
+		werr = h.store.UpdateObjectVersionMeta(*meta)
 	} else {
-		h.store.PutObjectMeta(*meta)
+		werr = h.store.PutObjectMeta(*meta)
+	}
+	if metaWriteFailed(w, werr, "PutObjectRetention", bucket, key) {
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)

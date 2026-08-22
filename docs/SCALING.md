@@ -703,6 +703,95 @@ Practical guidance for huge flat prefixes (tens of millions of keys):
   object in the BoltDB file). Budget disk for the metadata DB accordingly at the
   100M-object scale (tens of GB).
 
+## 11a. How many objects a cluster can hold
+
+Listing stays flat (section 11), but the metadata **index** does not shrink, and
+in a cluster it does not spread. These are the numbers that decide the ceiling,
+all measured rather than estimated.
+
+**By default, object data is sharded across nodes by hash ring and metadata is
+not.** Metadata goes through Raft, so every node keeps a complete copy of the
+index and applies every metadata write. Adding nodes buys data capacity and
+read/list throughput. It buys no metadata capacity and no metadata write
+throughput. Setting `cluster.metadata_shards` above 1 changes that; the numbers
+below are for the default, and "Sharding the metadata" at the end of this section
+covers what changes when you enable it.
+
+| What | Measured |
+|------|----------|
+| Metadata per object | ~600 bytes (BoltDB file, 50 to 60 character key) |
+| Random point lookup, 1M objects (0.6 GB index) | 3.9 µs |
+| Random point lookup, 10M objects (5.5 GB index) | 39 µs (index no longer cached) |
+| Full scan, 1M / 10M objects | 1.3 s / 27.6 s |
+| Single-node metadata write | ~2500/sec (one commit, one fsync per object) |
+| 3-node clustered ingest, 1 KiB objects, concurrency 32 | ~666 objects/sec |
+
+So the index costs roughly **0.6 GB per million objects, on every node**:
+
+| Objects | Metadata per node |
+|---------|-------------------|
+| 1M | ~0.6 GB |
+| 10M | ~6 GB |
+| 100M | ~60 GB |
+| 1B | ~600 GB |
+
+Practical guidance:
+
+- **Up to ~10M objects per node** is comfortable. **~100M** is workable with NVMe
+  for `metadata_dir` and enough RAM to keep the index in page cache. Past that the
+  metadata layer, not the object store, is what limits you.
+- **Anything that walks every object is O(objects)**: lifecycle scans,
+  `vaults3-cli storage reclaim`, stats backfill. Budget for it at high counts.
+- **The BoltDB file never shrinks.** Deleting 900k of 1M objects left the file at
+  its high-water mark. The space is reused by later writes, not returned to the
+  filesystem.
+- **Raft snapshots serialize the whole store.** `cluster.snapshot_count` defaults
+  to 8192 log entries, and each snapshot writes the entire metadata index. Raise
+  it substantially on a large cluster.
+- **Keep keys short.** The key is stored twice: once as the index key and once
+  inside the metadata value.
+- **Leave versioning off unless you need it.** Every version is another entry.
+- **To go beyond one cluster's ceiling, shard the metadata or run more clusters.**
+  A bucket-per-tenant deployment also splits naturally: one cluster per tenant (or
+  per group of tenants) keeps each index at a size a node can hold, and gives
+  blast-radius isolation and per-tenant key shredding as a side effect.
+
+### Sharding the metadata
+
+`cluster.metadata_shards` splits object metadata across that many independent
+Raft groups. Each node runs only the groups it is a member of, so the index on a
+node is roughly `shards_held / total_shards` of the cluster's, and metadata
+capacity and write throughput grow with the cluster instead of being copied to
+every node. A bucket maps to a shard by hash, and buckets, IAM, policies and
+multipart state stay in the control group that spans every node, so authorization
+and routing still need no lookup.
+
+```yaml
+cluster:
+  metadata_shards: 8      # fixed for the life of the cluster
+  metadata_replicas: 3    # nodes holding each shard
+```
+
+Four things to know before enabling it:
+
+- **The shard count is fixed** once the cluster commits its assignment, because
+  buckets hash to a shard. There is no resharding.
+- **It cannot be switched on for a cluster that already holds objects.** Those
+  records are in the control group, which nothing reads once objects route to
+  shards, so the server refuses to start rather than hide them. Create a new
+  sharded cluster and copy the objects across.
+- **The cluster needs at least `metadata_replicas` nodes** before the assignment
+  can be created, and the assignment is only created after membership has held
+  still for 30 seconds, because the founding members of each shard are permanent.
+- **A shard that cannot be reached is reported as unavailable, not as empty.**
+  Reads of its buckets return 503 rather than 404, which is deliberate: a 404
+  would tell a client its object is gone when the object is intact.
+
+`vaults3-cli cluster shards` shows the committed assignment and the groups running
+on the node it is talking to. The design, including the measured numbers that
+motivate it, is in
+[`docs/design/sharded-metadata.md`](design/sharded-metadata.md).
+
 ## 12. Quick reference
 
 | Goal | Block | Key settings |

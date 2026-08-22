@@ -40,19 +40,34 @@ type reclaimLookup struct {
 	local metadata.StoreAPI
 }
 
-func (l reclaimLookup) HasObject(bucket, key string) bool {
+// A failed lookup reports Unknown, never Absent. The scanner deletes only on
+// Absent, so a metadata store that errors (or, once metadata is sharded, a shard
+// this node cannot reach) makes the scan skip the file instead of treating live
+// data as junk.
+func presence(found bool, err error) reclaim.Presence {
+	switch {
+	case err != nil:
+		return reclaim.Unknown
+	case found:
+		return reclaim.Present
+	default:
+		return reclaim.Absent
+	}
+}
+
+func (l reclaimLookup) HasObject(bucket, key string) reclaim.Presence {
 	m, err := l.store.GetObjectMeta(bucket, key)
-	return err == nil && m != nil
+	return presence(m != nil, err)
 }
 
-func (l reclaimLookup) HasVersion(bucket, key, versionID string) bool {
+func (l reclaimLookup) HasVersion(bucket, key, versionID string) reclaim.Presence {
 	m, err := l.store.GetObjectVersion(bucket, key, versionID)
-	return err == nil && m != nil
+	return presence(m != nil, err)
 }
 
-func (l reclaimLookup) HasUpload(uploadID string) bool {
+func (l reclaimLookup) HasUpload(uploadID string) reclaim.Presence {
 	u, err := l.local.GetMultipartUpload(uploadID)
-	return err == nil && u != nil
+	return presence(u != nil, err)
 }
 
 // reclaimOptions parses the shared query parameters. Dry run is the default

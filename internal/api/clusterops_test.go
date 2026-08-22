@@ -88,12 +88,16 @@ type fakeCluster struct {
 	members          []ClusterMember
 	joined, left     []string
 	joinErr, leaveEr error
+	shardMap         *ShardAssignment
+	localShards      []LocalShard
 }
 
-func (f *fakeCluster) SelfID() string           { return f.self }
-func (f *fakeCluster) IsLeader() bool           { return f.isLeader }
-func (f *fakeCluster) LeaderID() string         { return f.leader }
-func (f *fakeCluster) Members() []ClusterMember { return f.members }
+func (f *fakeCluster) SelfID() string             { return f.self }
+func (f *fakeCluster) IsLeader() bool             { return f.isLeader }
+func (f *fakeCluster) LeaderID() string           { return f.leader }
+func (f *fakeCluster) Members() []ClusterMember   { return f.members }
+func (f *fakeCluster) ShardMap() *ShardAssignment { return f.shardMap }
+func (f *fakeCluster) LocalShards() []LocalShard  { return f.localShards }
 func (f *fakeCluster) Join(id, addr string) error {
 	f.joined = append(f.joined, id)
 	return f.joinErr

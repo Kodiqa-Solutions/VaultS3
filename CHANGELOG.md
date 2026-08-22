@@ -4,6 +4,148 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.54] - 2026-08-22
+### Fixed
+- **A write whose metadata could not be recorded is no longer reported as
+  successful.** The object PUT path called `PutObjectMeta` and discarded the
+  error, then answered `200 OK` with a valid ETag regardless. In a cluster that
+  write goes through Raft, so a group with no leader failed it while the bytes
+  were already on disk: the client believed the object existed, it never appeared
+  in a listing, its `GET` returned 404 forever, and the bytes were left orphaned.
+  Every metadata write on the request path (PUT, versioned PUT, copy, multipart
+  complete, POST form upload, delete, delete markers, object lock and retention,
+  tagging) is now checked and answers `503 SlowDown`, which every mainstream SDK
+  retries. Multi-object delete reports the failure per key instead of listing the
+  key as deleted. Found while reviewing the metadata architecture for issue #50.
+- **Deleting a delete marker now restores the object.** S3 says removing the
+  current delete marker makes the previous version current again. Two faults sat
+  in that path: the "latest" pointer was never repointed, so the object stayed
+  invisible although live versions remained, and the promotion took the first
+  entry of a version listing, which is the OLDEST version, so repointing alone
+  would have resurrected a stale copy. New `LatestObjectVersion` seeks the newest
+  version directly instead of scanning. Reproduced against the released build
+  before fixing.
+- **Multi-object delete ignored versioning, and destroyed objects that predated
+  it.** `POST /{bucket}?delete` removed the data and the "latest" pointer
+  unconditionally, whatever the bucket's versioning state, while a single
+  `DELETE` on the same bucket correctly wrote a delete marker and kept the data.
+  Three consequences, all silent, and the response reported `Deleted` in every
+  case:
+  - On a versioned bucket the object vanished with **no delete marker**, so S3's
+    undelete (remove the marker) did not exist for it, while its versions stayed
+    on disk reachable only by naming a version id.
+  - An object written **before** versioning was enabled has no version to fall
+    back on, so its bytes were removed outright with nothing to restore from.
+    Enabling versioning on an existing bucket and then running a bulk delete
+    therefore destroyed exactly the objects the owner had just moved to protect.
+  - A `<VersionId>` in the request was ignored, so a caller asking to permanently
+    remove one version instead had the current object deleted and every version
+    left in place.
+
+  Both delete paths now go through one `deleteOneObject`, so they cannot drift
+  apart again, and the result carries `VersionId`, `DeleteMarker` and
+  `DeleteMarkerVersionId` as S3 specifies. Multi-object delete is what Spark and
+  Hadoop S3A clean up with, so an ordinary workload reached this.
+
+  **Operators will see this in their storage numbers.** A bulk delete on a
+  versioning-enabled bucket no longer frees space, because the data is now kept
+  behind the delete marker. Reclaim it by expiring noncurrent versions with a
+  lifecycle rule, or by deleting versions explicitly. Buckets without versioning
+  are unaffected.
+- **A multi-object delete of 1000 keys with long names could be rejected as
+  malformed.** The request body was capped at 256 KiB, under the 1 MiB a legal
+  1000-key request can reach; the cap is now 4 MiB. Same shape as the
+  `CompleteMultipartUpload` body cap fixed in 4.4.5.
+- **A follower could not forward a write to its leader unless the API was on port
+  9000.** The Raft address carries the raft port and says nothing about the API
+  port, and the conversion between them assumed 9000 unconditionally, so on any
+  other port every write that landed on a follower failed with a connection
+  refused. It now prefers the leader's `cluster.peer_apis` entry, then this
+  node's `api_port`, then 9000, so the previous behaviour is unchanged where the
+  old assumption held. Found while smoke-testing a three-node cluster on one host.
+- **`storage reclaim` can no longer delete data it failed to ask about.** The
+  lookup returned a plain boolean, so "the metadata store errored" was
+  indistinguishable from "there is no metadata" and the file was recorded as an
+  orphan and removed. Presence is now three-valued (present, absent, unknown),
+  deletions are held until a bucket's scan finishes so discovery order cannot
+  decide whether data survives, and a single unanswerable lookup marks the whole
+  bucket incomplete and protects everything in it. Reports carry
+  `skippedUnknown` and `incomplete` so an operator can see that a scan was
+  partial rather than reading it as "nothing to reclaim". This is the issue #47
+  rule (only delete what is positively understood) made structural.
+
+### Performance
+- **Clustered metadata writes are batched into one transaction.** The Raft state
+  machine applied each committed entry in its own BoltDB transaction, costing one
+  fsync per object on every node. It now implements `raft.BatchingFSM` and
+  coalesces consecutive object-metadata writes, preserving log order exactly.
+  Measured on a 3-node cluster ingesting 1 KiB objects at concurrency 32:
+  **515 to 666 objects/sec (+29%)**, and 461 to 665 (+44%) on a shorter run. With
+  Raft removed entirely the same load reaches 886/sec, so consensus now costs
+  about 25% rather than dominating.
+
+### Added
+- **Sharded metadata (issue #50), off by default.** Until now a cluster spread
+  object DATA across its nodes but Raft-replicated the metadata to every one of
+  them, so adding nodes bought data capacity and no metadata capacity at all:
+  about 600 bytes per object, on every node, is what caps how many objects a
+  cluster can hold. Setting `cluster.metadata_shards` above 1 splits object
+  metadata across that many independent Raft groups, and each node runs only the
+  groups it is a member of.
+  - Buckets map to a shard by hash. Buckets, IAM, policies and multipart state
+    stay in a control group that still spans every node, so authorization and
+    request routing need no lookup and the request path is unchanged.
+  - The hop to another node lives inside the metadata store, not in the request
+    router: data placement and metadata placement are independent, and the S3
+    handler gets exactly one proxy hop, which the data placement already spends.
+  - Writes are ordered by the shard's leader and listings are served by it, so a
+    key a client was just told was stored cannot be missing from the next listing.
+  - **A shard that cannot be asked is reported as unavailable, never as empty.**
+    Reads of its buckets answer `503`, not `404`. Metadata is authoritative for
+    reconciliation here, so "I could not ask" being read as "it does not exist" is
+    how orphan reclaim deletes live data.
+  - The assignment is Raft-committed control state with a creation epoch and
+    frozen founding members, and only a founder may bootstrap a shard's group. A
+    node that joined later is added to the group that exists, because a second
+    bootstrap would form a rival group that answers, authoritatively, that the
+    shard is empty.
+  - Membership is reconciled per shard, one member at a time and adds before
+    removes, so a group never drops below the quorum of members holding its data.
+  - Several Raft groups share one node's Raft port. Shard connections announce
+    themselves, control connections do not, which is exactly what an older build
+    sends, so a rolling upgrade cannot split the control group.
+  - The shard count is fixed once the assignment is committed, and sharding
+    cannot be enabled on a cluster that already holds object metadata: the server
+    refuses to start rather than leave those records where nothing reads them.
+    See `docs/design/sharded-metadata.md`.
+- `vaults3-cli cluster shards` and `GET /api/v1/cluster/shards` report how object
+  metadata is distributed: the committed assignment, and the shard groups running
+  on the node answering. On a cluster that replicates all metadata they say
+  exactly that and what it costs, rather than reporting an empty assignment that
+  would read as "sharded and holding nothing".
+- `cluster.metadata_shards` and `cluster.metadata_replicas` settings, with
+  `cluster.metadataShards` / `cluster.metadataReplicas` in the Helm chart.
+- `docs/SCALING.md` section 11a, "how many objects a cluster can hold", with the
+  measured cost of the metadata index and what it means for planning, and
+  `docs/design/sharded-metadata.md` with the design, the measured numbers behind
+  it, and the constraints an adversarial review of it established.
+
+### Changed
+- **Bucket deletion is two commits, object metadata first.** A bucket's object
+  records can live in a different Raft group from the bucket record, so removing
+  the bucket while that group is unreachable would strand records nothing owns,
+  which a bucket recreated under the same name would inherit. The delete now
+  fails with `503` instead.
+- Background subsystems (lifecycle, tiering, search, the scanner, replication,
+  backup, inventory, batch operations, the rebalancer, the erasure healer) take
+  the metadata store interface rather than the concrete local store, so they see
+  the routed object space. With sharding on, full scans are partitioned across
+  shard leaders: each leader walks the shards it leads, so the cluster visits
+  every object once instead of every node walking everything.
+- The control group now uses the same shared Raft transport as shard groups.
+  Control connections are byte-identical to what earlier builds send, so this is
+  invisible on the wire and there is one transport path rather than two.
+
 ## [4.4.53] - 2026-08-13
 ### Fixed
 - **Encrypted reads no longer allocate in proportion to object size**, which is

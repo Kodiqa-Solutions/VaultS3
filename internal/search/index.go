@@ -38,14 +38,14 @@ type Index struct {
 	entries    map[string]*entry
 	lru        *list.List
 	lruElems   map[string]*list.Element
-	store      *metadata.Store
+	store      metadata.StoreAPI
 	maxEntries int
 }
 
 const defaultMaxSearchEntries = 50000
 
 // NewIndex creates a new search index with the given max entries cap.
-func NewIndex(store *metadata.Store, maxEntries int) *Index {
+func NewIndex(store metadata.StoreAPI, maxEntries int) *Index {
 	if maxEntries <= 0 {
 		maxEntries = defaultMaxSearchEntries
 	}

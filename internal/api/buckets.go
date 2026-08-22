@@ -145,7 +145,15 @@ func (h *APIHandler) handleDeleteBucket(w http.ResponseWriter, _ *http.Request, 
 	}
 
 	h.store.DeleteBucketPolicy(name)
-	h.store.DeleteBucketObjectMeta(name)
+	// Two phases, object metadata first. When metadata is sharded the records
+	// live in the shard that owns the bucket, not with the bucket record, so
+	// dropping the bucket while that shard is unreachable would strand them:
+	// nothing would own them and a bucket recreated with the same name would
+	// inherit them (issue #50).
+	if err := h.store.DeleteBucketObjectMeta(name); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not clear the bucket's object metadata, retry")
+		return
+	}
 	if err := h.store.DeleteBucket(name); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete bucket")
 		return

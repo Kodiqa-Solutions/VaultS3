@@ -75,6 +75,7 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 | **Erasure coding** (single-node, multi-disk) | ✅ Stable | Reed-Solomon encode/reconstruct and the background healer have fault-injection tests (lose disks → reconstruct → heal). |
 | **Tiering & backup** | ✅ Stable | Hot/cold migration, transparent promotion, and full/incremental backup are tested. Restore is a manual file copy. |
 | **Multi-node Raft clustering** | 🟡 Beta | Metadata writes replicate via Raft consensus (writes accepted on any node via leader-forwarding), object data is placed/served by a live-membership hash ring, inter-node calls are authenticated, and on Kubernetes the cluster auto-forms (leader bootstrap + auto-join + self-heal). Validated end-to-end on a real 3-node cluster: leader election & failover, node recovery with catch-up, cross-node reads, and concurrent load, including a 10,000-write list-then-write-then-read workload behind a gateway with a node restarted mid-run. Still operationally newer, not yet stress/scale/multi-region hardened, so validate against your workload before trusting it as the only copy of critical data. |
+| **Sharded metadata** (`cluster.metadata_shards > 1`) | 🟠 New in 4.4.54 | Splits object metadata across independent Raft groups so metadata capacity grows with the cluster instead of every node holding the whole index. Validated on real three-node clusters, local and in containers: shard assignment, group membership reconciliation, routed reads and writes from a node holding no copy of a shard, and an unreachable shard reporting `503` rather than a phantom `404`. Newer than everything above it, and the shard count is fixed when the cluster first commits its assignment, so treat it as opt-in for new clusters you can validate. Off by default. |
 | **Active-active replication** | 🟡 Beta | Vector-clock conflict resolution is unit-tested. The cross-site sync worker is less exercised in the wild. |
 
 **Recommendation:** run single-node (optionally with erasure coding across local disks) for production data you care about, and treat clustering/active-active as advanced opt-in features you validate first. Always keep an independent backup. See the **[Scaling & Operations Guide](docs/SCALING.md)** for redundancy layering and recovery runbooks, and the **[Benchmarks guide](docs/BENCHMARKS.md)** for a reproducible way to measure throughput and RAM on your own hardware.
@@ -119,7 +120,7 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 - **Lifecycle rules**: Per-bucket object expiration (auto-delete after N days) and aborting incomplete multipart uploads after N days (S3 `AbortIncompleteMultipartUpload`, reclaims the parts left by killed/failed clients), run by a background worker
 - **Zstandard compression**: Transparent compress-on-write, decompress-on-read with zstd (better ratio and speed than gzip). Reads **stream** the decoder, so GET time-to-first-byte stays flat regardless of object size (no whole-object buffering). Objects written by older gzip builds are still read transparently (codec auto-detected by magic number)
 - **Small-file packing (experimental)**: Optionally pack objects up to a size threshold into large append-only **volume** files (each as an independent zstd frame) with byte-offset locations in BoltDB, plus background dead-space **compaction** (`POST /api/v1/compact`), avoids the per-file overhead (inodes, syscalls, disk blocks) of millions of tiny objects. Larger objects fall through to individual files. Not yet composable with encryption or erasure coding (skipped if either is enabled)
-- **Scales to millions of objects**: Listing and storage stats are served from a sorted BoltDB metadata index with maintained per-bucket counters (size/count updated incrementally on every write), never a filesystem walk. So dashboard stats are O(1) and the object browser pages in milliseconds regardless of bucket size, verified at 1M+ objects (stats `13s → 0.4ms`)
+- **Scales to millions of objects**: Listing and storage stats are served from a sorted BoltDB metadata index with maintained per-bucket counters (size/count updated incrementally on every write), never a filesystem walk. So dashboard stats are O(1) and the object browser pages in milliseconds regardless of bucket size, verified at 1M+ objects (stats `13s → 0.4ms`). Metadata costs about 600 bytes per object and, in a cluster, is replicated to every node by default (object data is sharded, metadata is not), so roughly 10M objects per node is comfortable and 100M is workable with NVMe and enough RAM. Past that, `cluster.metadata_shards` splits the object metadata across independent Raft groups so each node holds only the shards it is a member of. See [docs/SCALING.md](docs/SCALING.md#11a-how-many-objects-a-cluster-can-hold)
 - **Access logging**: Structured JSON lines log file of all S3 operations
 - **Static website hosting**: Serve index/error documents from buckets, no auth required
 - **IAM users, groups & policies**: Fine-grained access control with S3-compatible policy evaluation, default deny, wildcard matching
@@ -128,7 +129,7 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 - **Audit trail**: Persistent audit log with filtering by user, bucket, time range. Auto-pruning via lifecycle worker
 - **IP allowlist/blocklist**: Global and per-user CIDR-based IP restrictions with IPv4/IPv6 support
 - **S3 event notifications**: Per-bucket webhook notifications on object mutations with event type and key prefix/suffix filtering, plus Kafka, NATS, Redis, AMQP/RabbitMQ, PostgreSQL, and Elasticsearch backends
-- **Raft clustering**: Multi-node cluster with Hashicorp Raft consensus for strongly consistent distributed metadata, automatic leader election, and node join/leave via HTTP API
+- **Raft clustering**: Multi-node cluster with Hashicorp Raft consensus for strongly consistent distributed metadata, automatic leader election, and node join/leave via HTTP API. Optionally shards the object metadata across independent Raft groups (`cluster.metadata_shards`) so metadata capacity grows with the cluster instead of every node holding a copy of the whole index. See [docs/design/sharded-metadata.md](docs/design/sharded-metadata.md)
 - **Consistent hashing**: xxhash64-based hash ring with virtual nodes for automatic data placement and request routing across cluster nodes via reverse proxy. A read whose data has not yet been copied to the node serving it is fetched from a holder that has it, so a `GET` never reports "not found" for an object that was just written, and a hop that fails before any response reaches the client is retried against the object's other holders instead of surfacing as a gateway error
 - **Erasure coding**: Reed-Solomon encoding (configurable data/parity shards) for disk-failure protection with background healer that auto-reconstructs degraded objects. Reads **stream** the data shards, so GET time-to-first-byte stays flat regardless of object size, and fall back to parity reconstruction only when a shard is actually missing. **Settable per bucket** alongside replica count (`vaults3-cli bucket durability`), so scratch data can be stored once while the buckets that matter keep their parity and copies: on a 3-node cluster with 4+2 coding and 3 replicas, the same data costs 4.52x with the defaults and 1.00x with both turned off
 - **High availability**: Automatic failure detection (health probes with suspect/down state machine), failover proxy routing to healthy replicas, and background rebalancer for membership changes. Inter-node traffic shares a pooled HTTP transport (connection reuse instead of a new socket per call), and a node that genuinely cannot serve a request answers `503 SlowDown` with an S3 error document, which every mainstream SDK retries on its own
@@ -214,7 +215,7 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 - **Request tracing**: Server-Sent Events at `/api/v1/trace` for per-request latency tracing
 - **Health diagnostics**: Detailed system diagnostics at `/api/v1/diagnostics` (disk, memory, goroutines, DB stats)
 - **Manual heal API**: `POST /api/v1/heal` to trigger erasure-coded object repair on demand
-- **Orphan reclaim**: `POST /api/v1/reclaim` (or `vaults3-cli storage reclaim`) finds data files that no metadata refers to any more and frees them, scanning every node in a cluster. Reports by default; `?apply=true` deletes, and nothing written in the last 24h is ever touched
+- **Orphan reclaim**: `POST /api/v1/reclaim` (or `vaults3-cli storage reclaim`) finds data files that no metadata refers to any more and frees them, scanning every node in a cluster. Reports by default; `?apply=true` deletes, and nothing written in the last 24h is ever touched. A file is deleted only when metadata positively says it is gone: if a lookup cannot be answered at all, the whole bucket is reported `incomplete` and nothing in it is touched
 - **Speedtest**: `POST /api/v1/speedtest` to benchmark storage throughput
 - **Batch operations**: Bulk delete and copy processor for large-scale object operations
 - **PROXY protocol v1**: Accept PROXY protocol connections for real client IP behind load balancers
@@ -411,6 +412,8 @@ cluster:
   peer_apis:               # nodeID → "host:apiPort"
     node-2: "host2:9000"
     node-3: "host3:9000"
+  metadata_shards: 1       # >1 splits object metadata across that many Raft groups
+  metadata_replicas: 3     # nodes holding each shard
   placement:
     replica_count: 3
     read_quorum: 2
@@ -1136,6 +1139,7 @@ vaults3-cli cluster join node-3 10.0.0.4:7000  # add a member (against the leade
 vaults3-cli cluster drain node-2               # stop a node accepting writes (reads continue)
 vaults3-cli cluster rebalance                  # move objects to their correct owner
 vaults3-cli cluster decommission node-2        # guided drain + rebalance before replacing a node
+vaults3-cli cluster shards                     # how object metadata is distributed across the cluster
 ```
 
 Build both binaries with `make build` or just the CLI with `make cli`.
@@ -1591,6 +1595,23 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+### Upgrading to 4.4.54
+
+One behaviour change is worth knowing before you upgrade, because it is visible
+in your storage numbers:
+
+**On a versioning-enabled bucket, a multi-object delete now writes a delete
+marker and keeps the data**, which is what a single `DELETE` has always done and
+what S3 specifies. Before this it removed the object outright, so a bulk delete
+freed space. After upgrading it will not, and the space is released when the
+versions are expired, either by a lifecycle rule (`NoncurrentVersionExpiration`)
+or by deleting versions explicitly. Buckets without versioning are unaffected.
+
+Nothing else needs action. Metadata sharding is off unless you set
+`cluster.metadata_shards` above 1, and the server refuses to start if you set it
+on a node whose metadata store already holds objects, so an upgrade cannot enable
+it by accident.
+
 ## Contributing
 
 Contributions are welcome! See **[CONTRIBUTING.md](CONTRIBUTING.md)** for build,
@@ -1754,3 +1775,4 @@ partition two sites and resolve the conflict. New logic there should keep that b
 - [x] S3 Select on Parquet files (parquet-go, row group iteration, columnar to record conversion)
 - [x] Integration test suite (26 end-to-end tests with real SigV4 signing, filesystem storage, BoltDB metadata)
 - [x] Race detection in CI (`go test -race`)
+- [x] Sharded metadata (`cluster.metadata_shards`): object metadata split across independent Raft groups so metadata capacity grows with the cluster, with per-shard membership reconciliation, all groups sharing one Raft port, and an unreachable shard reported as unavailable rather than empty

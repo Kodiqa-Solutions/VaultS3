@@ -55,6 +55,10 @@ spec:
               export VAULTS3_CLUSTER_BIND_ADDR="$POD_IP"
               export VAULTS3_CLUSTER_RAFT_PORT={{ .Values.cluster.raftPort }}
               export VAULTS3_CLUSTER_DATA_DIR=/metadata/raft
+              {{- if gt (int .Values.cluster.metadataShards) 1 }}
+              export VAULTS3_CLUSTER_METADATA_SHARDS={{ .Values.cluster.metadataShards }}
+              export VAULTS3_CLUSTER_METADATA_REPLICAS={{ .Values.cluster.metadataReplicas }}
+              {{- end }}
               export VAULTS3_CLUSTER_JOIN_ADDR="{{ include "vaults3.fullname" . }}-headless:{{ .Values.service.port }}"
               # Authenticate inter-node calls with the (shared) admin secret key.
               export VAULTS3_CLUSTER_SECRET="$VAULTS3_SECRET_KEY"

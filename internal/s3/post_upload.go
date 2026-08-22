@@ -76,14 +76,17 @@ func (h *ObjectHandler) PostUpload(w http.ResponseWriter, r *http.Request, bucke
 		ct = "application/octet-stream"
 	}
 
-	h.store.PutObjectMeta(metadata.ObjectMeta{
+	if err := h.store.PutObjectMeta(metadata.ObjectMeta{
 		Bucket:       bucket,
 		Key:          key,
 		Size:         size,
 		ETag:         etag,
 		ContentType:  ct,
 		LastModified: time.Now().UTC().UnixNano(),
-	})
+	}); err != nil {
+		metaWriteFailed(w, err, "POST upload", bucket, key)
+		return
+	}
 
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, etag))
 	w.Header().Set("Location", fmt.Sprintf("/%s/%s", bucket, key))

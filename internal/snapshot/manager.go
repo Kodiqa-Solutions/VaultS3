@@ -19,10 +19,10 @@ import (
 
 // Manager creates, inspects, and restores bucket snapshots.
 type Manager struct {
-	store *metadata.Store
+	store metadata.StoreAPI
 }
 
-func NewManager(store *metadata.Store) *Manager {
+func NewManager(store metadata.StoreAPI) *Manager {
 	return &Manager{store: store}
 }
 

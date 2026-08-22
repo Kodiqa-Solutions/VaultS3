@@ -65,7 +65,7 @@ type triggerJob struct {
 
 // TriggerManager dispatches S3 events to lambda function URLs.
 type TriggerManager struct {
-	store           *metadata.Store
+	store           metadata.StoreAPI
 	engine          storage.Engine
 	client          *http.Client
 	workerCh        chan triggerJob
@@ -75,7 +75,7 @@ type TriggerManager struct {
 }
 
 // NewTriggerManager creates a new trigger manager.
-func NewTriggerManager(store *metadata.Store, engine storage.Engine, cfg config.LambdaConfig) *TriggerManager {
+func NewTriggerManager(store metadata.StoreAPI, engine storage.Engine, cfg config.LambdaConfig) *TriggerManager {
 	return &TriggerManager{
 		store:           store,
 		engine:          engine,

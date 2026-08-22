@@ -85,9 +85,19 @@ type ClusterConfig struct {
 	Secret        string            `yaml:"secret"`    // shared secret authenticating inter-node endpoints (join/leave/apply)
 	DataDir       string            `yaml:"data_dir"`
 	SnapshotCount int               `yaml:"snapshot_count"`
-	Placement     PlacementConfig   `yaml:"placement"`
-	Detector      DetectorConfig    `yaml:"detector"`
-	Rebalance     RebalanceConfig   `yaml:"rebalance"`
+	// MetadataShards splits object metadata across independent Raft groups so a
+	// node indexes only the buckets it holds instead of every object in the
+	// cluster (issue #50). 0 or 1 keeps the single group that holds everything,
+	// which is the default and the pre-sharding topology. Buckets hash to a
+	// shard, so this is fixed for the life of a cluster: changing it on an
+	// existing cluster requires migrating metadata between groups.
+	MetadataShards int `yaml:"metadata_shards"`
+	// MetadataReplicas is how many nodes hold each shard. Clamped to the cluster
+	// size. Only meaningful when MetadataShards > 1.
+	MetadataReplicas int             `yaml:"metadata_replicas"`
+	Placement        PlacementConfig `yaml:"placement"`
+	Detector         DetectorConfig  `yaml:"detector"`
+	Rebalance        RebalanceConfig `yaml:"rebalance"`
 }
 
 type PlacementConfig struct {
@@ -567,6 +577,16 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("VAULTS3_CLUSTER_DATA_DIR"); v != "" {
 		cfg.Cluster.DataDir = v
+	}
+	if v := os.Getenv("VAULTS3_CLUSTER_METADATA_SHARDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Cluster.MetadataShards = n
+		}
+	}
+	if v := os.Getenv("VAULTS3_CLUSTER_METADATA_REPLICAS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Cluster.MetadataReplicas = n
+		}
 	}
 	// Per-pod cluster wiring (the Helm StatefulSet derives these from the pod
 	// ordinal so node-0 bootstraps and the rest auto-join).
