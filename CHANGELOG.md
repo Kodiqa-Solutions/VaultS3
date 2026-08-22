@@ -5,6 +5,12 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [4.4.56] - 2026-08-22
+### Added
+- A `NOTICE` file and a `## License` section carrying the copyright statement.
+  The repository shipped the full AGPL-3.0 text but never asserted copyright
+  anywhere, which is one of the licence's own conditions and the thing the
+  open-core split depends on.
+
 ### Security
 
 An external white-box assessment of VaultS3 reported 14 findings. All of them are

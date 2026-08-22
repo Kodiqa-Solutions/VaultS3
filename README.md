@@ -99,6 +99,8 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 ## Project and support
 
 VaultS3 is a [Kodiqa Solutions](https://www.vaults3.com) project.
+Copyright (C) 2026 Kodiqa Solutions, licensed under the
+[GNU Affero General Public License v3.0](LICENSE).
 
 **The storage engine is AGPL-3.0 and stays that way.** Every feature documented
 in this README is in the open-source binary. Nothing here is behind a licence
@@ -1894,3 +1896,18 @@ partition two sites and resolve the conflict. New logic there should keep that b
 - [x] Race detection in CI (`go test -race`)
 - [x] `vaults3 setup`: interactive and scripted first-run configuration, with a generated per-installation admin secret instead of a published default
 - [x] Sharded metadata (`cluster.metadata_shards`): object metadata split across independent Raft groups so metadata capacity grows with the cluster, with per-shard membership reconciliation, all groups sharing one Raft port, and an unreachable shard reported as unavailable rather than empty
+
+## License
+
+Copyright (C) 2026 Kodiqa Solutions.
+
+VaultS3 is free software, licensed under the **GNU Affero General Public License
+v3.0**. You may use, modify and redistribute it, including commercially, provided
+you preserve the licence and copyright notices, state your changes, and release
+the source of anything you derive from it under the same licence. The AGPL adds
+one condition the GPL does not: if you run a modified version as a network
+service, the users of that service are entitled to its source.
+
+The full text is in [LICENSE](LICENSE), and [NOTICE](NOTICE) carries the
+copyright statement. Separate paid add-ons are described under
+[Project and support](#project-and-support) and are not covered by this licence.

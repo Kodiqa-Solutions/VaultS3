@@ -140,3 +140,8 @@ enquiries: support@vaults3.com
 Your data stays portable: objects are ordinary files and the index is a BoltDB
 file, served over the S3 API, so moving to anything else that speaks S3 is an
 `rclone sync` away.
+
+## License
+
+Copyright (C) 2026 Kodiqa Solutions. VaultS3 is free software under the
+[GNU Affero General Public License v3.0](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/LICENSE).
