@@ -56,7 +56,7 @@ S3 API: `http://localhost:9000`
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `VAULTS3_ACCESS_KEY` | Admin access key | `vaults3-admin` |
-| `VAULTS3_SECRET_KEY` | Admin secret key | `vaults3-secret-change-me` |
+| `VAULTS3_SECRET_KEY` | Admin secret key | generated on first start, printed once in the container log |
 | `VAULTS3_PORT` | Server port | `9000` |
 | `VAULTS3_ADDRESS` | Bind address | `0.0.0.0` |
 | `VAULTS3_DOMAIN` | Domain for virtual-hosted URLs | _(empty)_ |

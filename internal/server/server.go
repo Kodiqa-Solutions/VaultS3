@@ -145,38 +145,39 @@ func (a clusterControllerAdapter) Members() []api.ClusterMember {
 }
 
 type Server struct {
-	cfg             *config.Config
-	store           *metadata.Store
-	metaStore       metadata.StoreAPI
-	engine          storage.Engine
-	keyMgr          *bucketcrypto.Manager
-	s3h             *s3.Handler
-	metrics         *metrics.Collector
-	activity        *api.ActivityLog
-	accessLog       *accesslog.AccessLogger
-	notifyDisp      *notify.Dispatcher
-	replWorker      *replication.Worker
-	biDirWorker     *replication.BiDirectionalWorker
-	replicationFunc func(eventType, bucket, key string, size int64, etag, versionID string)
-	searchIndex     *search.Index
-	vectorMgr       *vector.Manager
-	scanWorker      *scanner.Scanner
-	tieringMgr      *tiering.Manager
-	backupSched     *backup.Scheduler
-	rateLimiter     *ratelimit.Limiter
-	lambdaMgr       *lambda.TriggerManager
-	accessUpdater   *metadata.AccessUpdater
-	clusterNode     *cluster.Node
-	clusterProxy    *cluster.Proxy
-	shardService    *cluster.ShardService
-	shardRuntime    *cluster.ShardRuntime
-	shardRouter     *cluster.ShardRouter
-	failoverProxy   *cluster.FailoverProxy
-	failureDetector *cluster.FailureDetector
-	rebalancer      *cluster.Rebalancer
-	ecHealer        *erasure.Healer
-	s3Auth          *s3.Authenticator
-	writable        *atomic.Bool // node-local write gate shared by the S3 + admin handlers (drain)
+	cfg                  *config.Config
+	store                *metadata.Store
+	metaStore            metadata.StoreAPI
+	engine               storage.Engine
+	keyMgr               *bucketcrypto.Manager
+	s3h                  *s3.Handler
+	metrics              *metrics.Collector
+	activity             *api.ActivityLog
+	accessLog            *accesslog.AccessLogger
+	notifyDisp           *notify.Dispatcher
+	replWorker           *replication.Worker
+	biDirWorker          *replication.BiDirectionalWorker
+	replicationFunc      func(eventType, bucket, key string, size int64, etag, versionID string)
+	searchIndex          *search.Index
+	vectorMgr            *vector.Manager
+	scanWorker           *scanner.Scanner
+	tieringMgr           *tiering.Manager
+	backupSched          *backup.Scheduler
+	rateLimiter          *ratelimit.Limiter
+	lambdaMgr            *lambda.TriggerManager
+	accessUpdater        *metadata.AccessUpdater
+	clusterNode          *cluster.Node
+	clusterProxy         *cluster.Proxy
+	generatedAdminSecret string
+	shardService         *cluster.ShardService
+	shardRuntime         *cluster.ShardRuntime
+	shardRouter          *cluster.ShardRouter
+	failoverProxy        *cluster.FailoverProxy
+	failureDetector      *cluster.FailureDetector
+	rebalancer           *cluster.Rebalancer
+	ecHealer             *erasure.Healer
+	s3Auth               *s3.Authenticator
+	writable             *atomic.Bool // node-local write gate shared by the S3 + admin handlers (drain)
 	// reapElsewhere drops an object's data on the OTHER nodes; nil single-node.
 	// Held here so background sweeps (lifecycle expiry) reclaim cluster-wide too,
 	// not just the request-path deletes (issue #47).
@@ -508,12 +509,24 @@ func New(cfg *config.Config) (*Server, error) {
 	// match (issue #36). Reuses server.base_path.
 	auth.SetBasePath(cfg.Server.BasePath, cfg.Server.TrustForwardedPrefix)
 
-	// Load persisted admin credentials (overrides config/env if previously changed via dashboard)
-	if ak, sk, err := store.GetAdminCredentials(); err == nil && ak != "" && sk != "" {
-		cfg.Auth.AdminAccessKey = ak
-		cfg.Auth.AdminSecretKey = sk
-		auth.UpdateAdminCredentials(ak, sk)
+	// generatedAdminSecret is non-empty only on a first run, and is printed once
+	// when the server starts serving.
+	generatedAdminSecret := ""
+	// Admin credentials: persisted (a dashboard change, or a previous first run)
+	// beats configured, and a server told nothing generates its own rather than
+	// falling back to the secret printed in the docs (issue #51).
+	credSource, err := resolveAdminCredentials(cfg, store, auth)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	switch credSource {
+	case adminCredsFromStore:
 		slog.Info("loaded persisted admin credentials")
+	case adminCredsGenerated:
+		generatedAdminSecret = cfg.Auth.AdminSecretKey
+	default:
+		warnPlaceholderSecret(cfg.Auth.AdminSecretKey)
 	}
 
 	// Initialize metrics collector
@@ -979,39 +992,40 @@ func New(cfg *config.Config) (*Server, error) {
 	initBuiltinPolicies(store)
 
 	return &Server{
-		cfg:             cfg,
-		store:           store,
-		metaStore:       metaStore,
-		engine:          engine,
-		reapElsewhere:   reapOne,
-		keyMgr:          keyMgr,
-		s3h:             s3h,
-		metrics:         mc,
-		activity:        activityLog,
-		accessLog:       accessLogger,
-		notifyDisp:      notifyDispatcher,
-		replWorker:      replWorker,
-		biDirWorker:     biDirWorker,
-		replicationFunc: replicationFunc,
-		searchIndex:     searchIdx,
-		vectorMgr:       vectorMgr,
-		scanWorker:      scanWorker,
-		tieringMgr:      tieringMgr,
-		backupSched:     backupSched,
-		rateLimiter:     rateLimiter,
-		lambdaMgr:       lambdaMgr,
-		accessUpdater:   accessUpdater,
-		clusterNode:     clusterNode,
-		clusterProxy:    clusterProxy,
-		shardService:    shardService,
-		shardRuntime:    shardRuntime,
-		shardRouter:     shardRouter,
-		failoverProxy:   failoverProxy,
-		failureDetector: failureDetector,
-		rebalancer:      rebalancer,
-		writable:        writable,
-		ecHealer:        ecHealer,
-		s3Auth:          auth,
+		cfg:                  cfg,
+		store:                store,
+		metaStore:            metaStore,
+		engine:               engine,
+		reapElsewhere:        reapOne,
+		keyMgr:               keyMgr,
+		s3h:                  s3h,
+		metrics:              mc,
+		activity:             activityLog,
+		accessLog:            accessLogger,
+		notifyDisp:           notifyDispatcher,
+		replWorker:           replWorker,
+		biDirWorker:          biDirWorker,
+		replicationFunc:      replicationFunc,
+		searchIndex:          searchIdx,
+		vectorMgr:            vectorMgr,
+		scanWorker:           scanWorker,
+		tieringMgr:           tieringMgr,
+		backupSched:          backupSched,
+		rateLimiter:          rateLimiter,
+		lambdaMgr:            lambdaMgr,
+		accessUpdater:        accessUpdater,
+		clusterNode:          clusterNode,
+		clusterProxy:         clusterProxy,
+		generatedAdminSecret: generatedAdminSecret,
+		shardService:         shardService,
+		shardRuntime:         shardRuntime,
+		shardRouter:          shardRouter,
+		failoverProxy:        failoverProxy,
+		failureDetector:      failureDetector,
+		rebalancer:           rebalancer,
+		writable:             writable,
+		ecHealer:             ecHealer,
+		s3Auth:               auth,
 	}, nil
 }
 
@@ -1283,13 +1297,14 @@ func (s *Server) Run() error {
 	if s.cfg.Server.TLS.Enabled {
 		scheme = "https"
 	}
-	dashURL := fmt.Sprintf("%s://%s/dashboard/", scheme, addr)
+	dashURL := fmt.Sprintf("%s://%s/dashboard/", scheme, displayHost(addr))
 	if splitConsole {
 		caddr := s.cfg.Server.ConsoleAddress
 		if caddr == "" {
 			caddr = s.cfg.Server.Address
 		}
-		dashURL = fmt.Sprintf("%s://%s:%d/dashboard/", scheme, caddr, s.cfg.Server.ConsolePort)
+		dashURL = fmt.Sprintf("%s://%s/dashboard/", scheme,
+			displayHost(fmt.Sprintf("%s:%d", caddr, s.cfg.Server.ConsolePort)))
 	}
 	slog.Info("VaultS3 starting",
 		"addr", addr,
@@ -1297,9 +1312,11 @@ func (s *Server) Run() error {
 		"metadata_dir", s.cfg.Storage.MetadataDir,
 		"dashboard", dashURL,
 	)
-	if s.cfg.Auth.AdminAccessKey == "vaults3-admin" || s.cfg.Auth.AdminSecretKey == "vaults3-secret-change-me" {
-		slog.Warn("Using default admin credentials. Set VAULTS3_ACCESS_KEY and VAULTS3_SECRET_KEY environment variables.")
+	// A first run shows the secret it minted, once, where an operator will see it.
+	if s.generatedAdminSecret != "" {
+		announceAdminCredentials(s.cfg.Auth.AdminAccessKey, s.generatedAdminSecret, dashURL)
 	}
+	warnPlaceholderSecret(s.cfg.Auth.AdminSecretKey)
 	if s.cfg.Encryption.Enabled {
 		slog.Info("encryption enabled", "algorithm", "AES-256-GCM")
 	}

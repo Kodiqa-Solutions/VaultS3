@@ -4,6 +4,67 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.55] - 2026-08-22
+### Fixed
+- **A freshly downloaded binary would not start.** The release archive ships the
+  two binaries, `README.md` and `LICENSE`, and the release notes say to extract
+  it and run `./vaults3`. The server read `configs/vaults3.yaml` unconditionally
+  and exited when it was absent, so the documented install failed on the first
+  command, on every release. A config file at the DEFAULT path is now optional:
+  its absence is an ordinary first run, and the built-in defaults are already a
+  working single node. A config path given explicitly with `-config` must still
+  exist, because there a missing file means a typo rather than a first run
+  (issue #51, reported by tsundara).
+- **The first thing a new user saw was a URL they could not open.** The startup
+  line printed the bind address, so a default install advertised its dashboard
+  at `http://0.0.0.0:9000/dashboard/`. A wildcard bind is where the server
+  listens, not somewhere a browser can go; it now prints `127.0.0.1` for a
+  wildcard.
+- **Relative paths did not work inside the container.** The image set no working
+  directory, so `./data` and friends resolved at `/`, which the unprivileged
+  runtime user cannot write to. The image now has a writable working directory.
+  The server itself was never affected: the image points it at absolute paths.
+
+### Security
+- **A server told no admin secret now generates its own** instead of falling
+  back to `vaults3-secret-change-me`, which is printed in this repository.
+  Anyone who downloaded VaultS3, started it and exposed port 9000 was running a
+  server whose password is public, and a warning in the log is not a control:
+  the people most likely to miss it are exactly the people who never set a
+  secret. The generated secret is stored with the metadata and printed once, so
+  later starts reuse it.
+  - **Nothing is taken away from an existing installation.** Credentials already
+    persisted, which includes any password set from the dashboard and anything a
+    previous start saved, still win over everything else, and an explicitly
+    configured secret is still honoured. Only an installation that has never had
+    a secret gets a generated one.
+  - The sample config, the Helm chart and the Kubernetes manifest no longer
+    carry the example secret in the places that are overridden at runtime, and
+    the chart's `auth.secretKey` now defaults to empty, which makes
+    `helm install` generate one and preserve it across upgrades.
+- A server still running the published example secret says so on every start,
+  rather than only when it also uses the default access key.
+
+### Added
+- **`vaults3 setup`**, an interactive first-run command (issue #51). It asks for
+  the data, metadata and log locations, the listen address and port, the admin
+  credentials and any buckets to create at startup; creates the directories;
+  and writes a config file. It writes only what you chose, so clustering,
+  encryption, replication and the rest stay out of the file rather than
+  appearing as a wall of disabled blocks. The file is written `0600` because it
+  holds the admin secret, an existing config is never overwritten without
+  `--force`, and the run ends by printing the start command, the dashboard URL
+  and the credentials.
+  - `--non-interactive` takes every answer from flags for scripted installs, and
+    is also what a piped stdin selects, so `setup` never blocks in a pipeline.
+- `vaults3 help` and a usage message that names the subcommands.
+
+### Internal
+- Fixed a data race in the transport mux test helper, which set the handshake
+  timeout after the accept loop that reads it had already started. The shipped
+  binary never wrote that field after construction, so no released build was
+  affected, but `go test -race` failed. It is now a constructor parameter.
+
 ## [4.4.54] - 2026-08-22
 ### Fixed
 - **A write whose metadata could not be recorded is no longer reported as

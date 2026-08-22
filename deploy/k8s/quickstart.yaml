@@ -20,7 +20,9 @@ metadata:
 type: Opaque
 stringData:
   access-key: "vaults3-admin"
-  secret-key: "vaults3-secret-change-me" # <-- CHANGE THIS
+  # CHANGE THIS before applying. It is the dashboard and S3 password, and this
+  # file is public.
+  secret-key: "vaults3-secret-change-me"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -37,9 +39,11 @@ data:
       data_dir: "/data"
       metadata_dir: "/metadata"
     auth:
-      # Overridden at runtime by VAULTS3_ACCESS_KEY / VAULTS3_SECRET_KEY.
+      # Overridden at runtime by VAULTS3_ACCESS_KEY / VAULTS3_SECRET_KEY from the
+      # Secret above, so no credential is repeated here. Left empty, VaultS3
+      # generates one on first start and prints it once.
       admin_access_key: "vaults3-admin"
-      admin_secret_key: "vaults3-secret-change-me"
+      admin_secret_key: ""
     rate_limit:
       enabled: true
       requests_per_sec: 200

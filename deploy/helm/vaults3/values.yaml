@@ -31,9 +31,14 @@ fullnameOverride: ""
 # env vars (which override the config file), so they never live in the ConfigMap.
 auth:
   accessKey: "vaults3-admin"
-  # CHANGE THIS. Leave empty to auto-generate a random secret on first install
-  # (regenerated only if you don't set it and re-run with --no-hooks off).
-  secretKey: "vaults3-secret-change-me"
+  # Left empty by default, so `helm install` generates a random secret on first
+  # install and preserves it across upgrades. Set it to pin your own. A secret
+  # shipped in a values file is not a secret: it is published wherever the chart
+  # is.
+  #
+  # Read the generated one with:
+  #   kubectl get secret <release> -o jsonpath='{.data.secret-key}' | base64 -d
+  secretKey: ""
   # Use an existing Secret instead of the chart-managed one. The Secret must
   # contain keys `access-key` and `secret-key`.
   existingSecret: ""
@@ -52,9 +57,11 @@ config: |
     data_dir: "/data"
     metadata_dir: "/metadata"
   auth:
-    # Overridden at runtime by VAULTS3_ACCESS_KEY / VAULTS3_SECRET_KEY (from the Secret).
+    # Overridden at runtime by VAULTS3_ACCESS_KEY / VAULTS3_SECRET_KEY (from the
+    # Secret above), so this is deliberately left empty rather than repeating a
+    # credential here.
     admin_access_key: "vaults3-admin"
-    admin_secret_key: "vaults3-secret-change-me"
+    admin_secret_key: ""
   compression:
     enabled: false
   rate_limit:

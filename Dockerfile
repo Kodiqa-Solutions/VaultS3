@@ -26,11 +26,18 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates && \
     addgroup -g 1000 vaults3 && \
     adduser -D -u 1000 -G vaults3 vaults3 && \
-    mkdir -p /data /metadata /etc/vaults3 && \
-    chown -R vaults3:vaults3 /data /metadata /etc/vaults3
+    mkdir -p /data /metadata /etc/vaults3 /home/vaults3 && \
+    chown -R vaults3:vaults3 /data /metadata /etc/vaults3 /home/vaults3
 
 COPY --from=builder /vaults3 /usr/local/bin/vaults3
 COPY configs/vaults3.yaml /etc/vaults3/vaults3.yaml
+
+# A working directory the runtime user can write to. Without one every relative
+# path resolves at /, which vaults3 (uid 1000) cannot create in, so anything
+# using the built-in ./data, ./metadata or ./logs defaults failed with
+# "permission denied". The server itself is unaffected either way: the image
+# points it at the absolute /data and /metadata below.
+WORKDIR /home/vaults3
 
 ENV VAULTS3_ACCESS_KEY=""
 ENV VAULTS3_SECRET_KEY=""

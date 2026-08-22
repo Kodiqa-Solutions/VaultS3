@@ -54,6 +54,8 @@ var ErrTransportClosed = errors.New("cluster: transport closed")
 
 // TransportMux serves every Raft group on this node from one listener.
 type TransportMux struct {
+	// ln, advertise and handshakeTimeout are read by the accept loop and are
+	// never written after the constructor returns.
 	ln               net.Listener
 	advertise        net.Addr
 	handshakeTimeout time.Duration
@@ -79,13 +81,24 @@ func NewTransportMux(ln net.Listener) *TransportMux {
 // in the cluster configuration, so a node bound to a wildcard must advertise a
 // routable address instead or every peer would try to dial 0.0.0.0.
 func NewTransportMuxWithAdvertise(ln net.Listener, advertise net.Addr) *TransportMux {
+	return newTransportMux(ln, advertise, defaultHandshakeTimeout)
+}
+
+// newTransportMux is the real constructor. Everything the accept loop reads is
+// set BEFORE that loop starts and never written again: the loop runs on its own
+// goroutine from the moment this returns, so a field adjusted afterwards would
+// be read concurrently with the write.
+func newTransportMux(ln net.Listener, advertise net.Addr, handshakeTimeout time.Duration) *TransportMux {
 	if advertise == nil {
 		advertise = ln.Addr()
+	}
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = defaultHandshakeTimeout
 	}
 	m := &TransportMux{
 		ln:               ln,
 		advertise:        advertise,
-		handshakeTimeout: defaultHandshakeTimeout,
+		handshakeTimeout: handshakeTimeout,
 		shards:           make(map[uint16]*muxStreamLayer),
 		closed:           make(chan struct{}),
 	}

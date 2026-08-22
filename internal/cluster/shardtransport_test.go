@@ -16,8 +16,9 @@ func newTestMux(t *testing.T) *TransportMux {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	m := NewTransportMux(ln)
-	m.handshakeTimeout = 2 * time.Second
+	// Set the handshake timeout at construction: the accept loop reads it from
+	// the moment the mux exists, so assigning it afterwards is a data race.
+	m := newTransportMux(ln, ln.Addr(), 2*time.Second)
 	t.Cleanup(func() { m.Close() })
 	return m
 }

@@ -400,12 +400,44 @@ func (e *EncryptionConfig) KeyBytes() ([]byte, error) {
 	return key, nil
 }
 
+// Load reads a config file, applying defaults for everything it does not set.
+// A missing file is an error: the caller named it, so a typo must not silently
+// start a server with settings nobody chose.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	return parse(data)
+}
 
+// LoadOrDefaults is Load for a path the caller did not choose, the built-in
+// default location. A missing file there is not an error, it is a first run:
+// the defaults alone are a working single-node server, so a freshly downloaded
+// binary starts instead of failing on a file it never shipped with (issue #51).
+//
+// It reports whether defaults were used, so the caller can say so.
+func LoadOrDefaults(path string) (cfg *Config, usedDefaults bool, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, false, fmt.Errorf("read config: %w", err)
+		}
+		cfg, err = parse(nil)
+		return cfg, true, err
+	}
+	cfg, err = parse(data)
+	return cfg, false, err
+}
+
+// Defaults is the configuration of a server told nothing at all: a single node
+// on port 9000 with local storage and no optional subsystem enabled.
+func Defaults() *Config {
+	cfg, _ := parse(nil)
+	return cfg
+}
+
+func parse(data []byte) (*Config, error) {
 	cfg := &Config{
 		Server: ServerConfig{
 			Address:             "0.0.0.0",
@@ -472,8 +504,10 @@ func Load(path string) (*Config, error) {
 		},
 	}
 
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+	if len(data) > 0 {
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
 	}
 
 	// Apply environment variable overrides

@@ -45,8 +45,17 @@ storage:
   usage_scan_interval_secs: 300
 
 auth:
+  # Dashboard and S3 admin credentials.
+  #
+  # Leave admin_secret_key EMPTY and VaultS3 generates a strong one the first
+  # time it starts, stores it, and prints it once. That is the recommended way:
+  # a secret written in a file that ships with the software is not a secret.
+  # Set VAULTS3_ACCESS_KEY / VAULTS3_SECRET_KEY to use credentials of your own.
+  #
+  # Credentials already saved by a previous start, or changed from the
+  # dashboard, always win over what is written here.
   admin_access_key: "vaults3-admin"
-  admin_secret_key: "vaults3-secret-change-me"
+  admin_secret_key: ""
 
 encryption:
   # AES-256-GCM at rest. Objects are sealed in 1 MiB chunks, so a read costs a

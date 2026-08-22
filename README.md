@@ -347,11 +347,43 @@ make build
 ./vaults3
 ```
 
-Server starts on `http://localhost:9000` by default.
+That is the whole first run. With no config file present VaultS3 starts on its
+built-in defaults, creates the directories it needs, and generates an admin
+secret for this installation, which it prints once:
+
+```
+──────────────────────────────────────────────────────────────
+ VaultS3 generated an admin secret for this new installation.
+ It is shown once. Store it somewhere safe.
+
+   Access key:  vaults3-admin
+   Secret key:  4936c03e56b8ab52579aea4ab24e2eb24ac652788fb741c8
+
+   Dashboard:   http://127.0.0.1:9000/dashboard/
+──────────────────────────────────────────────────────────────
+```
+
+The secret is stored with the metadata, so later starts reuse it. Set
+`VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY` to use credentials of your own,
+or change them from the dashboard.
+
+### Write a config file
+
+`vaults3 setup` asks a handful of questions, creates the directories, and writes
+a config containing only what you chose:
+
+```bash
+./vaults3 setup                  # interactive
+./vaults3 setup --non-interactive --data-dir ./data --default-bucket local
+./vaults3 -config vaults3.yaml   # then start with it
+```
+
+It writes the file `0600` because it holds the admin secret, and refuses to
+overwrite an existing config unless you pass `--force`.
 
 ### Configure
 
-Edit `configs/vaults3.yaml`:
+For the full annotated set of options, edit `configs/vaults3.yaml`:
 
 ```yaml
 server:
@@ -370,7 +402,7 @@ storage:
 
 auth:
   admin_access_key: "vaults3-admin"
-  admin_secret_key: "vaults3-secret-change-me"
+  admin_secret_key: ""   # empty: generated on first start and stored
 
 encryption:
   enabled: false
@@ -1595,6 +1627,18 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+### Upgrading to 4.4.55
+
+**A server that has never had an admin secret now generates one** rather than
+falling back to the example secret from these docs. If your installation already
+has credentials, whether persisted, configured, or set from the dashboard,
+nothing changes: those still win. Only a genuinely new installation gets a
+generated secret, which it prints once at startup and then stores.
+
+If you were relying on `vaults3-secret-change-me`, set `VAULTS3_ACCESS_KEY` and
+`VAULTS3_SECRET_KEY` explicitly, or read the generated secret from the first
+start's output.
+
 ### Upgrading to 4.4.54
 
 One behaviour change is worth knowing before you upgrade, because it is visible
@@ -1775,4 +1819,5 @@ partition two sites and resolve the conflict. New logic there should keep that b
 - [x] S3 Select on Parquet files (parquet-go, row group iteration, columnar to record conversion)
 - [x] Integration test suite (26 end-to-end tests with real SigV4 signing, filesystem storage, BoltDB metadata)
 - [x] Race detection in CI (`go test -race`)
+- [x] `vaults3 setup`: interactive and scripted first-run configuration, with a generated per-installation admin secret instead of a published default
 - [x] Sharded metadata (`cluster.metadata_shards`): object metadata split across independent Raft groups so metadata capacity grows with the cluster, with per-shard membership reconciliation, all groups sharing one Raft port, and an unreachable shard reported as unavailable rather than empty
