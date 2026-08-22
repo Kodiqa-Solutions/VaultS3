@@ -59,6 +59,22 @@
 
 > ¹ MinIO removed the admin console from its Community Edition in 2025 and archived the open-source repository in February 2026. Full management now requires the paid AIStor product. This comparison reflects publicly available information as of **June 2026**, please open an issue if a cell is out of date.
 
+### How this compares to Amazon S3
+
+S3 is the API VaultS3 implements, not a competitor you would swap it for. If you are weighing self-hosting against S3 itself, these are the trade-offs, and most of them favour S3:
+
+| | VaultS3 | Amazon S3 |
+|---|---|---|
+| Durability | Your disks and configuration | 11 nines, across 3+ availability zones by default |
+| Scale | ~10M objects per node; a billion needs ~30 nodes | Effectively unlimited |
+| Operations & compliance | Yours, including any certification | No infrastructure to run; AWS is certified, your configuration still isn't |
+| Cost | Hardware. **No per-request or egress charges** | Per GB, per request, per GB egressed |
+| Exit path | Ordinary files and a BoltDB index behind the S3 API | S3 API |
+
+**Self-hosting wins when** egress or request charges dominate your bill, when the data has to stay on hardware you control, when clients are on the same network as the storage, or when you need a cost that does not move with traffic. **S3 wins** when you want durability and availability you do not have to engineer, scale you do not have to plan for, or an audit whose scope stops at your own configuration instead of reaching all the way down to the disks.
+
+> S3 figures reflect publicly available AWS information as of **August 2026**, please open an issue if a cell is out of date. AWS changes storage classes and pricing more often than the projects in the table above change features.
+
 ```bash
 make build && ./vaults3
 # Server at http://localhost:9000
@@ -79,6 +95,40 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 | **Active-active replication** | 🟡 Beta | Vector-clock conflict resolution is unit-tested. The cross-site sync worker is less exercised in the wild. |
 
 **Recommendation:** run single-node (optionally with erasure coding across local disks) for production data you care about, and treat clustering/active-active as advanced opt-in features you validate first. Always keep an independent backup. See the **[Scaling & Operations Guide](docs/SCALING.md)** for redundancy layering and recovery runbooks, and the **[Benchmarks guide](docs/BENCHMARKS.md)** for a reproducible way to measure throughput and RAM on your own hardware.
+
+## Project and support
+
+VaultS3 is a [Kodiqa Solutions](https://www.vaults3.com) project.
+
+**The storage engine is AGPL-3.0 and stays that way.** Every feature documented
+in this README is in the open-source binary. Nothing here is behind a licence
+key, and nothing here is going to move behind one.
+
+Separate paid products, for organisations that want them, are listed at
+[vaults3.com/enterprise](https://www.vaults3.com/enterprise/): a multi-cluster
+Fleet Console, a Kubernetes Operator, a multi-tenant Gateway, and a Compliance
+Pack. They are in early access, and they are add-ons around the engine rather
+than pieces taken out of it. Commercial enquiries: **support@vaults3.com**.
+
+### What happens if this project stops
+
+A fair question to ask of any storage software before you put data in it, and it
+deserves a concrete answer rather than reassurance:
+
+- **The licence cannot be revoked.** VaultS3 is AGPL-3.0. Every release stays
+  available, forkable and buildable by anyone, whatever happens to the people
+  who wrote it.
+- **There is nothing around it to go stale.** One static binary, no control
+  plane, no external services, no account to keep, nothing that phones home. It
+  keeps running on the machine you put it on.
+- **Your data is not locked in a format anyone has to reverse-engineer.** Objects
+  are ordinary files on disk and the index is a BoltDB file, served over the S3
+  API. Migrating away is `rclone sync` or `aws s3 sync` to anything else that
+  speaks S3, at whatever pace you like, with the source still serving reads the
+  whole time.
+
+That exit path is the reason to be comfortable adopting it, and it is worth
+checking for any storage product you evaluate, including this one.
 
 ## Features
 

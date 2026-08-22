@@ -1,0 +1,4 @@
+# VaultS3's core is AGPL-3.0 and free, and stays that way. This points at the
+# separate paid add-ons for organisations that want them, which is what funds
+# the work.
+custom: ["https://www.vaults3.com/enterprise/"]

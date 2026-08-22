@@ -125,3 +125,18 @@ docker run -d \
 - [GitHub](https://github.com/Kodiqa-Solutions/VaultS3)
 - [Documentation](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/README.md)
 - [Issues](https://github.com/Kodiqa-Solutions/VaultS3/issues)
+
+## Project and support
+
+VaultS3 is a [Kodiqa Solutions](https://www.vaults3.com) project. The storage
+engine is AGPL-3.0 and stays that way: everything described above is in this
+image, with nothing behind a licence key.
+
+Separate paid add-ons for larger deployments (Fleet Console, Kubernetes
+Operator, multi-tenant Gateway, Compliance Pack) are at
+[vaults3.com/enterprise](https://www.vaults3.com/enterprise/). Commercial
+enquiries: support@vaults3.com
+
+Your data stays portable: objects are ordinary files and the index is a BoltDB
+file, served over the S3 API, so moving to anything else that speaks S3 is an
+`rclone sync` away.
