@@ -99,6 +99,26 @@ VaultS3 includes multiple security layers:
 - **S3 Checksum API** (CRC32, CRC32C, SHA1, SHA256 checksums verified on upload, returned on download for end-to-end integrity)
 - **Conditional request handling** (`If-Match`/`If-None-Match` ETag preconditions prevent lost updates with 412 Precondition Failed)
 
+## External Security Assessment
+
+VaultS3 was reviewed in August 2026 by an external white-box security assessment
+covering the S3 API, the console API, the authentication and authorization model,
+the cluster and replication endpoints, and the dependency graph. It reported 14
+findings, several of them remotely exploitable against a deployment running the
+shipped defaults.
+
+**All 14 are fixed in 4.4.56.** The [CHANGELOG](CHANGELOG.md) describes each one,
+and the release notes carry the upgrade steps. If you run an earlier version,
+upgrade, and read the
+[upgrade notes](README.md#upgrading-to-4456-security-release): a few of the fixes
+tighten authorization and change behaviour.
+
+Two of them need action beyond upgrading. Rotate your administrator credentials
+if this installation ever ran with the secret this project used to ship, since
+persisted credentials survive an upgrade. And set `cluster.secret` before
+upgrading a clustered deployment, because a clustered node now refuses to start
+without one.
+
 ## Deployment Best Practices
 
 - **Always change default credentials**: set `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY` environment variables

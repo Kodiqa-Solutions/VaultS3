@@ -94,6 +94,8 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 | **Sharded metadata** (`cluster.metadata_shards > 1`) | 🟠 New in 4.4.54 | Splits object metadata across independent Raft groups so metadata capacity grows with the cluster instead of every node holding the whole index. Validated on real three-node clusters, local and in containers: shard assignment, group membership reconciliation, routed reads and writes from a node holding no copy of a shard, and an unreachable shard reporting `503` rather than a phantom `404`. Newer than everything above it, and the shard count is fixed when the cluster first commits its assignment, so treat it as opt-in for new clusters you can validate. Off by default. |
 | **Active-active replication** | 🟡 Beta | Vector-clock conflict resolution is unit-tested. The cross-site sync worker is less exercised in the wild. |
 
+**Security:** VaultS3 was reviewed by an external white-box security assessment in August 2026, which reported 14 findings. All are fixed in 4.4.56. See [SECURITY.md](SECURITY.md) for the summary and [CHANGELOG.md](CHANGELOG.md) for each finding. If you run an earlier version, upgrade and read the [upgrade notes](#upgrading-to-4456-security-release).
+
 **Recommendation:** run single-node (optionally with erasure coding across local disks) for production data you care about, and treat clustering/active-active as advanced opt-in features you validate first. Always keep an independent backup. See the **[Scaling & Operations Guide](docs/SCALING.md)** for redundancy layering and recovery runbooks, and the **[Benchmarks guide](docs/BENCHMARKS.md)** for a reproducible way to measure throughput and RAM on your own hardware.
 
 ## Project and support
