@@ -1,0 +1,54 @@
+# Package definition for RPM, DEB and APK, built by nfpm in the release workflow.
+#
+# VaultS3 shipped only tarballs and a container image, which is how issue #51
+# arrived: the tarball carried no config and the server refused to start without
+# one. A distribution package installs the config, a service unit and an
+# unprivileged account, so the documented first run is the one that actually
+# happens.
+name: vaults3
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Kodiqa Solutions <support@vaults3.com>
+description: |
+  Lightweight, S3-compatible object storage with a built-in web dashboard.
+  Single binary, low memory, encryption at rest.
+vendor: Kodiqa Solutions
+homepage: https://vaults3.com
+license: AGPL-3.0
+
+contents:
+  - src: ./dist/vaults3
+    dst: /usr/bin/vaults3
+  - src: ./dist/vaults3-cli
+    dst: /usr/bin/vaults3-cli
+  - src: ./packaging/vaults3.service
+    dst: /lib/systemd/system/vaults3.service
+  # Marked as config so an upgrade never overwrites what an operator edited.
+  - src: ./configs/vaults3.yaml
+    dst: /etc/vaults3/vaults3.yaml
+    type: config|noreplace
+  - src: ./LICENSE
+    dst: /usr/share/doc/vaults3/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/vaults3/README.md
+  - dst: /var/lib/vaults3
+    type: dir
+    file_info:
+      mode: 0750
+  - dst: /var/log/vaults3
+    type: dir
+    file_info:
+      mode: 0750
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh
+
+rpm:
+  group: Applications/System
+deb:
+  fields:
+    Bugs: https://github.com/Kodiqa-Solutions/VaultS3/issues

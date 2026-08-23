@@ -4,6 +4,40 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.61] - 2026-08-23
+### Added
+- **RPM, DEB and APK packages, an SPDX SBOM, and Sigstore build-provenance
+  attestations on every release.** VaultS3 shipped only tarballs and a container
+  image, which is how issue #51 arrived: the tarball carried no config and the
+  server would not start without one. A package installs the binary, a config
+  marked `noreplace` so an upgrade never overwrites operator edits, a hardened
+  systemd unit, and an unprivileged `vaults3` account, and it leaves
+  `/var/lib/vaults3` alone on both upgrade and removal, so taking the package off
+  a machine never deletes the objects on it.
+
+  Verified by installing each package in Debian 12, Rocky Linux 9 and Alpine 3:
+  files land in the right places with the config at `root:vaults3 0640`, the
+  service runs as its own user, generates and prints an admin secret once, and
+  answers `/health` and `/dashboard/` with 200. An edited config survives a
+  reinstall and stored objects survive `dpkg -r`.
+
+  Every release now also carries an SPDX SBOM per platform, a Sigstore provenance
+  bundle, and a `windows/arm64` build.
+
+  The SBOM is generated from the **binary**, not from the archive or the
+  repository. Syft reads Go build info out of the executable and lists the 45
+  modules compiled into it; pointed at a `.deb` it reports two entries, the
+  archive and itself, which looks like due diligence and answers nothing. The
+  build fails rather than publish an SBOM with fewer than ten entries.
+
+  The provenance bundle is attached as a release asset rather than left only in
+  GitHub's attestation store, so an operator can verify a download offline or from
+  a mirror instead of having to call GitHub:
+
+  ```
+  gh attestation verify vaults3_4.4.61_amd64.deb --repo Kodiqa-Solutions/VaultS3
+  ```
+
 ## [4.4.60] - 2026-08-23
 ### Fixed
 - **The erasure write path no longer holds the object in memory** (issue #38, and
@@ -2038,6 +2072,7 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   and multi-platform release binaries + Docker images.
 
 [Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[4.4.61]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.60...v4.4.61
 [4.4.60]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.59...v4.4.60
 [4.4.59]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.58...v4.4.59
 [4.4.58]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.57...v4.4.58

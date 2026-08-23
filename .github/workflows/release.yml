@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -24,6 +26,8 @@ jobs:
             goarch: arm64
           - goos: windows
             goarch: amd64
+          - goos: windows
+            goarch: arm64
 
     steps:
       - uses: actions/checkout@v6
@@ -62,6 +66,28 @@ jobs:
           CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \
             -o vaults3-cli-${GOOS}-${GOARCH}${EXT} ./cmd/vaults3-cli
 
+      # Scan the binary, not the archive. Syft reads Go build info out of the
+      # executable and lists every module compiled into it; pointed at a .tar.gz
+      # or a .deb it reports only the archive itself, which is an SBOM that
+      # answers nothing. One SBOM per platform, describing exactly the binary
+      # that ships in both that platform's tarball and its packages.
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate the SBOM for this binary
+        run: |
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
+          NAME=vaults3-${{ matrix.goos }}-${{ matrix.goarch }}
+          syft scan "file:${NAME}${EXT}" -o spdx-json="${NAME}.sbom.json"
+          # A near-empty SBOM is worse than none: it looks like due diligence and
+          # answers nothing. Fail the build rather than publish one.
+          COUNT=$(python3 -c "import json;print(len(json.load(open('${NAME}.sbom.json')).get('packages',[])))")
+          echo "SBOM lists ${COUNT} packages"
+          [ "$COUNT" -gt 10 ] || { echo "SBOM is empty, refusing to publish it"; exit 1; }
+
       - name: Compress binaries
         run: |
           EXT=""
@@ -75,11 +101,67 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: vaults3-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          path: |
+            vaults3-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            vaults3-${{ matrix.goos }}-${{ matrix.goarch }}.sbom.json
+
+  packages:
+    runs-on: ubuntu-latest
+    needs: release
+    # VaultS3 shipped only tarballs and a container image, which is how issue #51
+    # arrived: the tarball carried no config and the server would not start
+    # without one. A distro package installs the config, a systemd unit and an
+    # unprivileged account, so the documented first run is the one that happens.
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            nfpm_arch: amd64
+          - goarch: arm64
+            nfpm_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download the linux binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-linux-${{ matrix.goarch }}
+
+      - name: Lay out the package tree
+        run: |
+          mkdir -p dist
+          tar xzf vaults3-linux-${{ matrix.goarch }}.tar.gz
+          mv vaults3-linux-${{ matrix.goarch }} dist/vaults3
+          mv vaults3-cli-linux-${{ matrix.goarch }} dist/vaults3-cli
+          chmod +x dist/vaults3 dist/vaults3-cli
+
+      - name: Build rpm, deb and apk
+        env:
+          ARCH: ${{ matrix.nfpm_arch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # The package version must not carry the leading v.
+          VERSION="${VERSION#v}"
+          export VERSION
+          # nfpm writes a FILE at --target when the path is not an existing
+          # directory, so all three packagers would overwrite one another.
+          mkdir -p out
+          for pkg in deb rpm apk; do
+            docker run --rm -v "$PWD:/w" -w /w -e ARCH -e VERSION \
+              goreleaser/nfpm:latest package --config packaging/nfpm.yaml --target /w/out --packager "$pkg"
+          done
+          ls -l out/
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.goarch }}
+          path: out/*
 
   publish:
     runs-on: ubuntu-latest
-    needs: release
+    needs: [release, packages]
 
     steps:
       - uses: actions/checkout@v6
@@ -93,8 +175,29 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum *.tar.gz > checksums.txt
+          sha256sum *.tar.gz *.deb *.rpm *.apk > checksums.txt
           cat checksums.txt
+
+      # Build provenance ties every artifact to the workflow run and commit that
+      # produced it, signed through Sigstore.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/*.apk
+
+      # Attach the Sigstore bundle as a release asset. Without it, verification
+      # requires calling GitHub's attestation API, which is no use to an operator
+      # verifying offline or from a mirror, and offline is the case a self-hosted
+      # project should expect.
+      - name: Attach the provenance bundle
+        run: |
+          cp "${{ steps.attest.outputs.bundle-path }}" artifacts/vaults3-provenance.sigstore.json
+          ls -l artifacts/vaults3-provenance.sigstore.json
 
       # Pull this version's CHANGELOG section into the release body. Without it
       # the release page said only "docker pull", so a release carrying a
@@ -124,6 +227,11 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/*.apk
+            artifacts/*.sbom.json
+            artifacts/vaults3-provenance.sigstore.json
             artifacts/checksums.txt
           body: |
             ${{ steps.changelog.outputs.notes }}

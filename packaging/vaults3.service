@@ -1,0 +1,38 @@
+[Unit]
+Description=VaultS3 object storage
+Documentation=https://github.com/Kodiqa-Solutions/VaultS3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vaults3
+Group=vaults3
+ExecStart=/usr/bin/vaults3 -config /etc/vaults3/vaults3.yaml
+
+# The shipped config uses relative data paths so it also works from a checkout.
+# A package install is not run from a working directory, so pin them here rather
+# than editing a config the operator owns.
+Environment=VAULTS3_DATA_DIR=/var/lib/vaults3/data
+Environment=VAULTS3_METADATA_DIR=/var/lib/vaults3/metadata
+EnvironmentFile=-/etc/default/vaults3
+EnvironmentFile=-/etc/sysconfig/vaults3
+
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# The service needs nothing outside its own state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/vaults3 /var/log/vaults3
+
+[Install]
+WantedBy=multi-user.target

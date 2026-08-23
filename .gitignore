@@ -29,3 +29,6 @@ web/dist/
 web/node_modules/
 internal/dashboard/dist/
 scratchpad/
+
+# Local package/binary build output
+dist/
