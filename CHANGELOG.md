@@ -4,12 +4,40 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
-## [Unreleased]
+## [4.4.57] - 2026-08-23
+### Read before upgrading
+
+These apply if you are coming from a version earlier than 4.4.56. Nothing in
+4.4.57 itself changes behaviour.
+
+**A clustered node will not start without `cluster.secret`.** Inter-node
+endpoints authenticate with it and now fail closed. Set the same value on every
+node before you pull this image. Single-node deployments are unaffected, and the
+Helm chart already sets it for you.
+
+**Rotate your admin credentials if this installation ever ran with
+`vaults3-secret-change-me`.** That secret is persisted, and persisted credentials
+win over configuration, so upgrading does not replace it.
+
+**Everyone is logged out once.** The console signing key is now random per
+installation instead of derived from the admin secret.
+
 ### Added
 - A `NOTICE` file and a `## License` section in the README and on Docker Hub,
   carrying the copyright statement. The repository shipped the full AGPL-3.0
   text but never asserted copyright anywhere, which is one of the licence's own
   conditions and the foundation the open-core split rests on.
+- A sortable **User ID** column on the dashboard's Access Keys page, so a key can
+  be attributed to the application it was issued for. The user is required when a
+  key is created and has always been stored, but it was never displayed, so the
+  page showed rows of opaque hex with no way to tell which key belonged to which
+  app, and no safe way to decide which one was safe to revoke. The built-in admin
+  entry is labelled instead, since it is not tied to a created IAM user.
+- A summary of the external security assessment in `SECURITY.md`, and a pointer to
+  it from the README's production-readiness section. The findings were already
+  itemised in the 4.4.56 entry below, but nothing told a reader arriving at the
+  repo that the review happened, what it covered, or that two of the fixes need an
+  operator action beyond upgrading.
 
 ## [4.4.56] - 2026-08-22
 ### Security
@@ -1917,6 +1945,12 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   and multi-platform release binaries + Docker images.
 
 [Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[4.4.57]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.56...v4.4.57
+[4.4.56]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.55...v4.4.56
+[4.4.55]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.54...v4.4.55
+[4.4.54]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.53...v4.4.54
+[4.4.53]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.52...v4.4.53
+[4.4.52]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...v4.4.52
 [4.4.51]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.50...v4.4.51
 [4.4.50]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.49...v4.4.50
 [4.4.49]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.48...v4.4.49

@@ -5,6 +5,9 @@ export interface AccessKey {
   maskedSecret: string
   createdAt: string
   isAdmin: boolean
+  // The IAM user the key was created for. Absent on the built-in admin key,
+  // which is not tied to a created user.
+  userId?: string
 }
 
 export interface CreatedKey {
