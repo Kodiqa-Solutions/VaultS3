@@ -750,15 +750,28 @@ docker pull eniz1806/vaults3
 docker run -p 9000:9000 \
   -e VAULTS3_ACCESS_KEY=myadmin \
   -e VAULTS3_SECRET_KEY=mysupersecret \
-  -v ./data:/data -v ./metadata:/metadata \
+  -v vaults3-data:/data -v vaults3-meta:/metadata \
   eniz1806/vaults3
 
 # Or build locally
 docker build -t vaults3 .
-docker run -p 9000:9000 -v ./data:/data -v ./metadata:/metadata vaults3
+docker run -p 9000:9000 -v vaults3-data:/data -v vaults3-meta:/metadata vaults3
 ```
 
 Images are automatically published to [Docker Hub](https://hub.docker.com/r/eniz1806/vaults3) on every push to `main`.
+
+#### Storage layout in production
+
+Keep `/data` and `/metadata` on **separate volumes**, not inside the container and not on the same disk. A volume can be snapshotted, cloned, resized and reattached to a redeployed container, which is the difference between a container you can replace and one you cannot afford to lose.
+
+They also want different storage, because they are not the same kind of data:
+
+| | what it holds | size | wants |
+|---|---|---|---|
+| `/metadata` | the BoltDB index: buckets, object records, IAM, versions | small, tens of MB for 100k objects at roughly 600 bytes each | **low latency**, an SSD. Every request touches it |
+| `/data` | the objects themselves | as large as your data | **capacity and throughput**. Latency matters far less |
+
+Put metadata on fast storage and data on capacity storage, and back them up on different schedules: metadata is small enough to snapshot often, and it is the part that makes the objects findable. Objects without their metadata are files with no index. Metadata without its objects is an index pointing at nothing, so **both must be captured together, from the same moment**, for a restore to mean anything.
 
 #### Buckets on First Start
 
