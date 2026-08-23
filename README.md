@@ -37,6 +37,15 @@
 
 ## Why VaultS3?
 
+> [!NOTE]
+> **This is a one-person project, and you should know that before you trust it with your data.**
+>
+> I built VaultS3 for myself. I was running MinIO, the pieces I depended on moved behind a paid tier, and I did not want to rent back something I already had. So I wrote my own.
+>
+> It is on GitHub because I doubt I was the only one in that position. What you get is a maintainer who runs this in production himself and fixes things because he runs into them too. What you do not get is a company standing behind it. That is the trade, and I would rather you made the call with your eyes open.
+>
+> If something breaks, [open an issue](https://github.com/Kodiqa-Solutions/VaultS3/issues). If you would rather fix it yourself, [pull requests are welcome](CONTRIBUTING.md).
+
 Object storage has several good open-source options, and which one fits depends on what you are optimising for. Here are the facts, measured or taken from each project's own documentation, and below them an honest answer about when to pick something else.
 
 | | VaultS3 | MinIO | Silo | RustFS | SeaweedFS | Garage |
