@@ -28,6 +28,17 @@ func NewEncoder(dataShards, parityShards int) (*Encoder, error) {
 	}, nil
 }
 
+// EncodeStripe fills the parity entries of an already-split stripe in place. The
+// caller supplies dataShards+parityShards equal-length slices with the data
+// entries populated, which is what lets parity be generated one aligned stripe at
+// a time instead of from a copy of the whole object.
+func (e *Encoder) EncodeStripe(shards [][]byte) error {
+	if len(shards) != e.dataShards+e.parityShards {
+		return fmt.Errorf("expected %d shards, got %d", e.dataShards+e.parityShards, len(shards))
+	}
+	return e.rs.Encode(shards)
+}
+
 // Encode splits data into data+parity shards using Reed-Solomon encoding.
 // Returns a slice of shard byte slices (len = dataShards + parityShards).
 func (e *Encoder) Encode(data []byte) ([][]byte, error) {

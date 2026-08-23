@@ -4,6 +4,36 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.60] - 2026-08-23
+### Fixed
+- **The erasure write path no longer holds the object in memory** (issue #38, and
+  the write half of the memory reports behind #50). The read path has streamed
+  since 4.4.38, but a write still called `io.ReadAll` on the whole object and then
+  split and encoded on top of that, so one PUT allocated roughly the object plus
+  its parity and concurrent PUTs multiplied it. That is what made large uploads at
+  concurrency an OOM risk rather than a slow path.
+
+  A write now streams the plaintext straight into the data shards and generates
+  each parity shard on demand from them, a stripe at a time. Two passes are
+  needed because parity at a given offset depends on every data shard at that same
+  offset, and in a sequential stream those bytes arrive far apart. The second pass
+  is normally served from page cache.
+
+  **The on-disk layout is unchanged**, so existing objects stay readable and the
+  streaming reader, the degraded reader and the healer are untouched. A chunked
+  upload, which arrives with no declared length, still takes the buffering path.
+
+  Measured in containers against 4.4.59, 64 MiB objects at concurrency 16:
+
+  | memory limit | 4.4.59 | with this change |
+  |---|---|---|
+  | 512 MiB | peak 387 MiB, **OOM killed** | peak 185 MiB, survived, 389 MiB/s |
+  | 3 GiB | 58 MiB/s, 87 errors, **OOM killed** | **597 MiB/s**, no errors, 99 MiB |
+
+  Throughput improves rather than regresses, because the old path spent its time
+  under memory pressure. Allocation for a write is now flat: quadrupling the
+  object size changed it by 0.2 percent, where the old path scaled with the object.
+
 ## [4.4.59] - 2026-08-23
 ### Security
 - **An IAM policy written with a bare-string `Action` or `Resource` was silently
@@ -2008,6 +2038,7 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   and multi-platform release binaries + Docker images.
 
 [Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[4.4.60]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.59...v4.4.60
 [4.4.59]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.58...v4.4.59
 [4.4.58]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.57...v4.4.58
 [4.4.57]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.56...v4.4.57

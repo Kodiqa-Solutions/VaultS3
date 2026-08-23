@@ -102,6 +102,15 @@ func (e *Engine) PutObject(bucket, key string, reader io.Reader, size int64) (in
 		return e.inner.PutObject(bucket, key, reader, size)
 	}
 
+	// Stream when the length is known and the object is large enough to be
+	// erasure coded. This avoids holding the object and its parity in memory,
+	// which is what made concurrent large PUTs an OOM risk. A chunked upload
+	// arrives with size < 0 and a small object is stored whole by the inner
+	// engine, so both fall through to the buffering path below.
+	if size >= e.cfg.BlockSize {
+		return e.putObjectStreaming(bucket, key, reader, size)
+	}
+
 	// Read all data into memory
 	data, err := io.ReadAll(reader)
 	if err != nil {
