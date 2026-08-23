@@ -435,11 +435,11 @@ RPM, DEB and APK packages are attached to every [release](https://github.com/Kod
 
 ```bash
 # Debian or Ubuntu
-sudo apt install ./vaults3_4.4.61_amd64.deb
+sudo apt install ./vaults3_4.4.62_amd64.deb
 # RHEL, Rocky or Fedora
-sudo rpm -i vaults3-4.4.61-1.x86_64.rpm
+sudo rpm -i vaults3-4.4.62-1.x86_64.rpm
 # Alpine
-sudo apk add --allow-untrusted vaults3_4.4.61_x86_64.apk
+sudo apk add --allow-untrusted vaults3_4.4.62_x86_64.apk
 
 sudo systemctl enable --now vaults3
 journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
@@ -448,7 +448,7 @@ journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
 Every release also ships an SPDX SBOM per platform, generated from the binary so it lists the modules actually compiled in, and a Sigstore provenance bundle attached as an asset, so a download can be verified against the workflow run and commit that produced it, offline or from a mirror:
 
 ```bash
-gh attestation verify vaults3_4.4.61_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_4.4.62_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 ### Build from source
@@ -1009,7 +1009,7 @@ Website-enabled buckets serve `index.html` for directory paths and a custom erro
 
 ### IAM (Users, Groups & Policies)
 
-Fine-grained access control with S3-compatible IAM policies. `Action` and `Resource` accept both the bare-string form (`"Action": "s3:GetObject"`) and the array form, as AWS does, so policies copied from AWS documentation work unchanged. Operations on a specific object version are authorized as their own actions, `s3:DeleteObjectVersion` and `s3:GetObjectVersion`, so allowing `s3:DeleteObject` while denying `s3:DeleteObjectVersion` lets people delete recoverably without ever permanently destroying a version:
+Fine-grained access control with S3-compatible IAM policies. `Action` and `Resource` accept both the bare-string form (`"Action": "s3:GetObject"`) and the array form, as AWS does, so policies copied from AWS documentation work unchanged. Operations on a specific object version are authorized as their own actions, `s3:DeleteObjectVersion` and `s3:GetObjectVersion`, so allowing `s3:DeleteObject` while denying `s3:DeleteObjectVersion` lets people delete recoverably without ever permanently destroying a version. Multi-object deletes are authorized per entry against the same rules, so the batch route is not a way around them:
 
 ```python
 import requests, json

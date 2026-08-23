@@ -87,7 +87,7 @@ func NewHandler(store metadata.StoreAPI, engine storage.Engine, auth *Authentica
 		metrics:           mc,
 	}
 	h.buckets = &BucketHandler{store: store, engine: engine}
-	h.objects = &ObjectHandler{store: store, mpStore: store, engine: engine, encryptionEnabled: encryptionEnabled}
+	h.objects = &ObjectHandler{auth: auth, store: store, mpStore: store, engine: engine, encryptionEnabled: encryptionEnabled}
 	return h
 }
 
@@ -415,10 +415,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if h.onAudit != nil {
 				h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Allow", clientIP, 0)
 			}
-		} else if h.onAudit != nil {
-			action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
-			resource := formatResource(bucket, key)
-			h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Allow", clientIP, 0)
+			// Carry the identity forward for handlers that authorize per entry.
+			r = withIdentity(r, identity, reqCtx)
+		} else {
+			// Admins skip policy evaluation, but per-entry checks still need the
+			// identity to see that.
+			r = withIdentity(r, identity, map[string]string{"aws:SourceIp": clientIP})
+			if h.onAudit != nil {
+				action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
+				resource := formatResource(bucket, key)
+				h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Allow", clientIP, 0)
+			}
 		}
 	}
 
@@ -997,6 +1004,16 @@ func mapMethodToAction(method, bucket, key string, query map[string][]string) st
 	}
 
 	if bucket != "" && key == "" {
+		// DeleteObjects names its objects in the body, so the route can only
+		// authorize the weakest thing it implies. It used to fall through to
+		// s3:*, which failed closed but meant a user holding s3:DeleteObject
+		// could not batch delete at all. BatchDelete now authorizes every entry
+		// individually, including s3:DeleteObjectVersion for entries naming a
+		// version, so requiring s3:DeleteObject here is the floor, not the whole
+		// check.
+		if _, ok := query["delete"]; ok && method == http.MethodPost {
+			return "s3:DeleteObject"
+		}
 		// Bucket-level operations
 		if _, ok := query["policy"]; ok {
 			if method == http.MethodPut {

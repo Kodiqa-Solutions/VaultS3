@@ -4,6 +4,30 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.62] - 2026-08-23
+### Fixed
+- **DeleteObjects now authorizes each entry instead of demanding `s3:*`.** The
+  router decides before the request body is parsed, so a call that names its
+  objects in the body could only be checked once, and the route fell through to
+  requiring `s3:*`. That failed closed, but it also meant an identity holding
+  `s3:DeleteObject` could not batch delete at all, which is not how S3 behaves.
+
+  `BatchDelete` now authorizes every entry individually, using
+  `s3:DeleteObjectVersion` for entries naming a version and `s3:DeleteObject`
+  otherwise, so the batch route cannot be used to get around the per-object rule
+  that protects versions. A denied entry comes back as a per-key `AccessDenied`
+  in the response rather than failing the whole request, matching AWS. The route
+  itself now requires `s3:DeleteObject` as a floor.
+
+  The identity is carried to the handler on the request context, and the check
+  fails closed if it is missing, so a wiring mistake denies rather than silently
+  authorizing everything.
+
+  Verified in containers against 4.4.61 with a policy that allows deletes and
+  denies `s3:DeleteObjectVersion`: the released build refused **both** calls,
+  this one allows the ordinary batch delete and still refuses the version delete,
+  leaving both versions on disk.
+
 ## [4.4.61] - 2026-08-23
 ### Added
 - **RPM, DEB and APK packages, an SPDX SBOM, and Sigstore build-provenance
@@ -2072,6 +2096,7 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   and multi-platform release binaries + Docker images.
 
 [Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[4.4.62]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.61...v4.4.62
 [4.4.61]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.60...v4.4.61
 [4.4.60]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.59...v4.4.60
 [4.4.59]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.58...v4.4.59

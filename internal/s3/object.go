@@ -46,6 +46,10 @@ func traceRead404(r *http.Request, method, bucket, key, cause string) {
 }
 
 type ObjectHandler struct {
+	// auth authorizes individual entries of a multi-object request, which the
+	// router cannot do because it decides before the body is parsed.
+	auth *Authenticator
+
 	store metadata.StoreAPI
 	// mpStore holds in-progress multipart upload metadata. In a cluster this is the
 	// node-LOCAL store, not the Raft-replicated one: every request for an object
@@ -1507,6 +1511,26 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 				Key:     obj.Key,
 				Code:    "InvalidArgument",
 				Message: "Invalid key",
+			})
+			continue
+		}
+
+		// Authorize this entry on its own. The router cannot: it decides before
+		// the body is parsed, and each entry may name its own version. Deleting a
+		// named version is s3:DeleteObjectVersion, which is a different permission
+		// from the recoverable s3:DeleteObject, so a policy that allows deletes
+		// while denying permanent destruction must hold here too.
+		entryAction := "s3:DeleteObject"
+		if obj.VersionID != "" {
+			entryAction = "s3:DeleteObjectVersion"
+		}
+		if err := h.authorizeEntry(r, entryAction, formatResource(bucket, obj.Key)); err != nil {
+			// AWS reports a per-key error rather than failing the whole request,
+			// so one denied key does not hide the outcome of the others.
+			result.Errors = append(result.Errors, deleteError{
+				Key:     obj.Key,
+				Code:    "AccessDenied",
+				Message: err.Error(),
 			})
 			continue
 		}
