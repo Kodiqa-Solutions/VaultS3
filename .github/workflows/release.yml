@@ -113,6 +113,10 @@ jobs:
             ' CHANGELOG.md
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
+          # The Docker tags come from docker/metadata-action's {{version}}, which
+          # strips the leading v. Publishing "docker pull ...:v4.4.57" sends people
+          # to a tag that does not exist.
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -130,7 +134,7 @@ jobs:
 
             **Docker (recommended):**
             ```bash
-            docker pull eniz1806/vaults3:${{ github.ref_name }}
+            docker pull eniz1806/vaults3:${{ steps.changelog.outputs.version }}
             ```
 
             **Binary download:**
