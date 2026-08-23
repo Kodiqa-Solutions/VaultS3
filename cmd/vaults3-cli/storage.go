@@ -17,7 +17,12 @@ func runStorage(args []string) {
 Subcommands:
   reclaim [--apply] [--min-age=<hours>] [--bucket=<b>] [--local] [--yes]
       Find object data on disk that no metadata refers to any more, and with
-      --apply delete it. Reports only by default.`)
+      --apply delete it. Reports only by default.
+
+  reencrypt [--apply] [--bucket=<b>]
+      Find objects still stored in the pre-4.4.53 whole-object encryption
+      format, which cannot be streamed on read, and with --apply rewrite them
+      in the current chunked format. Reports only by default.`)
 		os.Exit(1)
 	}
 
@@ -26,6 +31,8 @@ Subcommands:
 	switch args[0] {
 	case "reclaim":
 		storageReclaim(args[1:])
+	case "reencrypt":
+		storageReencrypt(args[1:])
 	default:
 		fatal("unknown storage subcommand: " + args[0])
 	}
@@ -267,4 +274,82 @@ func printReclaim(out reclaimResponse, apply bool) {
 	if out.Totals.Orphans == 0 {
 		fmt.Println("\nNothing to reclaim.")
 	}
+}
+
+type reencryptSample struct {
+	Bucket string `json:"bucket"`
+	Key    string `json:"key"`
+	Bytes  int64  `json:"bytes"`
+}
+
+type reencryptReport struct {
+	Scanned   int               `json:"scanned"`
+	Legacy    int               `json:"legacy"`
+	Rewritten int               `json:"rewritten"`
+	Bytes     int64             `json:"bytes"`
+	ByBucket  map[string]int    `json:"byBucket"`
+	Samples   []reencryptSample `json:"samples"`
+	Errors    []string          `json:"errors"`
+	DryRun    bool              `json:"dryRun"`
+	TookMs    int64             `json:"tookMs"`
+}
+
+// storageReencrypt migrates objects still sealed in the pre-4.4.53 whole-object
+// format. Those cannot be streamed on read, so each one costs its own size in
+// latency and memory every time it is fetched, and key rotation does not fix it
+// because rotation never rewrites object bodies.
+func storageReencrypt(args []string) {
+	apply := false
+	bucket := ""
+	for _, a := range args {
+		switch {
+		case a == "--apply":
+			apply = true
+		case strings.HasPrefix(a, "--bucket="):
+			bucket = strings.TrimPrefix(a, "--bucket=")
+		default:
+			fatal("unknown flag: " + a)
+		}
+	}
+
+	q := url.Values{}
+	if apply {
+		q.Set("apply", "true")
+	}
+	if bucket != "" {
+		q.Set("bucket", bucket)
+	}
+
+	resp, err := apiRequest("POST", "/reencrypt?"+q.Encode(), nil)
+	if err != nil {
+		fatal("reencrypt request failed: " + err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		fatal(fmt.Sprintf("reencrypt failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body))))
+	}
+	var rep reencryptReport
+	if err := json.NewDecoder(resp.Body).Decode(&rep); err != nil {
+		fatal("decode response: " + err.Error())
+	}
+
+	if rep.DryRun {
+		fmt.Println("Dry run. Nothing was rewritten. Add --apply to migrate.")
+	}
+	fmt.Printf("Scanned %d objects, %d still in the old format (%s)\n",
+		rep.Scanned, rep.Legacy, humanBytes(uint64(rep.Bytes)))
+	if rep.Rewritten > 0 {
+		fmt.Printf("Rewritten: %d\n", rep.Rewritten)
+	}
+	for b, n := range rep.ByBucket {
+		fmt.Printf("  %-30s %d\n", b, n)
+	}
+	for _, s := range rep.Samples {
+		fmt.Printf("  e.g. %s/%s (%s)\n", s.Bucket, s.Key, humanBytes(uint64(s.Bytes)))
+	}
+	for _, e := range rep.Errors {
+		fmt.Fprintln(os.Stderr, "  error: "+e)
+	}
+	fmt.Printf("Took %d ms\n", rep.TookMs)
 }

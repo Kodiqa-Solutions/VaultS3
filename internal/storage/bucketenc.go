@@ -145,6 +145,13 @@ func (e *PerBucketEngine) streamKey(bucket string, keyVersion uint32) ([]byte, e
 // version named in its header, VS3X and legacy global-key blobs take the
 // whole-object path they were written with.
 func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	// An empty object carries no header and no ciphertext, so there is nothing to
+	// decrypt. Without this it fell through to the whole-object path, which
+	// rejected it as "encrypted data too short", making every zero-byte object in
+	// a bucket that had not opted in unreadable once a legacy key was configured.
+	if stored == 0 {
+		return reader, 0, nil
+	}
 	if h, ok := peekStreamHeader(reader); ok {
 		dek, err := e.streamKey(bucket, h.keyVersion)
 		if err != nil {

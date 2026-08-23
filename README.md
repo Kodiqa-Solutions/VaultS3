@@ -182,6 +182,7 @@ checking for any storage product you evaluate, including this one.
 - **BoltDB metadata**: Embedded key-value store, no external database needed
 - **S3 Signature V4**: Standard AWS authentication
 - **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault or local key provider) encryption modes. Objects are sealed in 1 MiB chunks, so encrypted reads stream and cost a chunk of memory rather than a copy of the object
+- **Migrating older encrypted objects**: objects written before 4.4.53 were sealed as one AES-GCM message, which cannot be streamed on read because the authentication tag covers the whole object, so each read costs its own size in latency and memory. `vaults3-cli storage reencrypt` reports how many are affected and rewrites them in the current chunked format with `--apply`. Key rotation does not do this, it mints a new key version without touching object bodies
 - **Per-bucket encryption keys**: For bucket-per-tenant setups, each bucket can be encrypted with its own key that is **not shared** with other tenants (or opt out and stay plaintext). Envelope encryption (master KEK wraps a per-bucket data key). Opt in per bucket via `PUT /{bucket}?encryption` or the dashboard. Supports key rotation and crypto-shredding. Enable with `encryption.per_bucket: true`, see [design doc](docs/design/per-bucket-encryption.md)
 - **SSE-C (customer-provided keys)**: Operator-blind per-object encryption: the client supplies the key per request (`x-amz-server-side-encryption-customer-*`). The server encrypts/decrypts with it and stores only the key's MD5, never the key
 - **Bucket policies**: Public-read, private, custom S3-compatible JSON policies. Supports the standard AWS `Principal` forms (`"*"`, `{"AWS": "*"}`, `{"AWS": ["*"]}`), wildcard actions, explicit `Deny` precedence, and per-bucket `Resource` matching. Granting `s3:GetObject` to everyone makes objects publicly readable and `s3:ListBucket` makes the listing public, as separate permissions; bucket sub-resources (`?policy`, `?acl`, ...) always require authentication. **Public Access Block** (`BlockPublicPolicy` / `RestrictPublicBuckets`) overrides any policy and blocks anonymous access
@@ -435,11 +436,11 @@ RPM, DEB and APK packages are attached to every [release](https://github.com/Kod
 
 ```bash
 # Debian or Ubuntu
-sudo apt install ./vaults3_4.4.62_amd64.deb
+sudo apt install ./vaults3_4.4.63_amd64.deb
 # RHEL, Rocky or Fedora
-sudo rpm -i vaults3-4.4.62-1.x86_64.rpm
+sudo rpm -i vaults3-4.4.63-1.x86_64.rpm
 # Alpine
-sudo apk add --allow-untrusted vaults3_4.4.62_x86_64.apk
+sudo apk add --allow-untrusted vaults3_4.4.63_x86_64.apk
 
 sudo systemctl enable --now vaults3
 journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
@@ -448,7 +449,7 @@ journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
 Every release also ships an SPDX SBOM per platform, generated from the binary so it lists the modules actually compiled in, and a Sigstore provenance bundle attached as an asset, so a download can be verified against the workflow run and commit that produced it, offline or from a mirror:
 
 ```bash
-gh attestation verify vaults3_4.4.62_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_4.4.63_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 ### Build from source

@@ -4,6 +4,41 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.63] - 2026-08-23
+### Fixed
+- **A zero-byte object could not be read back under per-bucket encryption.** An
+  empty object carries no header and no ciphertext, but the read path still sent
+  it to the whole-object decrypt, which rejected it as "encrypted data too
+  short". Every empty object in a bucket that had not opted in became unreadable
+  as soon as a legacy key was configured. Empty objects are ordinary in S3, so
+  this was a silent read failure rather than an edge case. Found while building
+  the migration below.
+
+### Added
+- **`vaults3-cli storage reencrypt`, to migrate objects off the pre-4.4.53
+  encryption format.** Objects written before 4.4.53 were sealed as a single
+  AES-GCM message. Such an object cannot be streamed on read, and not for want of
+  trying: the authentication tag covers the whole message and sits at the end, so
+  releasing plaintext before verifying it would mean serving unauthenticated
+  bytes. So every read of one costs its own size in latency and memory, and key
+  rotation does not help because rotation mints a new key version without
+  rewriting any bodies. There was no way off it.
+
+  The command reports by default and only rewrites with `--apply`. It pages
+  through each bucket rather than materialising its index, and migrates one
+  object at a time on purpose, because reading a legacy object materialises it
+  and fanning out would multiply exactly the memory this exists to stop paying.
+  A bucket that never opted into encryption stores plaintext, which also has no
+  streaming header, so those are identified and skipped rather than rewritten for
+  nothing.
+
+  Verified end to end in containers: two objects written by 4.4.52, then read by
+  a current build. **MD5 identical before and after the migration**, on-disk
+  headers changed from the legacy format to `VS3S`, first-byte latency on the
+  64 MiB object fell from 13.2 ms to 1.7 ms, and a second run found nothing left
+  to do. The underlying write is atomic, so an interrupted migration leaves the
+  original object in place.
+
 ## [4.4.62] - 2026-08-23
 ### Fixed
 - **DeleteObjects now authorizes each entry instead of demanding `s3:*`.** The
@@ -2096,6 +2131,7 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   and multi-platform release binaries + Docker images.
 
 [Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[4.4.63]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.62...v4.4.63
 [4.4.62]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.61...v4.4.62
 [4.4.61]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.60...v4.4.61
 [4.4.60]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.59...v4.4.60

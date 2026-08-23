@@ -277,6 +277,7 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		strings.HasPrefix(path, "/versions") ||
 		strings.HasPrefix(path, "/migrate") ||
 		path == "/reclaim" ||
+		path == "/reencrypt" ||
 		path == "/heal" ||
 		path == "/speedtest" ||
 		path == "/search" ||
@@ -498,6 +499,8 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleMigrateCancel(w, r)
 	case path == "/compact" && r.Method == http.MethodPost:
 		h.handleCompact(w, r)
+	case path == "/reencrypt" && r.Method == http.MethodPost:
+		h.handleReencrypt(w, r)
 	case path == "/reclaim" && r.Method == http.MethodPost:
 		h.handleReclaim(w, r)
 
