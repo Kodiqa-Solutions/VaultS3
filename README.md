@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>Lightweight S3-compatible object storage. Single binary, &lt;80MB RAM, built-in dashboard.</strong>
+  <strong>Lightweight S3-compatible object storage. Single binary, idles in 17 MB of RAM, built-in dashboard.</strong>
 </p>
 
 <p align="center">
@@ -37,27 +37,29 @@
 
 ## Why VaultS3?
 
-**MinIO** stripped the admin console from its Community Edition in mid-2025 and archived the open-source repository in February 2026, it is no longer actively maintained, and full management now requires the paid AIStor tier. **SeaweedFS** is capable but spreads across multiple components (master / volume / filer). It does have a web admin UI (`weed admin`) and a working FUSE mount. **Garage** still has no object versioning, WORM/object-lock, or event notifications.
+Object storage has several good open-source options, and which one fits depends on what you are optimising for. Here are the facts, measured or taken from each project's own documentation, and below them an honest answer about when to pick something else.
 
-**VaultS3 keeps everything in one self-contained binary under 80 MB RAM:**
+| | VaultS3 | MinIO | Silo | RustFS | SeaweedFS | Garage |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| GitHub stars | 1.3k | 61k¹ | 2.5k | 31k | 34k | 4.4k |
+| License | AGPL-3.0 | AGPL-3.0 | AGPL-3.0 | Apache-2.0 | Apache-2.0 | AGPL-3.0 |
+| Maintained in the open | **Yes** | Archived¹ | Yes | Yes | Yes | Yes |
+| RAM, idle² | **17 MiB** | 184 MiB | 101 MiB | 70 MiB | 98 MiB | 23 MiB |
+| Components to run | **1** | 1 | 1 | 1 | 3 | 1 |
 
-| | VaultS3 | MinIO | SeaweedFS | Garage |
-|---|:---:|:---:|:---:|:---:|
-| RAM (small deploy) | **<80 MB** | 512 MB+ | 50-200 MB | 50-150 MB |
-| Single binary | **Yes** | Yes | No | Yes |
-| Web dashboard | **Built-in** | Paid¹ | Yes | No |
-| Open-source maintained | **Yes** | Archived¹ | Yes | Yes |
-| Raft clustering | **Yes** | Yes | Yes | Yes |
-| Erasure coding | **Yes** | Yes | Yes | No |
-| Active-active replication | **Yes** | Yes | No | No |
-| FUSE mount | **Built-in** | No | Yes | No |
-| Full-text search | **Yes** | No | No | No |
-| Version diff/tags | **Yes** | No | No | No |
-| Lambda triggers | **Yes** | No | No | No |
-| Virus scanning | **Yes** | No | No | No |
-| Backup scheduler | **Yes** | No | No | No |
+> ¹ MinIO removed the admin console from its Community Edition in 2025 and archived the open-source repository in February 2026, so its star count reflects a project that is no longer developed in the open. Full management now requires the paid AIStor product.
+> ² Measured August 2026 on one host, all six idle with no traffic, Docker working set after a 110 second settle, second reading taken to confirm the figures had stopped moving. **Memory under load is higher for every one of them**: VaultS3 peaks around 185 MiB writing 64 MiB objects at concurrency 16. Reproduce it with `docker stats --no-stream`.
 
-> ¹ MinIO removed the admin console from its Community Edition in 2025 and archived the open-source repository in February 2026. Full management now requires the paid AIStor product. This comparison reflects publicly available information as of **June 2026**, please open an issue if a cell is out of date.
+### When to pick something else
+
+- **You already run MinIO** and want it to keep working: **[Silo](https://github.com/pgsty/silo)**. A community fork by Pigsty that keeps the line maintained and restores the console MinIO cut. Same on-disk format, same API, same `MINIO_*` variables, so an existing deployment carries on unchanged.
+- **AGPL is a problem for you**: **[RustFS](https://github.com/rustfs/rustfs)** or **[SeaweedFS](https://github.com/seaweedfs/seaweedfs)**, both Apache-2.0. RustFS is also the largest of these by adoption, though its own README still marks distributed mode, lifecycle and KMS as under testing.
+- **You need a distributed filesystem**, not only object storage: **SeaweedFS**, with a mature FUSE mount and a filer layer. It runs as master, volume and filer rather than one process.
+- **You want the smallest possible replicated store** and do not need erasure coding or versioning: **[Garage](https://git.deuxfleurs.fr/Deuxfleurs/garage)**, which idles in 23 MiB and is deliberately narrow in scope.
+
+### When VaultS3 is the answer
+
+One binary, the smallest footprint of the six, and the things you would otherwise assemble or pay for already in the box: a full dashboard, IAM with policies and OIDC, versioning with diff and rollback, per-bucket encryption with rotation and crypto-shredding, erasure coding, Raft clustering, active-active replication, lifecycle, notifications, a FUSE mount, full-text and vector search, virus scanning, tiering and scheduled backups. No paid tier holds any of it back, and there is no telemetry.
 
 ### How this compares to Amazon S3
 
@@ -138,7 +140,7 @@ checking for any storage product you evaluate, including this one.
 
 - **S3-compatible API**: Works with any S3 client (AWS CLI, mc, boto3, minio-js, s3fs), including directory-marker objects (`folder/` keys) so tools that represent folders as zero-byte objects work correctly
 - **Single binary**: One file, no runtime dependencies, no Docker required
-- **Low memory**: Targets <80MB RAM for a small single-node deploy (vs MinIO's 300-500MB). A clustered node under sustained large-object load costs more, because it also forwards bodies to the owner and fans replicas out to peers, so size cluster pods from your own measurement, see the [benchmarks guide](docs/BENCHMARKS.md)
+- **Low memory**: a small single-node deploy idles at about **17 MiB**, measured against MinIO's 184 MiB and Garage's 23 MiB on the same host (see the table above). A clustered node under sustained large-object load costs more, because it also forwards bodies to the owner and fans replicas out to peers, so size cluster pods from your own measurement, see the [benchmarks guide](docs/BENCHMARKS.md)
 - **BoltDB metadata**: Embedded key-value store, no external database needed
 - **S3 Signature V4**: Standard AWS authentication
 - **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault or local key provider) encryption modes. Objects are sealed in 1 MiB chunks, so encrypted reads stream and cost a chunk of memory rather than a copy of the object
