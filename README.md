@@ -115,15 +115,44 @@ VaultS3 is a [Kodiqa Solutions](https://www.vaults3.com) project.
 Copyright (C) 2026 Kodiqa Solutions, licensed under the
 [GNU Affero General Public License v3.0](LICENSE).
 
-**The storage engine is AGPL-3.0 and stays that way.** Every feature documented
-in this README is in the open-source binary. Nothing here is behind a licence
-key, and nothing here is going to move behind one.
+### What VaultS3 will never do
 
-Separate paid products, for organisations that want them, are listed at
+I built this because MinIO moved features I was already using behind a paid
+tier. So here is what I am committing to, in public, with a date on it.
+
+- **Nothing that is free today ever moves behind a paid tier.** Not the
+  dashboard, not clustering, not erasure coding, not encryption, not versioning,
+  not search. If it is in the box now, it stays in the box.
+- **The core stays AGPL-3.0.** It does not get relicensed to something
+  proprietary.
+- **No telemetry.** VaultS3 never phones home. There is nothing to switch off,
+  because there is nothing there to begin with.
+- **No account to download**, and **no licence key to run the server**.
+- **A public advisory for every security fix**, including the embarrassing ones.
+
+**What is commercial, so this is not evasive.** There are paid add-ons for
+organisations running VaultS3 at scale, listed at
 [vaults3.com/enterprise](https://www.vaults3.com/enterprise/): a multi-cluster
-Fleet Console, a Kubernetes Operator, a multi-tenant Gateway, and a Compliance
-Pack. They are in early access, and they are add-ons around the engine rather
-than pieces taken out of it. Commercial enquiries: **support@vaults3.com**.
+Fleet Console, a Kubernetes Operator, a multi-tenant Gateway and a Compliance
+Pack. They solve problems a single server does not have, they are built as
+separate programs that talk to the core over its API, and they are how this
+project gets funded. That is the arrangement, stated plainly: the storage engine
+is free and stays free, and I sell tools around it. New paid products may be
+built. Nothing is ever removed from the core to create one. Commercial
+enquiries: **support@vaults3.com**.
+
+**On the CLA.** Contributors sign one, which means I hold enough copyright to
+relicense the core if I chose to. I am telling you that rather than hoping you
+do not check. The first promise on this list is the one that matters, and it is
+the one to hold me to.
+
+**If ownership ever changes.** These promises are mine. If I ever transfer
+VaultS3 to someone else, I will say so publicly and in advance, and I will not
+pretend my promises bind a new owner. You would get to make your own decision
+with notice, which is more than I got.
+
+*Last updated: 23 August 2026. This section is in git, so every change to it is
+in the history.*
 
 ### What happens if this project stops
 
