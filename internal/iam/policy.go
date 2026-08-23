@@ -1,6 +1,10 @@
 package iam
 
-import "strings"
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+)
 
 // Policy represents an IAM policy document.
 type Policy struct {
@@ -11,11 +15,42 @@ type Policy struct {
 // Statement represents a single policy statement.
 type Statement struct {
 	Effect      string                         `json:"Effect"`
-	Action      []string                       `json:"Action"`
-	Resource    []string                       `json:"Resource"`
+	Action      stringOrSlice                  `json:"Action"`
+	Resource    stringOrSlice                  `json:"Resource"`
 	Condition   map[string]map[string][]string `json:"Condition,omitempty"`
-	NotAction   []string                       `json:"NotAction,omitempty"`
-	NotResource []string                       `json:"NotResource,omitempty"`
+	NotAction   stringOrSlice                  `json:"NotAction,omitempty"`
+	NotResource stringOrSlice                  `json:"NotResource,omitempty"`
+}
+
+// stringOrSlice accepts both forms AWS IAM allows for Action and Resource: a
+// bare string ("s3:GetObject") and an array (["s3:GetObject"]). Most AWS
+// documentation examples use the bare string, so policies are routinely written
+// that way and pasted into other S3 implementations.
+//
+// These fields used to be plain []string, so a bare string failed to unmarshal.
+// The caller that loads a user's policies discards a policy it cannot parse
+// without logging anything, so such a policy was accepted at creation, stored,
+// listed back intact, and then silently ignored at every authorization decision.
+// A Deny written that way protected nothing, which is the same failure shape as
+// conditions being ignored (security assessment finding 12).
+type stringOrSlice []string
+
+func (s *stringOrSlice) UnmarshalJSON(b []byte) error {
+	trimmed := bytes.TrimSpace(b)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var one string
+		if err := json.Unmarshal(trimmed, &one); err != nil {
+			return err
+		}
+		*s = stringOrSlice{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(trimmed, &many); err != nil {
+		return err
+	}
+	*s = many
+	return nil
 }
 
 // Evaluate checks all statements against an action and resource.

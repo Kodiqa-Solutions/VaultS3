@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -140,9 +141,18 @@ func (a *Authenticator) resolveIdentity(accessKey string, r *http.Request) (*iam
 				if err == nil {
 					for _, p := range iamPolicies {
 						var pol iam.Policy
-						if err := json.Unmarshal([]byte(p.Document), &pol); err == nil {
-							identity.Policies = append(identity.Policies, pol)
+						if err := json.Unmarshal([]byte(p.Document), &pol); err != nil {
+							// A policy that cannot be parsed used to be dropped in
+							// silence, so an operator saw it created, listed and
+							// attached while it took no part in any decision, and a
+							// Deny written that way protected nothing. Refuse the
+							// whole identity instead of deciding on a partial set.
+							slog.Error("iam: a policy failed to parse, denying this identity until it is fixed",
+								"policy", p.Name, "user", userID, "error", err)
+							identity.PolicyLoadFailed = true
+							continue
 						}
+						identity.Policies = append(identity.Policies, pol)
 					}
 				}
 
@@ -379,6 +389,9 @@ func (a *Authenticator) AuthorizeWithContext(identity *iam.Identity, action, res
 	}
 	if _, ok := ctx["aws:username"]; !ok && identity.UserID != "" {
 		ctx["aws:username"] = identity.UserID
+	}
+	if identity.PolicyLoadFailed {
+		return fmt.Errorf("access denied: %s on %s (a policy attached to this identity could not be parsed)", action, resource)
 	}
 	if iam.EvaluateWithContext(identity.Policies, action, resource, ctx) {
 		return nil

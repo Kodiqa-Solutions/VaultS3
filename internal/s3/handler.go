@@ -972,12 +972,26 @@ func parsePath(path string) (bucket, key string) {
 // mapMethodToAction maps an HTTP method + context to an S3 IAM action.
 func mapMethodToAction(method, bucket, key string, query map[string][]string) string {
 	if key != "" {
+		// A ?versionId names one specific version, which S3 treats as a separate
+		// action from operating on the current version. s3:DeleteObject creates a
+		// delete marker and is recoverable; s3:DeleteObjectVersion destroys a
+		// version permanently. Collapsing the two means the standard "let them
+		// delete, but never permanently" policy (allow s3:DeleteObject, deny
+		// s3:DeleteObjectVersion) protects nothing, because the allow alone would
+		// authorize the destructive call.
+		versioned := len(query["versionId"]) > 0
 		switch method {
 		case http.MethodGet, http.MethodHead:
+			if versioned {
+				return "s3:GetObjectVersion"
+			}
 			return "s3:GetObject"
 		case http.MethodPut:
 			return "s3:PutObject"
 		case http.MethodDelete:
+			if versioned {
+				return "s3:DeleteObjectVersion"
+			}
 			return "s3:DeleteObject"
 		}
 	}

@@ -947,7 +947,7 @@ Website-enabled buckets serve `index.html` for directory paths and a custom erro
 
 ### IAM (Users, Groups & Policies)
 
-Fine-grained access control with S3-compatible IAM policies:
+Fine-grained access control with S3-compatible IAM policies. `Action` and `Resource` accept both the bare-string form (`"Action": "s3:GetObject"`) and the array form, as AWS does, so policies copied from AWS documentation work unchanged. Operations on a specific object version are authorized as their own actions, `s3:DeleteObjectVersion` and `s3:GetObjectVersion`, so allowing `s3:DeleteObject` while denying `s3:DeleteObjectVersion` lets people delete recoverably without ever permanently destroying a version:
 
 ```python
 import requests, json

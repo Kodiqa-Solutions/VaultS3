@@ -4,6 +4,44 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.59] - 2026-08-23
+### Security
+- **An IAM policy written with a bare-string `Action` or `Resource` was silently
+  ignored.** AWS accepts both `"Action": "s3:GetObject"` and
+  `"Action": ["s3:GetObject"]`, and most AWS documentation examples use the bare
+  string, so policies are routinely written that way. VaultS3 typed those fields
+  as arrays only, so the bare-string form failed to parse, and the loader that
+  reads a user's policies discarded anything it could not parse without logging
+  it. Such a policy was accepted by the API, stored, listed back intact and shown
+  attached to the user, while taking no part in any authorization decision. **A
+  `Deny` written that way protected nothing**, so an operator who combined a broad
+  allow with a narrow deny had only the allow. Both forms are now accepted, and a
+  policy that still fails to parse is logged as an error instead of vanishing.
+- **An identity with an unparseable policy is now refused rather than authorized
+  from the policies that did parse.** The S3 path skipped a policy it could not
+  read and evaluated the rest, so a `Deny` lost to a parse error silently widened
+  access whenever another attached policy allowed the action. The console path
+  already refused outright, and the two now agree: an unreadable policy is not an
+  absent one. The reason is logged with the policy name, the user and the parse
+  error, so a broken policy is visible rather than merely inert. Administrators
+  are exempt, so a malformed policy cannot lock an operator out of their own
+  deployment.
+- **Operating on a specific object version now requires the version-scoped
+  action.** `DELETE` and `GET` with a `?versionId` mapped to `s3:DeleteObject` and
+  `s3:GetObject`, so the standard arrangement of allowing `s3:DeleteObject` while
+  denying `s3:DeleteObjectVersion`, which lets people delete recoverably but never
+  destroy a version permanently, authorized the destructive call anyway. They now
+  map to `s3:DeleteObjectVersion` and `s3:GetObjectVersion`, as S3 defines them.
+
+  **This can look like a regression after upgrading.** A policy that granted only
+  `s3:DeleteObject` or `s3:GetObject` no longer covers version-scoped calls. Add
+  `s3:DeleteObjectVersion` or `s3:GetObjectVersion` for identities that should
+  have them. Administrators are unaffected, since they bypass policy evaluation.
+
+  Verified in containers against the released build with the same policy set: a
+  permanent version delete that 4.4.58 allowed, destroying a version, is now
+  refused with 403 and the version survives, while an ordinary delete still works.
+
 ## [4.4.58] - 2026-08-23
 ### Fixed
 - **A degraded erasure read no longer materialises the whole object before its
@@ -1970,6 +2008,7 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   and multi-platform release binaries + Docker images.
 
 [Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[4.4.59]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.58...v4.4.59
 [4.4.58]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.57...v4.4.58
 [4.4.57]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.56...v4.4.57
 [4.4.56]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.55...v4.4.56
