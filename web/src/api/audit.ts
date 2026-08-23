@@ -6,9 +6,8 @@ export interface AuditEntry {
   action: string
   resource: string
   effect: string
-  sourceIP: string
+  sourceIp: string
   statusCode: number
-  detail: string
 }
 
 export interface AuditQuery {

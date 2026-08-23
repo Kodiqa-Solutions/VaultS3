@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
 import { queryAudit, type AuditEntry } from '../api/audit'
 
-type SortField = 'time' | 'user' | 'action' | 'resource' | 'effect' | 'sourceIP' | 'statusCode'
+type SortField = 'time' | 'user' | 'action' | 'resource' | 'effect' | 'sourceIp' | 'statusCode'
 type SortDir = 'asc' | 'desc'
 
 const PAGE_SIZE = 50
@@ -68,7 +68,7 @@ export default function AuditPage() {
         case 'action': cmp = (a.action || '').localeCompare(b.action || ''); break
         case 'resource': cmp = (a.resource || '').localeCompare(b.resource || ''); break
         case 'effect': cmp = (a.effect || '').localeCompare(b.effect || ''); break
-        case 'sourceIP': cmp = (a.sourceIP || '').localeCompare(b.sourceIP || ''); break
+        case 'sourceIp': cmp = (a.sourceIp || '').localeCompare(b.sourceIp || ''); break
         case 'statusCode': cmp = (a.statusCode || 0) - (b.statusCode || 0); break
       }
       return sortDir === 'asc' ? cmp : -cmp
@@ -142,7 +142,7 @@ export default function AuditPage() {
                 <SortHeader field="action" label={t('audit.action')} />
                 <SortHeader field="resource" label={t('audit.resource')} />
                 <SortHeader field="effect" label={t('audit.effect')} />
-                <SortHeader field="sourceIP" label={t('audit.sourceIp')} />
+                <SortHeader field="sourceIp" label={t('audit.sourceIp')} />
                 <SortHeader field="statusCode" label={t('audit.status')} />
               </tr>
             </thead>
@@ -166,7 +166,7 @@ export default function AuditPage() {
                       {e.effect || '-'}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-gray-500 dark:text-gray-400 font-mono text-xs">{e.sourceIP || '-'}</td>
+                  <td className="px-4 py-3 text-gray-500 dark:text-gray-400 font-mono text-xs">{e.sourceIp || '-'}</td>
                   <td className="px-4 py-3 text-gray-500 dark:text-gray-400">{e.statusCode || '-'}</td>
                 </tr>
               ))}

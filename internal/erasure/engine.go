@@ -187,7 +187,13 @@ func (e *Engine) getErasureCoded(bucket, key string) (storage.ReadSeekCloser, in
 		return st, meta.OriginalSize, nil
 	}
 
-	// Degraded: a data shard is missing, so parity recovery is required.
+	// Degraded: a data shard is missing, so parity recovery is required. Recover
+	// it a stripe at a time so first-byte latency stays flat, and only fall back
+	// to reading and decoding the whole object if that is not possible.
+	if ds, ok := e.newDegradedStream(bucket, key, meta); ok {
+		return ds, meta.OriginalSize, nil
+	}
+
 	data, err := e.reconstruct(bucket, key, meta)
 	if err != nil {
 		return nil, 0, err

@@ -4,6 +4,31 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.58] - 2026-08-23
+### Fixed
+- **A degraded erasure read no longer materialises the whole object before its
+  first byte** (issue #38). The healthy read path has streamed its data shards
+  since 4.4.38, but the moment one data shard was missing it fell back to reading
+  every shard in full, decoding the entire object and only then emitting byte one.
+  That put the whole object on the heap and made first-byte latency proportional
+  to object size, which is the exact behaviour #38 reports. Recovery now runs one
+  aligned stripe at a time, reading only as many shards as the code needs, so
+  first-byte cost is constant: measured on a 64 MiB object with a data shard
+  removed, storage reads before the first byte went from the whole object to a
+  fixed 4 MiB, and the same figure holds for a 32 MiB object as for an 8 MiB one.
+  End to end in containers, first-byte latency on that object fell from 17 to 23 ms
+  down to 3 to 6 ms with full-read throughput unchanged. Bytes returned are
+  identical: the same decoder recovers the same data, just in slices.
+- **The Audit Trail's Source IP column was always empty.** The API emits
+  `sourceIp` and the dashboard read `sourceIP`. JSON keys are case sensitive, so
+  the value was undefined on every row and the column rendered a dash. Nothing
+  errored and no test failed, so a security log quietly lost the one field that
+  says where a denied request came from. The address itself was always recorded
+  correctly, including behind a reverse proxy, where the forwarded client address
+  is used rather than the proxy's own. Tests now pin both the JSON field name and
+  the forwarded-address behaviour, since either could break the column again
+  without anything else failing.
+
 ## [4.4.57] - 2026-08-23
 ### Read before upgrading
 
@@ -1945,6 +1970,7 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   and multi-platform release binaries + Docker images.
 
 [Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[4.4.58]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.57...v4.4.58
 [4.4.57]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.56...v4.4.57
 [4.4.56]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.55...v4.4.56
 [4.4.55]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.54...v4.4.55
