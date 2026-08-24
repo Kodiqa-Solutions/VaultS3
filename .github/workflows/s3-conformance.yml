@@ -65,6 +65,20 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      # The binary embeds the dashboard from internal/dashboard/dist, which only
+      # exists after the web build, so a bare `go build` fails with
+      # "pattern all:dist: no matching files found".
+      #
+      # A stub is used rather than the real React build. This job drives the S3
+      # API and never opens the dashboard, so building the frontend would add a
+      # couple of minutes to every run to embed assets nothing here requests. The
+      # dashboard is built and tested for real in ci.yml.
+      - name: Stub the embedded dashboard
+        run: |
+          mkdir -p internal/dashboard/dist
+          echo '<!doctype html><title>not built for conformance runs</title>' \
+            > internal/dashboard/dist/index.html
+
       - name: Build the server
         run: go build -o vaults3 ./cmd/vaults3
 
@@ -107,6 +121,13 @@ jobs:
           SECRET_KEY: vaults3-secret-change-me
         run: ./scripts/s3-tests/run.sh
 
+      # Guarded: when the build fails there is no server log, and an unguarded
+      # tail turns a clear build error into a confusing "cannot open" error.
       - name: Server log on failure
         if: failure()
-        run: tail -100 /tmp/vs3/server.log
+        run: |
+          if [ -f /tmp/vs3/server.log ]; then
+            tail -100 /tmp/vs3/server.log
+          else
+            echo "no server log: the failure happened before the server started"
+          fi
