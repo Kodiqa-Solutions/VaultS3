@@ -110,7 +110,7 @@ shipped defaults.
 **All 14 are fixed in 4.4.56.** The [CHANGELOG](CHANGELOG.md) describes each one,
 and the release notes carry the upgrade steps. If you run an earlier version,
 upgrade, and read the
-[upgrade notes](README.md#upgrading-to-4456-security-release): a few of the fixes
+[upgrade notes](docs/UPGRADING.md#upgrading-to-4456-security-release): a few of the fixes
 tighten authorization and change behaviour.
 
 Two of them need action beyond upgrading. Rotate your administrator credentials

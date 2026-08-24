@@ -1,0 +1,156 @@
+# Roadmap
+
+What is planned, and what has already shipped.
+
+[Documentation index](README.md) · [Back to the project README](../README.md)
+
+---
+
+- [x] Core S3 CRUD operations
+- [x] S3 Signature V4 authentication
+- [x] Presigned URLs
+- [x] Content-Type detection and storage
+- [x] Range requests (partial GET)
+- [x] Copy object (same/cross-bucket)
+- [x] Batch delete
+- [x] Multipart upload (full lifecycle)
+- [x] Multiple access keys
+- [x] Object tagging
+- [x] AES-256-GCM encryption at rest
+- [x] Bucket policies (public-read, custom)
+- [x] Quota management (per-bucket)
+- [x] Virtual-hosted style URLs
+- [x] Prometheus-compatible metrics
+- [x] Web dashboard with built-in UI (login, bucket browser, file management, access keys, activity log, stats, dark/light theme, responsive)
+- [x] Health check endpoints (/health, /ready)
+- [x] Graceful shutdown (SIGTERM/SIGINT with configurable timeout)
+- [x] TLS support (HTTPS with cert/key)
+- [x] Docker image (multi-stage build with health check)
+- [x] Object versioning (per-bucket, version IDs, delete markers, version-specific operations)
+- [x] Object locking / WORM (legal hold, retention with GOVERNANCE/COMPLIANCE modes)
+- [x] Lifecycle rules (per-bucket expiration with background worker)
+- [x] Gzip compression (transparent compress/decompress)
+- [x] Access logging (structured JSON lines)
+- [x] Static website hosting (index/error documents, no-auth serving)
+- [x] IAM users, groups & policies (fine-grained access control, policy evaluation engine, built-in policies)
+- [x] CORS per bucket (S3-compatible, OPTIONS preflight)
+- [x] STS temporary credentials (short-lived keys, auto-cleanup, configurable max duration)
+- [x] Audit trail (persistent log, filtering by user/bucket/time, auto-pruning)
+- [x] IP allowlist/blocklist (global and per-user CIDR restrictions, IPv4/IPv6)
+- [x] S3 event notifications (per-bucket webhooks, event type + prefix/suffix filtering, retry with backoff)
+- [x] Async replication (one-way to peer VaultS3 instances, BoltDB queue, retry with exponential backoff, loop prevention)
+- [x] CLI tool (`vaults3-cli`, bucket, object, user, replication, cluster management)
+- [x] Presigned upload restrictions (max size, content type whitelist, key prefix enforcement)
+- [x] Full-text search (in-memory index over keys, content types, tags. `GET /api/v1/search`)
+- [x] Webhook virus scanning (ClamAV/VirusTotal integration, quarantine bucket, fail-open/closed modes)
+- [x] Data tiering (hot/cold storage, automatic migration based on access patterns, transparent reads, manual migration API)
+- [x] Backup scheduler (full/incremental backups to local targets, cron scheduling, backup history, trigger API)
+- [x] Git-like versioning (visual diff with LCS, version tagging with labels, one-click rollback)
+- [x] FUSE mount (mount buckets as local filesystem, read/write, lazy loading via range requests)
+- [x] Rate limiting (token bucket per IP and per access key, 429 responses, auto-cleanup)
+- [x] UploadPartCopy (copy byte ranges from existing objects as multipart parts)
+- [x] S3 Select (SQL queries on CSV and JSON objects, SELECT/WHERE/LIMIT/LIKE/AND/OR)
+- [x] Multi-backend notifications (Kafka, NATS, Redis pub/sub and queue backends)
+- [x] Bucket default retention (auto-apply GOVERNANCE/COMPLIANCE retention to new objects)
+- [x] Per-bucket Prometheus metrics (request counts, bytes in/out, errors by bucket label)
+- [x] OIDC/JWT SSO (dashboard login via Google/Keycloak/Auth0, RS256 JWKS verification, domain filtering, auto-create users, role mapping)
+- [x] Lambda compute triggers (webhook functions on S3 events, event/key filtering, optional body inclusion, output storage, worker pool)
+- [x] FUSE read cache (LRU block cache, metadata TTL cache, kernel attribute caching, SigV4 key caching)
+- [x] RAM optimization (slim search index with LRU cap, batched last-access writes, GOMEMLIMIT support)
+- [x] Dashboard advanced pages (IAM users/groups/policies, audit trail, search, notifications, replication, lambda triggers, backups, 7 new pages with full CRUD)
+- [x] GetBucketLocation, Bucket Tagging, Bucket/Object ACL, ListMultipartUploads, ListParts (6 new S3 operations for AWS CLI/SDK compatibility)
+- [x] Structured logging with slog (key-value pairs, configurable log level)
+- [x] Request ID middleware (X-Request-Id header on every response)
+- [x] Panic recovery middleware (stack trace logging, graceful 500 responses)
+- [x] Request latency histogram (Prometheus-compatible `vaults3_request_duration_seconds_bucket`)
+- [x] Go unit tests for 14 packages (metadata, storage, IAM, ratelimit, search, config, middleware, server, lifecycle, S3 handler, API, versioning, notify), 133 tests
+- [x] Makefile targets: `make test-coverage`, `make lint`
+- [x] Dashboard polish: sortable table columns on all list pages (files, buckets, keys, audit, search)
+- [x] Dashboard polish: client-side pagination (50 items/page) on file browser and audit trail
+- [x] Dashboard polish: file preview panel (images, text files, JSON) with metadata sidebar
+- [x] Dashboard polish: bucket config UI (versioning toggle, lifecycle rule editor, CORS config editor)
+- [x] Dashboard API: versioning, lifecycle, and CORS endpoints for bucket settings management
+- [x] SVG dashboard charts: BarChart (per-bucket sizes), DonutChart (request method distribution), Sparkline (activity)
+- [x] GitHub Actions CI: build, test, lint, coverage on push/PR
+- [x] pprof debug endpoint: `/debug/pprof/*` behind `debug: true` config flag
+- [x] Extended stats API with request metrics (total requests, errors, bytes in/out, requests by method)
+- [x] Dashboard bulk operations: multi-select with bulk delete and bulk zip download
+- [x] Dashboard drag-and-drop folder upload (recursive directory reading via webkitGetAsEntry)
+- [x] Dashboard auto-refresh toggle on stats page (30s interval, localStorage persistence)
+- [x] Dashboard copy-to-clipboard buttons for S3 URIs, object keys, and access keys
+- [x] Dashboard API: bulk-delete and download-zip endpoints
+- [x] Dashboard home page with summary cards, activity sparkline, system stats, quick actions
+- [x] Settings page: read-only server configuration viewer (`GET /api/v1/settings`, secrets stripped)
+- [x] Keyboard shortcuts: `/` go to search, `?` shortcut help overlay, `Esc` close modal/blur
+- [x] Breadcrumb navigation in file browser with home icon, chevron separators, clickable path segments
+- [x] Security headers middleware (CSP, X-Frame-Options, X-Content-Type-Options, HSTS, Referrer-Policy)
+- [x] CORS origin validation (same-origin + localhost, replaces wildcard)
+- [x] Dashboard API rate limiting (429 Too Many Requests)
+- [x] Input validation (DNS-compatible bucket names, object key constraints)
+- [x] Object versioning dashboard UI (version list panel, diff viewer, rollback, version tagging, bucket versioning indicator)
+- [x] Version list API (`GET /api/v1/versions?bucket=X&key=Y`)
+- [x] Toast notification system (success/error/info toasts, bottom-right stack, auto-dismiss 5s)
+- [x] Sortable table columns on all dashboard pages (notifications, backups, lambda triggers, replication queue)
+- [x] Enhanced bucket creation wizard (optional versioning toggle + auto-expire lifecycle rule)
+- [x] API tests (auth login/failure, JWT required, bucket CRUD, CORS preflight, input validation)
+- [x] Versioning tests (LCS diff algorithm, text type detection, metadata diff, tag store CRUD)
+- [x] Notify tests (dispatcher lifecycle, backend publish, webhook delivery, event/key filtering, retry)
+- [x] Python integration test (security headers, CORS, auth, validation, bucket CRUD, versioning, settings)
+- [x] User metadata (x-amz-meta-*) on PUT/GET/HEAD
+- [x] Conditional GET/PUT (If-Modified-Since, If-None-Match, If-Match → 304/412)
+- [x] Content-MD5 validation on PUT
+- [x] Metadata-only copy (x-amz-metadata-directive: REPLACE)
+- [x] Conditional copy (x-amz-copy-source-if-* headers)
+- [x] Response header overrides (?response-content-type, etc.)
+- [x] Inline tagging and retention on PUT
+- [x] Canned ACL headers (x-amz-acl, x-amz-grant-*)
+- [x] S3 Checksum API (CRC32, CRC32C, SHA1, SHA256)
+- [x] Parts count header on HEAD (x-amz-mp-parts-count)
+- [x] ListObjectsV1 (marker-based pagination)
+- [x] ListBuckets with prefix filter
+- [x] Versioning suspend support
+- [x] GetObject by part number (?partNumber=N)
+- [x] Advanced lifecycle rules (NoncurrentVersionExpiration, AbortIncompleteMultipartUpload, MaxNoncurrentVersions, ExpiredObjectDeleteMarker cleanup, object size filter)
+- [x] IAM policy conditions (StringEquals, StringLike, IpAddress, DateLessThan)
+- [x] Policy variables (${aws:username}, ${aws:userid})
+- [x] LDAP authentication with group mapping
+- [x] STS AssumeRole with session policies
+- [x] External auth webhook
+- [x] Access key description & status
+- [x] Governance bypass (x-amz-bypass-governance-retention)
+- [x] Per-bucket replication rules with prefix/tag filters
+- [x] S3 Replication Config API (PUT/GET/DELETE /{bucket}?replication)
+- [x] Real-time event-driven replication
+- [x] Existing object replication
+- [x] Delete marker replication
+- [x] Site replication (IAM + bucket config sync)
+- [x] KMS integration (HashiCorp Vault + local key provider)
+- [x] Remote tiering (S3-compatible cold tier)
+- [x] RestoreObject API (POST /{bucket}/{key}?restore)
+- [x] Storage classes (STANDARD, REDUCED_REDUNDANCY)
+- [x] Compression exclusions (skip already-compressed file types)
+- [x] Real-time event streaming (SSE at /api/v1/events)
+- [x] Real-time log streaming (SSE at /api/v1/logs)
+- [x] Request tracing (SSE at /api/v1/trace)
+- [x] Health diagnostics (/api/v1/diagnostics)
+- [x] Manual heal API (POST /api/v1/heal)
+- [x] Speedtest (POST /api/v1/speedtest)
+- [x] Batch operations processor (bulk delete/copy)
+- [x] PROXY protocol v1 support
+- [x] Auto-TLS (Let's Encrypt + self-signed fallback)
+- [x] Inter-node network separation
+- [x] Bucket bandwidth throttling
+- [x] S3 Select on compressed files (GZIP, BZIP2)
+- [x] S3 POST policy (HTML form-based upload)
+- [x] S3 Inventory reports (periodic CSV)
+- [x] Snowball/TAR bulk upload
+- [x] FIFO quota (delete oldest objects when quota exceeded)
+- [x] AMQP/RabbitMQ notification backend (amqp091-go client with lazy connection and topic exchange)
+- [x] PostgreSQL notification backend (lib/pq driver, auto-create table, JSONB storage)
+- [x] Elasticsearch notification backend
+- [x] SSE-KMS encryption (HashiCorp Vault Transit engine + local key provider, key rotation, per-object AES-256-GCM)
+- [x] S3 Select on Parquet files (parquet-go, row group iteration, columnar to record conversion)
+- [x] Integration test suite (26 end-to-end tests with real SigV4 signing, filesystem storage, BoltDB metadata)
+- [x] Race detection in CI (`go test -race`)
+- [x] `vaults3 setup`: interactive and scripted first-run configuration, with a generated per-installation admin secret instead of a published default
+- [x] Sharded metadata (`cluster.metadata_shards`): object metadata split across independent Raft groups so metadata capacity grows with the cluster, with per-shard membership reconciliation, all groups sharing one Raft port, and an unreachable shard reported as unavailable rather than empty

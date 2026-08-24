@@ -4,6 +4,57 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [Unreleased]
+### Security
+- **The Go toolchain was pinned to a version with nine reachable standard-library
+  vulnerabilities.** `go.mod` carried `toolchain go1.26.3`, and a toolchain
+  directive is authoritative, so released binaries were built with it regardless
+  of what the build environment had installed. Nine of the advisories were
+  reachable from code paths VaultS3 actually calls, across `crypto/tls`,
+  `crypto/x509`, `net/http`, `net/url`, `net/textproto` and `encoding/xml`. The
+  pin is now `go1.26.7` and the count is zero.
+
+  Dependency scanning could not have caught this: it is the compiler, not a
+  dependency, so nothing in the manifest changes when it is wrong.
+
+### Added
+- **`govulncheck` runs on every push and pull request.** Go's own scanner, which
+  analyses whether vulnerable code is actually reachable rather than only
+  comparing manifest versions. It found the toolchain problem above on its first
+  run.
+- **`golangci-lint` runs in CI, reporting only for now.** The `lint` Makefile
+  target already existed and nothing ran it, so CI checked only `go vet` and
+  formatting. It currently reports 77 issues, 50 of them unchecked error
+  returns, so it does not fail the build yet: failing on all of them at once
+  would just mean the job gets ignored. The findings are in the log to be worked
+  down, and it becomes blocking at zero. Unchecked errors are not cosmetic here,
+  issue #50's data loss was a discarded error return that reported success.
+- **A `vaults3 healthcheck` subcommand**, used by the container image instead of
+  `wget --spider`. The server probes its own `/health`, reading the same config
+  it serves from, so a changed port, a reverse-proxy base path or TLS are
+  followed rather than assumed. It exits 0 when healthy, 1 when it is not, and 2
+  on a usage error, so a broken `HEALTHCHECK` line cannot be mistaken for a
+  failing service.
+
+  This does not by itself remove busybox from the alpine image, which is where
+  the known wget advisory lives. What it does is end the dependency on an
+  external HTTP client for liveness, which is the prerequisite for shipping a
+  distroless image that has no shell and no busybox at all.
+
+### Changed
+- **The README was split into `docs/`.** It had grown to 2,019 lines and 121 KB,
+  and 58% of that sat under one heading: `Quick Start` held 40 subsections
+  covering FUSE mounts, S3 Select, tiering, backups and rate limiting, so a
+  reader who clicked "Quick Start" landed in a manual rather than a quickstart.
+  The README is now 279 lines and keeps what someone needs to decide: what this
+  is, how it compares, a real quickstart, a feature summary, maturity per
+  subsystem, and the project promises.
+
+  Everything else moved into thirteen task-scoped guides under `docs/`, indexed
+  by [docs/README.md](docs/README.md). No prose was dropped in the move. The docs
+  stay in the repository rather than on a website, so they are versioned with the
+  code, travel with a clone or a fork, and can be fixed by pull request.
+
 ## [4.4.63] - 2026-08-23
 ### Fixed
 - **A zero-byte object could not be read back under per-bucket encryption.** An

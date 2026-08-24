@@ -177,7 +177,7 @@ reinstall.
 
 **App-level alternative:** VaultS3 also has a built-in backup (full/incremental)
 and bucket snapshots, which sidestep the cross-volume-consistency concern, see
-the main README.
+the [data management guide](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/docs/DATA-MANAGEMENT.md).
 
 ## Uninstall
 

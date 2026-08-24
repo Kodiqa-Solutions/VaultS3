@@ -1,0 +1,159 @@
+# Full feature list
+
+Everything in the box, in one list. The task guides linked from the documentation index cover the same ground with examples.
+
+[Documentation index](README.md) · [Back to the project README](../README.md)
+
+---
+
+- **S3-compatible API**: Works with any S3 client (AWS CLI, mc, boto3, minio-js, s3fs), including directory-marker objects (`folder/` keys) so tools that represent folders as zero-byte objects work correctly
+- **Single binary**: One file, no runtime dependencies, no Docker required
+- **Low memory**: a small single-node deploy idles at about **17 MiB**, measured against MinIO's 184 MiB and Garage's 23 MiB on the same host (see the [comparison table](../README.md#why-vaults3)). A clustered node under sustained large-object load costs more, because it also forwards bodies to the owner and fans replicas out to peers, so size cluster pods from your own measurement, see the [benchmarks guide](BENCHMARKS.md)
+- **BoltDB metadata**: Embedded key-value store, no external database needed
+- **S3 Signature V4**: Standard AWS authentication
+- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault or local key provider) encryption modes. Objects are sealed in 1 MiB chunks, so encrypted reads stream and cost a chunk of memory rather than a copy of the object
+- **Migrating older encrypted objects**: objects written before 4.4.53 were sealed as one AES-GCM message, which cannot be streamed on read because the authentication tag covers the whole object, so each read costs its own size in latency and memory. `vaults3-cli storage reencrypt` reports how many are affected and rewrites them in the current chunked format with `--apply`. Key rotation does not do this, it mints a new key version without touching object bodies
+- **Per-bucket encryption keys**: For bucket-per-tenant setups, each bucket can be encrypted with its own key that is **not shared** with other tenants (or opt out and stay plaintext). Envelope encryption (master KEK wraps a per-bucket data key). Opt in per bucket via `PUT /{bucket}?encryption` or the dashboard. Supports key rotation and crypto-shredding. Enable with `encryption.per_bucket: true`, see [design doc](design/per-bucket-encryption.md)
+- **SSE-C (customer-provided keys)**: Operator-blind per-object encryption: the client supplies the key per request (`x-amz-server-side-encryption-customer-*`). The server encrypts/decrypts with it and stores only the key's MD5, never the key
+- **Bucket policies**: Public-read, private, custom S3-compatible JSON policies. Supports the standard AWS `Principal` forms (`"*"`, `{"AWS": "*"}`, `{"AWS": ["*"]}`), wildcard actions, explicit `Deny` precedence, and per-bucket `Resource` matching. Granting `s3:GetObject` to everyone makes objects publicly readable and `s3:ListBucket` makes the listing public, as separate permissions. Bucket sub-resources (`?policy`, `?acl`, ...) always require authentication. **Public Access Block** (`BlockPublicPolicy` / `RestrictPublicBuckets`) overrides any policy and blocks anonymous access
+- **Quota management**: Per-bucket size and object count limits
+- **Rate limiting**: Token bucket rate limiter per client IP and per access key to prevent abuse
+- **S3 Select**: Execute SQL queries on CSV, JSON, and Parquet objects without downloading the full file
+- **Multipart upload**: Full lifecycle (Create, UploadPart, UploadPartCopy, Complete, Abort, ListUploads, ListParts)
+- **Bucket tagging**: S3-compatible tag sets with PUT/GET/DELETE
+- **Bucket/Object ACL**: S3-compatible ACL responses (GET/PUT)
+- **Multiple access keys**: Dynamic key management via BoltDB
+- **Object tagging**: Up to 10 tags per object
+- **Range requests**: Partial content downloads (206 responses)
+- **Copy object**: Same-bucket and cross-bucket copies
+- **Batch delete**: Multi-object delete with XML body
+- **Virtual-hosted style URLs**: `bucket.domain/key` in addition to path-style
+- **Bucket default retention**: Set default GOVERNANCE or COMPLIANCE retention on a bucket, auto-applied to new objects
+- **Per-bucket Prometheus metrics**: Request counts, bytes in/out, and errors with bucket labels at `/metrics`
+- **Prometheus metrics**: `/metrics` endpoint with storage, request, and runtime stats
+- **Presigned URLs**: Pre-authenticated URL generation
+- **Web dashboard**: Built-in React UI at `/dashboard/` with home overview page, file browser (grid or list layout with file-type icons, sortable columns, pagination, file preview, metadata panel, version history panel with diff viewer/rollback/tagging, multi-select, bulk delete, bulk zip download, breadcrumb navigation), drag-and-drop file and folder upload (streamed straight to storage so large files work, with subfolder structure preserved), copy-to-clipboard buttons, access key management (each key showing the user it was issued for, so a key can be traced to the application using it), activity log, storage stats with auto-refresh, read-only settings viewer, IAM management, audit trail viewer (sortable, paginated), search (sortable, paginated), notifications, replication status, lambda triggers, backup management, bucket config (versioning toggle with status indicator, lifecycle editor, CORS editor), keyboard shortcuts (`/` search, `?` help), toast notifications (success/error/info), dark/light theme, language switcher, collapsible sidebar, remember-me sign-in, responsive layout
+- **Dashboard in your language**: The Web UI ships **English, German, French, and Simplified Chinese**, picked automatically from the browser's language and switchable from the top bar (the choice is remembered). Adding a language is one JSON file and no code, see [Translating the dashboard](../CONTRIBUTING.md#translating-the-dashboard)
+- **Health checks**: `/health` (liveness) and `/ready` (readiness) endpoints for load balancers and Kubernetes
+- **Buckets on first start**: Declare the buckets a deployment needs (`VAULTS3_DEFAULT_BUCKETS=app-data,backups`, `storage.default_buckets`, or the chart's `defaultBuckets`) and the missing ones are created while the server starts, so a container needs no init container or one-off S3 client call to become usable. Existing buckets are never touched, and an invalid name or a failed create stops startup instead of coming up quietly incomplete
+- **Graceful shutdown**: Drains in-flight requests on SIGTERM/SIGINT with configurable timeout
+- **TLS support**: Optional HTTPS with configurable cert/key paths
+- **Separate dashboard port**: Optionally serve the Web UI + its API on a dedicated port (`server.console_port`, e.g. 9001) apart from the S3 API, so each can have its own firewall rules / TLS / reverse proxy (MinIO-style)
+- **Reverse-proxy subpath**: Host the whole app under a subpath (`server.base_path`, e.g. `/vaults3`) so both the dashboard (`https://example.com/vaults3/dashboard/`) and the S3 API work behind it. Asset URLs and SPA routes are rewritten at serve time, and S3 SigV4 signatures are verified against the original (pre-strip) path (optionally auto-detect the subpath from the proxy's `X-Forwarded-Prefix` with `server.trust_forwarded_prefix`, off by default since that header is client-supplied)
+- **Object versioning**: Per-bucket versioning with version IDs, delete markers, version-specific GET/DELETE/HEAD
+- **Object locking (WORM)**: Legal hold and retention (GOVERNANCE/COMPLIANCE) to prevent deletion
+- **Lifecycle rules**: Per-bucket object expiration (auto-delete after N days) and aborting incomplete multipart uploads after N days (S3 `AbortIncompleteMultipartUpload`, reclaims the parts left by killed/failed clients), run by a background worker
+- **Zstandard compression**: Transparent compress-on-write, decompress-on-read with zstd (better ratio and speed than gzip). Reads **stream** the decoder, so GET time-to-first-byte stays flat regardless of object size (no whole-object buffering). Objects written by older gzip builds are still read transparently (codec auto-detected by magic number)
+- **Small-file packing (experimental)**: Optionally pack objects up to a size threshold into large append-only **volume** files (each as an independent zstd frame) with byte-offset locations in BoltDB, plus background dead-space **compaction** (`POST /api/v1/compact`), avoids the per-file overhead (inodes, syscalls, disk blocks) of millions of tiny objects. Larger objects fall through to individual files. Not yet composable with encryption or erasure coding (skipped if either is enabled)
+- **Scales to millions of objects**: Listing and storage stats are served from a sorted BoltDB metadata index with maintained per-bucket counters (size/count updated incrementally on every write), never a filesystem walk. So dashboard stats are O(1) and the object browser pages in milliseconds regardless of bucket size, verified at 1M+ objects (stats `13s → 0.4ms`). Metadata costs about 600 bytes per object and, in a cluster, is replicated to every node by default (object data is sharded, metadata is not), so roughly 10M objects per node is comfortable and 100M is workable with NVMe and enough RAM. Past that, `cluster.metadata_shards` splits the object metadata across independent Raft groups so each node holds only the shards it is a member of. See [docs/SCALING.md](SCALING.md#11a-how-many-objects-a-cluster-can-hold)
+- **Access logging**: Structured JSON lines log file of all S3 operations
+- **Static website hosting**: Serve index/error documents from buckets, no auth required
+- **IAM users, groups & policies**: Fine-grained access control with S3-compatible policy evaluation, default deny, wildcard matching
+- **CORS per bucket**: S3-compatible CORS configuration with OPTIONS preflight support
+- **STS temporary credentials**: Short-lived access keys with configurable TTL, auto-cleanup of expired keys
+- **Audit trail**: Persistent audit log of allow and deny decisions with the principal, action, resource, status and **source IP**, filterable by user, bucket and time range. Behind a reverse proxy the forwarded client address is recorded rather than the proxy's own, so a denied request can be traced to where it came from. Auto-pruning via lifecycle worker (`security.audit_retention_days`, default 90)
+- **IP allowlist/blocklist**: Global and per-user CIDR-based IP restrictions with IPv4/IPv6 support
+- **S3 event notifications**: Per-bucket webhook notifications on object mutations with event type and key prefix/suffix filtering, plus Kafka, NATS, Redis, AMQP/RabbitMQ, PostgreSQL, and Elasticsearch backends
+- **Raft clustering**: Multi-node cluster with Hashicorp Raft consensus for strongly consistent distributed metadata, automatic leader election, and node join/leave via HTTP API. Optionally shards the object metadata across independent Raft groups (`cluster.metadata_shards`) so metadata capacity grows with the cluster instead of every node holding a copy of the whole index. See [docs/design/sharded-metadata.md](design/sharded-metadata.md)
+- **Consistent hashing**: xxhash64-based hash ring with virtual nodes for automatic data placement and request routing across cluster nodes via reverse proxy. A read whose data has not yet been copied to the node serving it is fetched from a holder that has it, so a `GET` never reports "not found" for an object that was just written, and a hop that fails before any response reaches the client is retried against the object's other holders instead of surfacing as a gateway error
+- **Erasure coding**: Reed-Solomon encoding (configurable data/parity shards) for disk-failure protection with background healer that auto-reconstructs degraded objects. Reads **and writes stream**, so neither holds the object in memory: a GET's time-to-first-byte stays flat regardless of object size, and a PUT costs a fixed number of stripe buffers rather than the object plus its parity, which is what makes large uploads at high concurrency safe. A degraded read, where a shard is actually missing, streams too: parity recovery runs one aligned stripe at a time rather than rebuilding the whole object first, so first-byte cost stays constant and a degraded read does not hold the object in memory. **Settable per bucket** alongside replica count (`vaults3-cli bucket durability`), so scratch data can be stored once while the buckets that matter keep their parity and copies: on a 3-node cluster with 4+2 coding and 3 replicas, the same data costs 4.52x with the defaults and 1.00x with both turned off
+- **High availability**: Automatic failure detection (health probes with suspect/down state machine), failover proxy routing to healthy replicas, and background rebalancer for membership changes. Inter-node traffic shares a pooled HTTP transport (connection reuse instead of a new socket per call), and a node that genuinely cannot serve a request answers `503 SlowDown` with an S3 error document, which every mainstream SDK retries on its own
+- **Scalable listing**: Object listing is served from the sorted BoltDB metadata index (seek to the page, `O(log n + page_size)`), so `ListObjectsV2` page latency stays flat (~0.7 ms per 1000-key page) whether a prefix holds a thousand or **a hundred million** objects (measured, not extrapolated), no full-bucket scan
+  - 📖 See the **[Scaling & Operations Guide](SCALING.md)** for multi-disk erasure coding, multi-node cluster setup, large-prefix listing, and lost-disk / lost-server recovery runbooks
+- **Active-active replication**: Bidirectional site-to-site sync with vector clocks for causal ordering, pluggable conflict resolution (last-writer-wins, largest-object, site-preference), and change log for efficient delta sync
+- **Async replication**: One-way async replication to peer VaultS3 instances with BoltDB-backed queue, retry with exponential backoff, and loop prevention
+- **CLI tool**: Standalone `vaults3-cli` binary for bucket, object, user, and replication management without AWS CLI, plus `vaults3-cli info` for server version and storage capacity (used / free / total), `vaults3-cli cluster` for day-2 cluster operations (status, join, leave, drain/undrain a member, rebalance, decommission, see [docs/SCALING.md](SCALING.md)), and `vaults3-cli storage reclaim` to free data files that no metadata refers to any more
+- **Capacity overview**: `GET /api/v1/system` and the dashboard Stats page report the version and storage usage. In a cluster, `GET /api/v1/cluster/info` (the same dashboard panel, and `vaults3-cli info`) roll it up across all nodes with a per-node breakdown, an `mc admin info`-style view. Three sizes are reported separately because they answer different questions and are not meant to match: **logical** (each object's current version, counted once cluster-wide, since object metadata is the same on every node), **VaultS3 on disk** (what its data, metadata, erasure, cold-tier and Raft directories actually occupy, summed per node, so it includes replicas, parity shards and non-current versions), and **filesystems** (statfs of the whole volumes, which usually also hold the OS, container images and logs). The middle figure is the one to compare against logical for a real amplification ratio, with a per-directory split to tell object data apart from metadata and Raft logs. It comes from a cached background walk, `storage.usage_scan_interval_secs` (default 300, `0` disables it), and is also exported as `vaults3_disk_usage_bytes{dir=...}`
+- **Presigned upload restrictions**: Enforce max file size, content type whitelist, and key prefix on presigned PUT URLs
+- **Full-text search**: In-memory search index over object metadata, tags, content type, and key patterns with incremental updates
+- **Semantic / vector search (optional)**: Embeds object text via any OpenAI-compatible endpoint (Ollama, llama.cpp, OpenAI…) and serves similarity search + RAG retrieval from `POST /api/v1/vectors/query`, all in the single binary, no external vector database. Searchable from the dashboard (Keyword / Semantic toggle)
+- **Migrate from S3**: Import buckets and objects from MinIO, SeaweedFS, Garage, Ceph, AWS S3, Cloudflare R2, Wasabi, Backblaze B2, or any S3-compatible source via a dashboard wizard (pick a source preset that pre-fills the endpoint and SigV4 region, test connection, pick buckets, live progress, cancel in-flight jobs). **preserves each object's original modified date, user metadata, and content headers** plus **bucket policies and tags** (a faithful copy, not a same-day re-upload, something `mc mirror` can't do since it writes via PutObject). Streams objects (no in-memory buffering, so arbitrarily large objects transfer without a request-size timeout), copies objects in parallel (bounded worker pool), and is **resumable**: a restarted or crashed migration skips objects already copied and continues instead of re-transferring the whole bucket. Retries transient errors, no AWS SDK required
+- **Cost estimator**: A dashboard panel that estimates what your stored data would cost on AWS S3, GCS, Cloudflare R2, Backblaze B2, and Wasabi (storage + egress) vs. self-hosting, egress-free, for free (`GET /api/v1/tco`)
+- **Bucket snapshots ("git-for-buckets")**: Capture a bucket's state, diff against the live bucket, and roll back in one click (commit / diff / restore), git-style history for your data, built on versioning with no external stack. Restore even resurrects deleted objects, and is itself reversible
+- **Webhook virus scanning**: POST uploaded objects to a configurable scan endpoint (ClamAV, VirusTotal, etc.) with quarantine bucket for infected files
+- **Data tiering**: Automatic hot/cold storage migration based on access patterns with transparent reads and manual migration API
+- **Backup scheduler**: Scheduled full/incremental backups to local directory targets with cron-like scheduling and backup history
+- **Git-like versioning**: Visual diff between object versions (text and binary), version tagging with labels, one-click rollback to any version
+- **FUSE mount**: Mount VaultS3 buckets as local filesystem directories with read/write support, lazy loading, and SigV4 authentication. LRU block cache (256KB blocks, configurable size), metadata cache with TTL, kernel attribute caching, and SigV4 derived key caching for fast repeated reads
+- **OIDC/JWT SSO**: Sign in to the dashboard with external identity providers (Google, Keycloak, Auth0, Authentik) via OpenID Connect, using the **authorization-code flow with PKCE** (validated end-to-end against a real Keycloak and a real Authentik). The PKCE verifier, nonce and client secret never leave the server, and the login state is sealed so a login started on one cluster node can finish on another. The authorization endpoint, expected issuer and requested scopes all come from the provider's discovery document, so providers that serve a global authorization endpoint separate from each application's issuer need no rewrite rules, and a scope the provider does not define is never requested. RS256 JWT verification with JWKS auto-discovery and caching. Email domain filtering, auto-create users, OIDC group to policy mapping.
+- **Lambda compute triggers**: Webhook-based function triggers on S3 events. Call external URLs with event payload and optional object body, optionally store the response as a new object. Per-bucket trigger configuration with event type and key prefix/suffix filtering. Worker pool with non-blocking dispatch.
+- **SVG dashboard charts**: Pure SVG bar chart (per-bucket sizes), donut chart (request method distribution), and sparkline (request activity) on the stats page, zero dependencies
+- **GitHub Actions CI**: Automated build, test, lint, and coverage on push/PR
+- **pprof debug endpoint**: `/debug/pprof/*` available when `debug: true` in config for CPU/memory profiling
+- **Structured logging (slog)**: All server logs use Go's `log/slog` with key-value pairs. Configurable log level (`debug`, `info`, `warn`, `error`) via `logging.level` in config
+- **Request ID middleware**: Every response includes an `X-Request-Id` header for request tracing
+- **Panic recovery middleware**: Catches panics, logs full stack trace, returns 500 without crashing the server
+- **Request latency histogram**: `vaults3_request_duration_seconds_bucket` Prometheus histogram with 11 bucket boundaries (5ms to 10s)
+- **Security headers**: CSP, X-Frame-Options (DENY), X-Content-Type-Options (nosniff), HSTS (1 year), Referrer-Policy on all dashboard responses
+- **CORS origin validation**: Dashboard API restricts Access-Control-Allow-Origin to same-origin and localhost (replaces wildcard `*`)
+- **Dashboard API rate limiting**: Uses existing token bucket rate limiter on `/api/v1/` endpoints, returns 429 when exceeded
+- **Input validation**: DNS-compatible bucket name validation (3-63 chars, lowercase, no leading/trailing hyphen) and object key validation (max 1024 chars, no null bytes)
+- **RAM optimization**: Slim search index with LRU eviction cap (50K entries default), batched last-access updates (30s flush interval), configurable Go memory limit (`GOMEMLIMIT`). Uploads stream rather than buffer, so peak memory scales with concurrency and not with object size, and a clustered node restores its metadata snapshot in bounded batches, so **startup memory is flat in the size of the cluster** (restoring 1.6M objects peaks at ~66 MB). When measuring in a container, read `anon` from `memory.stat`: `memory.current` includes page cache and will sit near the limit under write load by design ([benchmarks guide](BENCHMARKS.md))
+- **Streaming uploads**: A `PUT` streams to disk while its checksums are computed in passing, and compression encodes as the object flows through, so peak memory scales with concurrency rather than with concurrency multiplied by object size. A 64 MiB object at 32 concurrent uploads no longer costs gigabytes of buffered copies (SSE-C and uploads with no declared length still buffer by necessity)
+- **GetObjectAttributes**: Returns object size, ETag, and storage class. Used internally by AWS SDK v2
+- **Bucket encryption config**: Per-bucket server-side encryption configuration (AES256, aws:kms) via `PUT/GET/DELETE /{bucket}?encryption`
+- **Public access block**: Per-bucket public access block with 4 boolean flags (BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets). `BlockPublicPolicy` and `RestrictPublicBuckets` are enforced: either one blocks anonymous access to the bucket regardless of its policy. The two ACL flags are accepted and stored for API compatibility but have no effect, since VaultS3 uses policies rather than ACLs (`PUT ?acl` is a no-op)
+- **Bucket logging config**: Per-bucket access logging configuration with target bucket and prefix
+- **User metadata**: Custom `x-amz-meta-*` headers on PUT/GET/HEAD
+- **Conditional requests**: `If-Modified-Since`, `If-None-Match` (304), `If-Match`, `If-None-Match` (412) on GET and PUT
+- **Content-MD5 validation**: Server-side integrity check on PUT with `Content-MD5` header
+- **Metadata-only copy**: `x-amz-metadata-directive: REPLACE` for updating metadata without re-uploading
+- **Conditional copy**: `x-amz-copy-source-if-*` headers for conditional CopyObject
+- **Response header overrides**: `?response-content-type`, `?response-content-disposition`, etc. on GET
+- **Inline tagging on PUT**: `x-amz-tagging` header to set tags during object upload
+- **Inline retention on PUT**: `x-amz-object-lock-mode` header to set retention during upload
+- **Canned ACL headers**: `x-amz-acl` and `x-amz-grant-*` headers on PUT
+- **Replication status header**: `x-amz-replication-status` on GET/HEAD responses
+- **Website redirect**: `x-amz-website-redirect-location` header for per-object redirects
+- **S3 Checksum API**: CRC32, CRC32C, SHA1, SHA256 checksums on upload and download
+- **Parts count header**: `x-amz-mp-parts-count` on HEAD for multipart objects
+- **ListObjectsV1**: Marker-based pagination (`GET /{bucket}?marker=`) for legacy client compatibility
+- **ListBuckets with prefix filter**: Filter bucket listing by name prefix
+- **Versioning suspend**: Suspend versioning on a bucket while preserving existing versions
+- **GetObject by part number**: `?partNumber=N` to retrieve individual parts of multipart objects
+- **Multiple lifecycle rules**: Multiple rules per bucket with prefix, tag, and size filters
+- **NoncurrentVersionExpiration**: Auto-expire non-current object versions after N days
+- **AbortIncompleteMultipartUpload**: Auto-cleanup stale multipart uploads after N days
+- **MaxNoncurrentVersions**: Cap retained non-current versions per object
+- **ExpiredObjectDeleteMarker cleanup**: Remove orphaned delete markers automatically
+- **Object size filter**: Lifecycle rules with `ObjectSizeGreaterThan` / `ObjectSizeLessThan` conditions
+- **IAM policy conditions**: `StringEquals`, `StringLike`, `IpAddress`, `DateLessThan` condition operators
+- **Policy variables**: `${aws:username}`, `${aws:userid}` substitution in policy resources
+- **LDAP authentication**: Bind-based LDAP/LDAPS authentication with group mapping
+- **STS AssumeRole**: Federated access via STS AssumeRole with session policies
+- **External auth webhook**: Delegate authentication to an external HTTP endpoint
+- **Access key description & status**: Metadata fields and active/inactive status on access keys
+- **Governance bypass**: `x-amz-bypass-governance-retention` header for admin override of GOVERNANCE locks
+- **Per-bucket replication rules**: Replication rules with prefix and tag filters per bucket
+- **Replication Config API**: S3-compatible `PUT/GET/DELETE /{bucket}?replication` endpoints
+- **Real-time event-driven replication**: Replicate objects immediately on mutation events
+- **Existing object replication**: Replicate pre-existing objects when enabling replication rules
+- **Delete marker replication**: Optionally replicate delete markers to target buckets
+- **Site replication**: IAM and bucket configuration sync across sites
+- **KMS integration**: HashiCorp Vault and local key provider for envelope encryption
+- **Remote tiering**: Tier cold objects to an S3-compatible remote backend
+- **RestoreObject API**: `POST /{bucket}/{key}?restore` to initiate restore from cold tier
+- **Storage classes**: STANDARD and REDUCED_REDUNDANCY storage class support
+- **Compression exclusions**: Skip compression for already-compressed file types (GZIP, JPEG, MP4, etc.)
+- **Real-time event streaming**: Server-Sent Events at `/api/v1/events` for live S3 event monitoring
+- **Real-time log streaming**: Server-Sent Events at `/api/v1/logs` for live access log tailing
+- **Request tracing**: Server-Sent Events at `/api/v1/trace` for per-request latency tracing
+- **Health diagnostics**: Detailed system diagnostics at `/api/v1/diagnostics` (disk, memory, goroutines, DB stats)
+- **Manual heal API**: `POST /api/v1/heal` to trigger erasure-coded object repair on demand
+- **Orphan reclaim**: `POST /api/v1/reclaim` (or `vaults3-cli storage reclaim`) finds data files that no metadata refers to any more and frees them, scanning every node in a cluster. Reports by default, and `?apply=true` deletes, and nothing written in the last 24h is ever touched. A file is deleted only when metadata positively says it is gone: if a lookup cannot be answered at all, the whole bucket is reported `incomplete` and nothing in it is touched
+- **Speedtest**: `POST /api/v1/speedtest` to benchmark storage throughput
+- **Batch operations**: Bulk delete and copy processor for large-scale object operations
+- **PROXY protocol v1**: Accept PROXY protocol connections for real client IP behind load balancers
+- **Auto-TLS**: Automatic Let's Encrypt certificates with self-signed fallback
+- **Inter-node network separation**: Bind cluster traffic to a dedicated network interface
+- **Bucket bandwidth throttling**: Per-bucket upload/download rate limits
+- **S3 Select on compressed files**: Query GZIP and BZIP2 compressed CSV/JSON objects with S3 Select
+- **S3 POST policy**: HTML form-based upload with policy document validation
+- **S3 Inventory reports**: Periodic CSV inventory of bucket contents
+- **Snowball/TAR bulk upload**: Upload TAR archives that are automatically extracted into objects
+- **FIFO quota**: Automatically delete oldest objects when bucket quota is exceeded
+- **AMQP/RabbitMQ notifications**: Publish S3 events to RabbitMQ exchanges
+- **PostgreSQL notifications**: Insert S3 events into a PostgreSQL table
+- **Elasticsearch notifications**: Index S3 events in Elasticsearch
+- **Docker image**: Multi-stage Dockerfile with built-in health check
+- **YAML config**: Simple configuration, sensible defaults

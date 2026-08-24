@@ -2,7 +2,7 @@ module github.com/Kodiqa-Solutions/VaultS3
 
 go 1.26.0
 
-toolchain go1.26.3
+toolchain go1.26.7
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0

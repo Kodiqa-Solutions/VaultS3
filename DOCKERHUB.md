@@ -123,7 +123,7 @@ docker run -d \
 ## Links
 
 - [GitHub](https://github.com/Kodiqa-Solutions/VaultS3)
-- [Documentation](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/README.md)
+- [Documentation](https://github.com/Kodiqa-Solutions/VaultS3/blob/main/docs/README.md)
 - [Issues](https://github.com/Kodiqa-Solutions/VaultS3/issues)
 
 ## Project and support

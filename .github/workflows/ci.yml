@@ -82,6 +82,50 @@ jobs:
           gofmt -l .
           test -z "$(gofmt -l .)"
 
+      # go vet catches a narrow set of issues. golangci-lint is the deeper pass
+      # the Makefile target already used locally, which nothing enforced.
+      #
+      # Reporting only, deliberately. It currently finds 77 issues, 50 of them
+      # unchecked error returns, and failing the build on all of them at once
+      # would just mean the job gets ignored. The findings are visible in the log
+      # so they can be worked down, and this becomes blocking once the count is
+      # zero. Unchecked errors are not cosmetic here: issue #50's data loss was
+      # a discarded error return that reported success.
+      #
+      # Version pinned rather than latest, so a new release adding a linter
+      # cannot turn CI red without anyone changing anything.
+      - name: Run golangci-lint
+        continue-on-error: true
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.1
+          args: --timeout=5m
+
+  # Go's own vulnerability scanner. Dependabot compares manifests, which is why
+  # it has twice missed real issues here. govulncheck analyses whether the
+  # vulnerable code is actually reachable from this codebase, so it reports
+  # fewer false alarms and catches things a manifest diff does not see.
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
   docker:
     runs-on: ubuntu-latest
     needs: [build-and-test, lint]

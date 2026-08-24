@@ -37,6 +37,8 @@ func main() {
 		switch os.Args[1] {
 		case "setup":
 			os.Exit(runSetup(os.Args[2:]))
+		case "healthcheck":
+			os.Exit(runHealthcheck(os.Args[2:]))
 		case "help", "-h", "--help":
 			usage()
 			os.Exit(0)

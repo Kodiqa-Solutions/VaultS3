@@ -48,8 +48,13 @@ EXPOSE 9000
 
 USER vaults3
 
+# The server probes itself. Using busybox wget here pulled a CVE into every
+# deployment for a check the binary can do on its own, with no upstream fix
+# coming, and it is also what a distroless image cannot provide at all.
+# The subcommand reads the same config as the server, so a changed port, a
+# reverse-proxy base path or TLS are all followed rather than assumed.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD wget -q --spider http://localhost:9000/health || exit 1
+  CMD ["vaults3", "healthcheck", "-config", "/etc/vaults3/vaults3.yaml"]
 
 ENTRYPOINT ["vaults3"]
 CMD ["-config", "/etc/vaults3/vaults3.yaml"]
