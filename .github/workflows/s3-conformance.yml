@@ -1,0 +1,112 @@
+# S3 conformance: run ceph/s3-tests against a real VaultS3 server.
+#
+# VaultS3 advertises 80+ S3 operations. Its own tests are written against its own
+# reading of the spec, so they cannot catch a misreading. s3-tests is the suite
+# the rest of the object-storage world is measured against, and adopting it found
+# two real bugs on the first run: ListObjectVersions returned nothing for a
+# never-versioned bucket, and deleting the "null" version orphaned the object's
+# bytes on disk while removing its metadata.
+#
+# Two entry points, deliberately different in what they gate:
+#
+#   pull_request / push  -> the whitelist in scripts/s3-tests/implemented_tests.txt.
+#                           Every listed test must pass. This is a regression gate.
+#   schedule / dispatch  -> the full upstream suite, reporting which additional
+#                           tests now pass so they can be promoted onto the list.
+#                           Never fails on an unimplemented feature, only on a
+#                           regression of something already promised.
+name: S3 conformance
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'scripts/s3-tests/**'
+      - '.github/workflows/s3-conformance.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'scripts/s3-tests/**'
+      - '.github/workflows/s3-conformance.yml'
+  schedule:
+    # Weekly full sweep, offset from other scheduled jobs.
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'gate (whitelist only) or all (full sweep)'
+        required: false
+        default: gate
+        type: choice
+        options: [gate, all]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build the server
+        run: go build -o vaults3 ./cmd/vaults3
+
+      - name: Start VaultS3
+        env:
+          VAULTS3_ACCESS_KEY: vaults3-admin
+          VAULTS3_SECRET_KEY: vaults3-secret-change-me
+        run: |
+          mkdir -p /tmp/vs3/data /tmp/vs3/metadata
+          cat > /tmp/vs3/config.yaml <<YAML
+          server:
+            port: 9000
+          storage:
+            data_dir: /tmp/vs3/data
+            metadata_dir: /tmp/vs3/metadata
+          YAML
+          ./vaults3 -config /tmp/vs3/config.yaml > /tmp/vs3/server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/health >/dev/null; then
+              echo "server up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become healthy"; cat /tmp/vs3/server.log; exit 1
+
+      - name: Choose mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "mode=all" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=${{ github.event.inputs.mode || 'gate' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run conformance suite
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          ENDPOINT: http://127.0.0.1:9000
+          ACCESS_KEY: vaults3-admin
+          SECRET_KEY: vaults3-secret-change-me
+        run: ./scripts/s3-tests/run.sh
+
+      - name: Server log on failure
+        if: failure()
+        run: tail -100 /tmp/vs3/server.log

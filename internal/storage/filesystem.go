@@ -50,36 +50,106 @@ func (fs *FileSystem) ObjectPath(bucket, key string) string {
 	return fs.objectPath(bucket, key)
 }
 
+// quarantineDir holds paths the engine refused to resolve. It is a real
+// directory name rather than an error return so the existing callers, which all
+// expect a string, cannot accidentally operate on an escaping path.
+const quarantineDir = "invalid-bucket"
+
+// IsSafeBucketName reports whether a bucket name can be used to build a path
+// without escaping the data directory.
+//
+// This is deliberately NOT the full S3 naming rule (3-63 chars, lowercase, and
+// so on). Callers that import buckets from somewhere else, such as a migration
+// from a remote S3-compatible store, should not fail a whole migration because a
+// source bucket is two characters long. They should fail when the name is a path
+// traversal, which is the security property. The S3 naming rule stays where it
+// belongs, on the CreateBucket API path.
+func IsSafeBucketName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsRune(name, '/') || strings.ContainsRune(name, filepath.Separator) {
+		return false
+	}
+	// filepath.Clean collapses "a/.." to "."; anything that does not survive
+	// cleaning as itself is not a single plain path segment.
+	return filepath.Clean(name) == name
+}
+
+// containedPath joins segments under the data directory and reports whether the
+// result stayed inside it.
+//
+// The containment check is against the DATA DIRECTORY, not against the bucket
+// directory. Checking a path that itself contains the untrusted segment proves
+// nothing: the previous version compared the resolved path against
+// filepath.Join(dataDir, bucket), so a bucket of "../evil" moved the goalpost
+// along with the ball and the prefix test passed while the path sat outside the
+// store. Found by FuzzObjectPathStaysInsideDataDir.
+//
+// Bucket names arriving over the S3 API are validated by CreateBucket, but that
+// is not the only door: internal/migrate creates buckets from names listed by a
+// REMOTE S3 endpoint the user pointed at, and internal/replication creates them
+// from a peer's change feed. Neither validates, so the engine has to.
+func (fs *FileSystem) containedPath(segments ...string) (string, bool) {
+	root := filepath.Clean(fs.dataDir)
+	p := filepath.Join(append([]string{root}, segments...)...)
+	if p != root && !strings.HasPrefix(p, root+string(filepath.Separator)) {
+		return "", false
+	}
+	return p, true
+}
+
 func (fs *FileSystem) bucketPath(bucket string) string {
-	return filepath.Join(fs.dataDir, bucket)
+	p, ok := fs.containedPath(bucket)
+	if !ok {
+		return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir)
+	}
+	return p
 }
 
 func (fs *FileSystem) objectPath(bucket, key string) string {
-	p := filepath.Join(fs.dataDir, bucket, key)
-	// Prevent path traversal — resolved path must stay under bucket dir
-	bucketDir := filepath.Join(fs.dataDir, bucket) + string(filepath.Separator)
-	if !strings.HasPrefix(p+string(filepath.Separator), bucketDir) && p != filepath.Join(fs.dataDir, bucket) {
-		return filepath.Join(fs.dataDir, bucket, "invalid-key")
+	if p, ok := fs.containedPath(bucket, key); ok {
+		return p
 	}
-	return p
+	// The key escaped but the bucket is sound: keep the old sentinel so the
+	// failure still lands inside that bucket.
+	if bp, ok := fs.containedPath(bucket); ok {
+		return filepath.Join(bp, "invalid-key")
+	}
+	// The bucket itself escaped, so there is no bucket directory to fall back to.
+	return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-key")
 }
 
 func (fs *FileSystem) versionPath(bucket, key, versionID string) string {
-	p := filepath.Join(fs.dataDir, bucket, ".vs", key, versionID)
-	// Prevent path traversal — resolved path must stay under bucket's .vs dir
-	vsDir := filepath.Join(fs.dataDir, bucket, ".vs") + string(filepath.Separator)
-	if !strings.HasPrefix(p+string(filepath.Separator), vsDir) {
-		return filepath.Join(fs.dataDir, bucket, ".vs", "invalid-version")
+	if p, ok := fs.containedPath(bucket, ".vs", key, versionID); ok {
+		return p
 	}
-	return p
+	if bp, ok := fs.containedPath(bucket, ".vs"); ok {
+		return filepath.Join(bp, "invalid-version")
+	}
+	return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-version")
 }
 
+// CreateBucketDir refuses a name that resolves outside the data directory rather
+// than quarantining it, so a caller that skipped validation gets told instead of
+// silently writing into a directory nobody asked for.
 func (fs *FileSystem) CreateBucketDir(bucket string) error {
-	return os.MkdirAll(fs.bucketPath(bucket), 0755)
+	p, ok := fs.containedPath(bucket)
+	if !ok {
+		return fmt.Errorf("storage: refusing bucket %q: it resolves outside the data directory", bucket)
+	}
+	return os.MkdirAll(p, 0755)
 }
 
+// DeleteBucketDir refuses an escaping name for the same reason CreateBucketDir
+// does, and more urgently: this one is os.RemoveAll, so resolving outside the
+// data directory would recursively delete something that is not ours.
 func (fs *FileSystem) DeleteBucketDir(bucket string) error {
-	return os.RemoveAll(fs.bucketPath(bucket))
+	p, ok := fs.containedPath(bucket)
+	if !ok {
+		return fmt.Errorf("storage: refusing to delete bucket %q: it resolves outside the data directory", bucket)
+	}
+	return os.RemoveAll(p)
 }
 
 func (fs *FileSystem) PutObject(bucket, key string, reader io.Reader, size int64) (int64, string, error) {

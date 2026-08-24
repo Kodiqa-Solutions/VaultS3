@@ -1,11 +1,46 @@
 name: CI
 
+# Documentation-only changes skip this workflow entirely. Nothing here reads a
+# markdown file: no .md is embedded in the binary (checked), none is copied into
+# the image, and no job publishes DOCKERHUB.md. Before this filter a README edit
+# ran the full build, test, vulncheck and lint, and then republished
+# eniz1806/vaults3:latest, handing every `:latest` user a new image digest for a
+# change to a sentence. The docs now live in docs/ as separate files, so doc-only
+# commits are common rather than rare.
+#
+# Kept deliberately narrow: only prose and images. deploy/ is NOT excluded, since
+# a chart is infrastructure and a future helm-lint job should run against it.
+#
+# Safe because main has no branch protection and no required status checks, so a
+# skipped run cannot strand a pull request waiting for a check that never reports.
+# If required checks are ever turned on, this needs the companion-workflow pattern
+# instead, or a docs-only PR will block forever.
 on:
   push:
     branches: [main]
     tags: ['v*']
+    # Listed twice rather than via a YAML anchor: GitHub Actions does not
+    # officially support anchors in workflow files, and a silently mis-parsed
+    # trigger is a worse outcome than seven duplicated lines. Keep the two lists
+    # identical.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'assets/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'assets/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
 
 jobs:
   build-and-test:

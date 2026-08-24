@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1060,6 +1061,20 @@ func (h *ObjectHandler) deleteOneObject(bucket, key, versionID, versioning strin
 // deleteObjectVersion removes one version permanently and repoints "latest" if
 // that version was the current one.
 func (h *ObjectHandler) deleteObjectVersion(bucket, key, versionID string, bypassGovernance bool) (objectDeletion, error) {
+	// Version "null" names an object stored before its bucket was versioned. Its
+	// bytes sit at the ordinary object path, NOT under .vs/, so the version-aware
+	// delete below finds nothing to remove while the metadata still goes away.
+	// That left the file on disk with no record pointing at it: an orphan of the
+	// same kind as issue #47, and a bucket that could never be deleted because
+	// DeleteBucket asks the storage engine, not the index, whether it is empty.
+	//
+	// Deleting the null version of such an object is simply deleting the object,
+	// which is what S3 does.
+	if versionID == nullVersionID {
+		if meta, err := h.store.GetObjectMeta(bucket, key); err == nil && meta != nil && meta.VersionID == "" {
+			return h.deleteCurrentObject(bucket, key, bypassGovernance)
+		}
+	}
 	if err := h.checkObjectLock(bucket, key, versionID, bypassGovernance); err != nil {
 		return objectDeletion{}, &deleteRefused{err: err}
 	}
@@ -1704,6 +1719,56 @@ func (h *ObjectHandler) DeleteObjectTagging(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+// nullVersionID is the version id S3 reports for an object stored before its
+// bucket had versioning enabled.
+const nullVersionID = "null"
+
+// listNullVersions returns the objects that predate versioning on this bucket,
+// which S3 reports as the version id "null". They are the entries in the
+// latest-pointer index that carry no version id: an object written while
+// versioning was enabled always has one.
+//
+// A delete marker is never a null version, so those are skipped.
+func (h *ObjectHandler) listNullVersions(bucket, prefix, keyMarker, versionMarker string, maxKeys int) ([]metadata.ObjectMeta, bool, error) {
+	// A version-id marker only makes sense once a key marker names the key it
+	// belongs to, and "null" sorts as its own single version, so a request that
+	// resumes past a specific version has already passed the null one.
+	startAfter := keyMarker
+	if keyMarker != "" && versionMarker != "" && versionMarker != nullVersionID {
+		startAfter = keyMarker
+	}
+
+	latest, truncated, err := h.store.ListLatestObjects(bucket, prefix, startAfter, maxKeys)
+	if err != nil {
+		return nil, false, err
+	}
+
+	out := make([]metadata.ObjectMeta, 0, len(latest))
+	for _, m := range latest {
+		if m.VersionID != "" || m.DeleteMarker {
+			continue // a real version, or a marker: already covered above
+		}
+		m.VersionID = nullVersionID
+		m.IsLatest = true
+		out = append(out, m)
+	}
+	return out, truncated, nil
+}
+
+// sortVersionsForListing puts the merged list back into the order S3 promises:
+// by key, and within a key the latest version first.
+func sortVersionsForListing(versions []metadata.ObjectMeta) {
+	sort.SliceStable(versions, func(i, j int) bool {
+		if versions[i].Key != versions[j].Key {
+			return versions[i].Key < versions[j].Key
+		}
+		if versions[i].IsLatest != versions[j].IsLatest {
+			return versions[i].IsLatest
+		}
+		return versions[i].LastModified > versions[j].LastModified
+	})
+}
+
 // ListObjectVersions handles GET /{bucket}?versions.
 func (h *ObjectHandler) ListObjectVersions(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.store.BucketExists(bucket) {
@@ -1727,6 +1792,29 @@ func (h *ObjectHandler) ListObjectVersions(w http.ResponseWriter, r *http.Reques
 		slog.Error("internal error", "error", err)
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 		return
+	}
+
+	// Objects written while a bucket was NOT versioned have no version record at
+	// all: they live only in the latest-pointer index with an empty VersionID.
+	// S3 still lists them here, as a version whose id is the literal "null".
+	//
+	// Returning nothing for them is not a cosmetic gap. ListObjectVersions is how
+	// tools enumerate a bucket in order to empty it, so a caller saw an empty
+	// bucket, deleted nothing, and then could not delete the bucket either. The
+	// ceph/s3-tests fixture does exactly that, which is how this was found: one
+	// undeletable bucket failed the setup of every following test.
+	nullVersions, nullTruncated, err := h.listNullVersions(bucket, prefix, keyMarker, versionMarker, maxKeys)
+	if err != nil {
+		slog.Error("internal error", "error", err)
+		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		return
+	}
+	versions = append(versions, nullVersions...)
+	truncated = truncated || nullTruncated
+	sortVersionsForListing(versions)
+	if len(versions) > maxKeys {
+		versions = versions[:maxKeys]
+		truncated = true
 	}
 
 	type xmlVersion struct {

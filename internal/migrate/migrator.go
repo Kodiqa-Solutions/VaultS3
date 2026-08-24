@@ -233,13 +233,28 @@ func (m *Manager) run(ctx context.Context, src *Source, job *Job, concurrency in
 			m.markCancelled(job)
 			return
 		}
+		// These names come from a REMOTE endpoint the user pointed at, not from
+		// our own API, so they have had no validation at all. CreateBucket here
+		// is the metadata store's, which does not apply the S3 naming rules that
+		// PUT /{bucket} does. A name like "../evil" used to reach the filesystem
+		// engine and create a directory outside the data directory.
+		if !storage.IsSafeBucketName(bucket) {
+			m.setError(job, fmt.Sprintf("source bucket %q is not a usable name: it resolves outside the data directory", bucket))
+			return
+		}
 		if !m.store.BucketExists(bucket) {
 			if err := m.store.CreateBucket(bucket); err != nil {
 				m.setError(job, fmt.Sprintf("create bucket %s: %v", bucket, err))
 				return
 			}
 		}
-		m.engine.CreateBucketDir(bucket)
+		// Not discarded: the engine refuses a name that resolves outside the data
+		// directory, and continuing past that would migrate every object in this
+		// bucket into a path the engine already rejected.
+		if err := m.engine.CreateBucketDir(bucket); err != nil {
+			m.setError(job, fmt.Sprintf("create bucket dir %s: %v", bucket, err))
+			return
+		}
 
 		// Carry over the bucket's access policy and tags before the objects. This
 		// is the IAM/policies half of a migration; user/access-key migration is

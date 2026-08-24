@@ -114,9 +114,9 @@ Windows, an SPDX SBOM per platform, and a Sigstore provenance bundle you can
 verify offline:
 
 ```bash
-sudo apt install ./vaults3_4.4.63_amd64.deb
+sudo apt install ./vaults3_4.4.64_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_4.4.63_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_4.4.64_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart or a single
@@ -141,7 +141,7 @@ The short version. Each row links to the guide that covers it, and the
 | **Integrations** | Webhook, Kafka, NATS, Redis, AMQP, PostgreSQL and Elasticsearch notifications, lambda triggers, virus scanning. [Guide](docs/INTEGRATIONS.md) |
 | **Search** | Full-text over metadata and tags, plus optional semantic search and RAG retrieval with no external vector database. [Guide](docs/INTEGRATIONS.md#full-text-search) |
 | **Migrate in** | Import buckets from MinIO, SeaweedFS, Garage, Ceph, AWS, R2, Wasabi or B2, preserving dates, metadata, policies and tags |
-| **Operations** | Prometheus metrics, structured logs, health and readiness endpoints, pprof, `vaults3-cli` for day-2 work. [Guide](docs/CLI.md) |
+| **Operations** | Prometheus metrics, structured logs, health and readiness endpoints, pprof, `vaults3 diagnose` for bug reports, `vaults3-cli` for day-2 work. [Guide](docs/CLI.md) |
 
 ## Production Readiness
 
@@ -157,6 +157,8 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 | **Active-active replication** | 🟡 Beta | Vector-clock conflict resolution is unit-tested. The cross-site sync worker is less exercised in the wild. |
 
 **Security:** VaultS3 was reviewed by an external white-box security assessment in August 2026, which reported 14 findings. All are fixed in 4.4.56. See [SECURITY.md](SECURITY.md) for the summary and [CHANGELOG.md](CHANGELOG.md) for each finding. If you run an earlier version, upgrade and read the [upgrade notes](docs/UPGRADING.md#upgrading-to-4456-security-release).
+
+**S3 compatibility:** VaultS3 is measured against [ceph/s3-tests](https://github.com/ceph/s3-tests), the suite the rest of the object-storage world is tested with, rather than only against its own idea of the spec. CI gates on the tests it is expected to pass, and a weekly sweep runs the whole suite to find more to promote. The harness and the current baseline are in [scripts/s3-tests/](scripts/s3-tests/README.md).
 
 **Recommendation:** run single-node (optionally with erasure coding across local disks) for production data you care about, and treat clustering/active-active as advanced opt-in features you validate first. Always keep an independent backup. See the **[Scaling & Operations Guide](docs/SCALING.md)** for redundancy layering and recovery runbooks, and the **[Benchmarks guide](docs/BENCHMARKS.md)** for a reproducible way to measure throughput and RAM on your own hardware.
 

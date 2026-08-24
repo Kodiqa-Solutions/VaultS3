@@ -4,7 +4,38 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
-## [Unreleased]
+## [4.4.64] - 2026-08-24
+### Fixed
+- **`ListObjectVersions` returned nothing for a bucket that never had versioning
+  enabled.** S3 lists those objects with the version id `null`. VaultS3 read only
+  the version index, and an object written while a bucket was unversioned has no
+  entry there, so the call reported an empty bucket.
+
+  Not a cosmetic gap: `ListObjectVersions` is how tools enumerate a bucket in
+  order to empty it before deleting it. A caller saw nothing, deleted nothing,
+  and then got `BucketNotEmpty` from `DeleteBucket`, with no way to make progress.
+
+- **Deleting the `null` version of such an object orphaned its bytes.** The
+  version-aware delete looks under `.vs/`, but an object stored before versioning
+  keeps its bytes at the ordinary path, so the file survived while its metadata
+  was removed. Nothing referenced it afterwards, and because `DeleteBucket` asks
+  the storage engine rather than the index whether a bucket is empty, the bucket
+  could never be deleted. Same class as issue #47.
+
+- **A bucket name containing `..` escaped the data directory.** The filesystem
+  engine checked that a resolved path stayed under `<data-dir>/<bucket>`, but that
+  target contains the bucket name, so a bucket of `../evil` moved the goalpost
+  along with the ball and the check passed. Containment is now measured against
+  the data directory itself.
+
+  Not reachable through the S3 API, which validates bucket names on
+  `CreateBucket` and requires a bucket to exist for every object operation. It
+  was reachable through migration: bucket names there come from a remote
+  S3-compatible endpoint the user points at, and that path called the metadata
+  store directly without validation, then discarded the error from
+  `CreateBucketDir`. `DeleteBucketDir` was the sharper edge, since it is
+  `os.RemoveAll`. Found by a new fuzz target.
+
 ### Security
 - **The Go toolchain was pinned to a version with nine reachable standard-library
   vulnerabilities.** `go.mod` carried `toolchain go1.26.3`, and a toolchain
@@ -18,6 +49,36 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   dependency, so nothing in the manifest changes when it is wrong.
 
 ### Added
+- **S3 conformance testing against `ceph/s3-tests`.** VaultS3 advertises 80+ S3
+  operations and had no external check of that claim. Its own tests are written
+  against its own reading of the specification, so they cannot catch a misreading.
+
+  `scripts/s3-tests/` runs the upstream suite against a real server.
+  `implemented_tests.txt` lists the tests VaultS3 is expected to pass and CI gates
+  on exactly that list, so it is a regression gate from the first day rather than
+  a wall of failures nobody reads. A weekly sweep runs everything and reports which
+  additional tests now pass, so the list grows one promotion at a time.
+
+  The baseline is 192 gated tests of 838 collected, and the gate runs in about 12
+  seconds. The first run that got far enough to execute found the two bugs above.
+
+- **Fuzz targets for path containment**, run by `go test -fuzz` with no new
+  tooling. They assert that a bucket and key can never resolve outside the data
+  directory, and they found the bucket-name escape above. 19 million executions
+  across both targets found nothing further.
+
+- **`vaults3 diagnose`**, which prints the version and which optional subsystems
+  are enabled. It reads the config only, so it works when the server will not
+  start, and it prints no secrets, so the output can be pasted into a public
+  issue. Every difficult issue this year was slowed by not knowing this: #49 was
+  only reproduced after enabling storage wrappers one at a time, because the
+  reporter never mentioned encryption. The bug report template now asks for it
+  instead of asking people to redact a config by hand.
+
+  It also flags interactions that have already cost a round trip, such as
+  compression being a no-op under encryption, and warns when `cluster.secret` is
+  empty.
+
 - **`govulncheck` runs on every push and pull request.** Go's own scanner, which
   analyses whether vulnerable code is actually reachable rather than only
   comparing manifest versions. It found the toolchain problem above on its first
@@ -42,6 +103,12 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   distroless image that has no shell and no busybox at all.
 
 ### Changed
+- **Documentation-only changes no longer run CI.** Nothing in the workflow reads
+  a markdown file, yet a README edit ran the full build, test, vulncheck and lint,
+  and then republished `eniz1806/vaults3:latest`, handing every `:latest` user a
+  new image digest for a change to a sentence. Now that the docs live in `docs/`
+  as separate files, doc-only commits are common rather than rare.
+
 - **The server now warns when compression is enabled together with encryption at
   rest, instead of reporting "compression enabled" and quietly doing nothing.**
   Compression is wrapped first, which makes encryption the outer engine, so a
@@ -2193,7 +2260,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.51...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.64...HEAD
+[4.4.64]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.63...v4.4.64
 [4.4.63]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.62...v4.4.63
 [4.4.62]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.61...v4.4.62
 [4.4.61]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.60...v4.4.61

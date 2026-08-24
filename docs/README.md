@@ -34,6 +34,7 @@ for that release.
 | [Scaling and operations](SCALING.md) | Multi-disk erasure coding, cluster setup, large-prefix listing, lost-disk and lost-server recovery runbooks |
 | [Benchmarks](BENCHMARKS.md) | A reproducible way to measure throughput and RAM on your own hardware |
 | [Security hardening](HARDENING.md) | The measures built into the server |
+| [S3 conformance testing](../scripts/s3-tests/README.md) | How VaultS3 is measured against the ceph/s3-tests suite, and the current baseline |
 | [Upgrading](UPGRADING.md) | Release-to-release upgrade notes, including the 4.4.56 security release |
 
 ## Reference

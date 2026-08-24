@@ -23,6 +23,8 @@ func usage() {
 Usage:
   vaults3 [flags]          start the server
   vaults3 setup [flags]    write a config file and create its directories
+  vaults3 diagnose         print version and enabled subsystems, for bug reports
+  vaults3 healthcheck      probe this server's own /health, for container checks
   vaults3 help             show this message
 
 Flags:
@@ -39,6 +41,8 @@ func main() {
 			os.Exit(runSetup(os.Args[2:]))
 		case "healthcheck":
 			os.Exit(runHealthcheck(os.Args[2:]))
+		case "diagnose":
+			os.Exit(runDiagnose(os.Args[2:]))
 		case "help", "-h", "--help":
 			usage()
 			os.Exit(0)

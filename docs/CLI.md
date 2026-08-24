@@ -62,6 +62,50 @@ vaults3-cli cluster shards                     # how object metadata is distribu
 Build both binaries with `make build` or just the CLI with `make cli`.
 
 
+## Server subcommands
+
+The server binary carries a few commands of its own, separate from `vaults3-cli`.
+
+### `vaults3 diagnose`
+
+Prints the version and which optional subsystems are switched on. That is usually
+what decides whether a bug reproduces, and it is the thing a bug report most often
+leaves out.
+
+```bash
+vaults3 diagnose                              # package or binary install
+docker exec <container> vaults3 diagnose      # Docker, container running
+docker run --rm -v /your/vaults3.yaml:/etc/vaults3/vaults3.yaml \
+  eniz1806/vaults3 diagnose                   # Docker, container will not start
+```
+
+It reads the config only and never contacts the server, so it works on a machine
+where the server refuses to start, which is when it is needed most. With no
+`-config` it looks for `configs/vaults3.yaml` then `/etc/vaults3/vaults3.yaml`.
+
+No secrets are printed. Keys, tokens and the cluster secret are reduced to whether
+they are set, so the output can go into a public issue without redaction. Add
+`-json` for a machine-readable form.
+
+It also flags interactions worth knowing about, such as compression being a no-op
+while encryption is enabled, or `cluster.secret` being empty.
+
+### `vaults3 healthcheck`
+
+Probes the server's own `/health` and exits 0 when it answers, 1 when it does not,
+and 2 on a usage error. The container image uses it, so the image needs no shell
+or HTTP client to report liveness. It follows the config, so a changed port, a
+reverse-proxy base path or TLS are honoured rather than assumed.
+
+```bash
+vaults3 healthcheck -config /etc/vaults3/vaults3.yaml
+```
+
+### `vaults3 setup`
+
+Asks a few questions, creates the directories and writes a config containing only
+what you chose. See the [installation guide](INSTALL.md).
+
 ## Test with mc (MinIO Client)
 
 ```bash
