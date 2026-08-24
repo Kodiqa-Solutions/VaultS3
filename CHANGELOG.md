@@ -42,6 +42,18 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   distroless image that has no shell and no busybox at all.
 
 ### Changed
+- **The server now warns when compression is enabled together with encryption at
+  rest, instead of reporting "compression enabled" and quietly doing nothing.**
+  Compression is wrapped first, which makes encryption the outer engine, so a
+  write is encrypted and only then handed to the compressor. Ciphertext does not
+  compress, measured at 1.00x on a highly repetitive payload, and the CPU is spent
+  anyway. The docs said "pick one" but the running server said "compression
+  enabled" and nothing else, so an operator had no way to learn it from the log.
+
+  The warning names which layer is responsible and how much it affects, because
+  per-bucket encryption is the one case that is not total: a bucket that never
+  opted in is stored as plaintext and still compresses. Fixing the layering itself
+  would change the on-disk format, so it stays a separate change.
 - **The README was split into `docs/`.** It had grown to 2,019 lines and 121 KB,
   and 58% of that sat under one heading: `Quick Start` held 40 subsections
   covering FUSE mounts, S3 Select, tiering, backups and rate limiting, so a

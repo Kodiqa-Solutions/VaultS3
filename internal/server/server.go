@@ -184,6 +184,33 @@ type Server struct {
 	reapElsewhere func(bucket, key, versionID string)
 }
 
+// compressionDefeatedBy reports which encryption layer stops an enabled compressor
+// from achieving anything, and how much of the data it affects. It returns empty
+// strings when compression is off, when encryption is off, or when the two do not
+// collide.
+//
+// Encryption wraps compression (see the engine layering in New), so a write is
+// encrypted first and the compressor only ever sees ciphertext, which does not
+// compress: measured 1.00x on a highly repetitive payload. The operator still pays
+// the CPU, so this is worth saying out loud instead of the usual "compression
+// enabled" line.
+//
+// Per-bucket encryption is the one case that is not total. A bucket that never
+// opted in is stored as plaintext, so its objects still compress normally.
+func compressionDefeatedBy(cfg *config.Config) (by, scope string) {
+	if !cfg.Compression.Enabled || !cfg.Encryption.Enabled {
+		return "", ""
+	}
+	switch {
+	case cfg.Encryption.PerBucket:
+		return "per-bucket encryption", "objects in buckets that opted into encryption"
+	case cfg.Encryption.KMS.Enabled:
+		return "SSE-KMS encryption", "any object"
+	default:
+		return "SSE-S3 encryption", "any object"
+	}
+}
+
 func New(cfg *config.Config) (*Server, error) {
 	// Initialize storage engine
 	fs, err := storage.NewFileSystem(cfg.Storage.DataDir)
@@ -205,7 +232,14 @@ func New(cfg *config.Config) (*Server, error) {
 		engine = storage.NewCompressedEngine(engine)
 		// Writes are zstd; gzip is still decoded on read for objects written by
 		// older versions. The log said "gzip" long after that stopped being true.
-		slog.Info("compression enabled", "algorithm", "zstd", "reads", "zstd+gzip")
+		if by, scope := compressionDefeatedBy(cfg); by != "" {
+			slog.Warn("compression is enabled but will not compress "+scope+": "+by+
+				" wraps compression, so the compressor is handed ciphertext, which does not compress. "+
+				"The CPU cost is still paid. Disable compression, or disable encryption at rest",
+				"algorithm", "zstd", "defeated_by", by, "affects", scope)
+		} else {
+			slog.Info("compression enabled", "algorithm", "zstd", "reads", "zstd+gzip")
+		}
 	}
 
 	// Wrap with encryption if enabled (SSE-S3 or SSE-KMS)
