@@ -234,3 +234,62 @@ func TestStatusWriter(t *testing.T) {
 		t.Errorf("underlying writer should also get 404, got %d", rr.Code)
 	}
 }
+
+// A bucket with no CORS configuration makes the store return (nil, nil), which
+// is how it reports "not configured". Three call sites ranged straight over
+// cfg.Rules and panicked on it. This one is the worst of them: addCORSHeaders
+// runs before authentication, so any unauthenticated request carrying an Origin
+// header reached it. Found on production, where internet scanners probing
+// /wp-json/wp/v2/users panicked the handler three times in one day.
+func TestCORSHeadersOnABucketWithNoCORSConfigDoesNotPanic(t *testing.T) {
+	h := newTestHandler(t)
+	if err := h.store.CreateBucket("plain"); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/plain/some-key", nil)
+	req.Header.Set("Origin", "https://example.com")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req) // panicked here before the fix
+
+	// Unauthenticated, so it must still be refused rather than served.
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("allowed an origin with no CORS config: %q", got)
+	}
+}
+
+// The bucket does not even have to exist: the panic came before any lookup that
+// would have rejected it, so a scanner inventing a path was enough.
+func TestCORSHeadersOnAMissingBucketDoesNotPanic(t *testing.T) {
+	h := newTestHandler(t)
+	req := httptest.NewRequest(http.MethodGet, "/wp-json/wp/v2/users", nil)
+	req.Header.Set("Origin", "https://example.com")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code == http.StatusInternalServerError {
+		t.Errorf("status = %d, a recovered panic", w.Code)
+	}
+}
+
+// The preflight path reads the same nil.
+func TestCORSPreflightOnABucketWithNoCORSConfigDoesNotPanic(t *testing.T) {
+	h := newTestHandler(t)
+	if err := h.store.CreateBucket("plain"); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodOptions, "/plain/some-key", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	w := httptest.NewRecorder()
+
+	h.handleCORSPreflight(w, req, "plain") // panicked here before the fix
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d for a bucket with no CORS rules", w.Code, http.StatusForbidden)
+	}
+}

@@ -4,6 +4,26 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.66] - 2026-08-26
+### Fixed
+- **An unauthenticated request could panic the S3 handler.** A bucket with no CORS
+  configuration makes the metadata store return `(nil, nil)`, which is how it
+  reports "not configured" rather than an error. Three call sites ranged straight
+  over `cfg.Rules` and dereferenced that nil.
+
+  The worst of them, `addCORSHeaders`, runs *before* authentication, so any
+  anonymous request carrying an `Origin` header and any bucket-shaped path was
+  enough. The panic recovery middleware caught it, so the server never fell over,
+  but every such request cost a recovered panic and a stack trace in the log.
+
+  Found on the production instance, where internet scanners probing
+  `/wp-json/wp/v2/users` triggered it three times in a single day. The other two
+  paths, the CORS preflight handler and `GET /{bucket}?cors`, panicked on the
+  same nil for buckets that had simply never been given a CORS policy. All three
+  are guarded now, `GET /{bucket}?cors` correctly answers
+  `NoSuchCORSConfiguration`, and the store documents the nil contract so the next
+  caller does not repeat it.
+
 ## [4.4.65] - 2026-08-26
 ### Security
 - **Bumped `klauspost/compress` from 1.18.2 to 1.18.7**, closing an out-of-bounds
@@ -2314,7 +2334,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.65...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.66...HEAD
+[4.4.66]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.65...v4.4.66
 [4.4.65]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.64...v4.4.65
 [4.4.64]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.63...v4.4.64
 [4.4.63]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.62...v4.4.63

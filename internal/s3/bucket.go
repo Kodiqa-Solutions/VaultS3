@@ -690,8 +690,11 @@ func (h *BucketHandler) GetBucketCORS(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
+	// nil means the bucket has no CORS configuration. S3 answers that with
+	// NoSuchCORSConfiguration, the same as a read failure, and ranging over the
+	// nil would panic.
 	cfg, err := h.store.GetCORSConfig(bucket)
-	if err != nil {
+	if err != nil || cfg == nil {
 		writeS3Error(w, "NoSuchCORSConfiguration", "No CORS configuration", http.StatusNotFound)
 		return
 	}

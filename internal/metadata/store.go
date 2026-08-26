@@ -2197,6 +2197,10 @@ func (s *Store) PutCORSConfig(bucket string, cfg CORSConfig) error {
 	})
 }
 
+// GetCORSConfig returns the bucket's CORS configuration, or (nil, nil) when the
+// bucket has none. A nil config is not an error, so every caller has to check it
+// separately: three of them once ranged straight over cfg.Rules and panicked on
+// buckets that had never been given a CORS policy.
 func (s *Store) GetCORSConfig(bucket string) (*CORSConfig, error) {
 	var cfg *CORSConfig
 	err := s.db.View(func(tx *bolt.Tx) error {

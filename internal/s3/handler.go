@@ -1053,8 +1053,10 @@ func formatResource(bucket, key string) string {
 
 // handleCORSPreflight handles OPTIONS requests for CORS preflight.
 func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request, bucket string) {
+	// nil means the bucket has no CORS configuration, which is a refusal here
+	// rather than an error, and must not be ranged over.
 	cfg, err := h.store.GetCORSConfig(bucket)
-	if err != nil {
+	if err != nil || cfg == nil {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -1092,8 +1094,11 @@ func (h *Handler) addCORSHeaders(w http.ResponseWriter, r *http.Request, bucket 
 		return
 	}
 
+	// A bucket with no CORS configuration yields (nil, nil), not an error, so
+	// the nil has to be checked separately or this ranges over a nil pointer.
+	// This runs before authentication, so anonymous traffic reaches it.
 	cfg, err := h.store.GetCORSConfig(bucket)
-	if err != nil {
+	if err != nil || cfg == nil {
 		return
 	}
 

@@ -4,8 +4,8 @@ description: Lightweight S3-compatible object storage with a built-in dashboard 
 type: application
 # version  = the chart version (bump on chart changes)
 # appVersion = the VaultS3 image tag this chart defaults to
-version: 0.1.26
-appVersion: "4.4.65"
+version: 0.1.27
+appVersion: "4.4.66"
 home: https://github.com/Kodiqa-Solutions/VaultS3
 sources:
   - https://github.com/Kodiqa-Solutions/VaultS3
