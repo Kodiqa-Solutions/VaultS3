@@ -64,10 +64,14 @@ config: |
     admin_secret_key: ""
   compression:
     enabled: false
+  # Per-IP limits key on the connection address, and behind an ingress every
+  # client shares it, so the ceiling is set well above real traffic.
   rate_limit:
     enabled: true
-    requests_per_sec: 200
-    burst_size: 400
+    requests_per_sec: 2000
+    burst_size: 4000
+    per_key_rps: 2000
+    per_key_burst: 4000
 
 # Buckets created on startup if they are missing, so the release needs no init
 # container or S3 client to get its first bucket. Existing buckets are left

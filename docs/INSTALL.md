@@ -19,11 +19,11 @@ RPM, DEB and APK packages are attached to every [release](https://github.com/Kod
 
 ```bash
 # Debian or Ubuntu
-sudo apt install ./vaults3_4.4.64_amd64.deb
+sudo apt install ./vaults3_4.4.65_amd64.deb
 # RHEL, Rocky or Fedora
-sudo rpm -i vaults3-4.4.64-1.x86_64.rpm
+sudo rpm -i vaults3-4.4.65-1.x86_64.rpm
 # Alpine
-sudo apk add --allow-untrusted vaults3_4.4.64_x86_64.apk
+sudo apk add --allow-untrusted vaults3_4.4.65_x86_64.apk
 
 sudo systemctl enable --now vaults3
 journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
@@ -32,7 +32,7 @@ journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
 Every release also ships an SPDX SBOM per platform, generated from the binary so it lists the modules actually compiled in, and a Sigstore provenance bundle attached as an asset, so a download can be verified against the workflow run and commit that produced it, offline or from a mirror:
 
 ```bash
-gh attestation verify vaults3_4.4.64_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_4.4.65_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 ## Build from source

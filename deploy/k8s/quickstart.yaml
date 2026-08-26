@@ -44,10 +44,14 @@ data:
       # generates one on first start and prints it once.
       admin_access_key: "vaults3-admin"
       admin_secret_key: ""
+    # Per-IP limits key on the connection address, and behind an ingress every
+    # client shares it, so the ceiling is set well above real traffic.
     rate_limit:
       enabled: true
-      requests_per_sec: 200
-      burst_size: 400
+      requests_per_sec: 2000
+      burst_size: 4000
+      per_key_rps: 2000
+      per_key_burst: 4000
 ---
 apiVersion: v1
 kind: Service

@@ -37,6 +37,27 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Upgrading to 4.4.65
+
+**Rate limiting is now on by default.** Nothing is required of you, but it is a
+behaviour change worth knowing about:
+
+- If your `vaults3.yaml` already has a `rate_limit` block, it is respected
+  exactly as written. An explicit `enabled: false` still turns it off.
+- If your config has no `rate_limit` block, or you run with no config file at
+  all, you now get 2000 requests per second per IP and per access key, with a
+  4000 burst.
+- Docker users who do not mount their own config pick up the new defaults with
+  the new image. The Helm chart and the Kubernetes manifests already enabled
+  rate limiting and move from 200 to the same 2000.
+
+The ceiling is set far above real traffic: a saturating 8-thread `boto3` client
+measures around 1300 requests per second, comfortably inside it. If you push
+more than that through a single endpoint, or you sit behind a reverse proxy
+where every client shares one address for limiting purposes, raise
+`rate_limit.requests_per_sec` to suit. See
+[rate limiting](CONFIGURATION.md#rate-limiting).
+
 ## Upgrading to 4.4.56 (security release)
 
 **This release closes 14 findings from an external security assessment, several

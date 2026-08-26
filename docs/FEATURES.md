@@ -17,7 +17,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **SSE-C (customer-provided keys)**: Operator-blind per-object encryption: the client supplies the key per request (`x-amz-server-side-encryption-customer-*`). The server encrypts/decrypts with it and stores only the key's MD5, never the key
 - **Bucket policies**: Public-read, private, custom S3-compatible JSON policies. Supports the standard AWS `Principal` forms (`"*"`, `{"AWS": "*"}`, `{"AWS": ["*"]}`), wildcard actions, explicit `Deny` precedence, and per-bucket `Resource` matching. Granting `s3:GetObject` to everyone makes objects publicly readable and `s3:ListBucket` makes the listing public, as separate permissions. Bucket sub-resources (`?policy`, `?acl`, ...) always require authentication. **Public Access Block** (`BlockPublicPolicy` / `RestrictPublicBuckets`) overrides any policy and blocks anonymous access
 - **Quota management**: Per-bucket size and object count limits
-- **Rate limiting**: Token bucket rate limiter per client IP and per access key to prevent abuse
+- **Rate limiting**: Token bucket rate limiter per client IP and per access key to prevent abuse, enabled by default with a ceiling well above normal client traffic
 - **S3 Select**: Execute SQL queries on CSV, JSON, and Parquet objects without downloading the full file
 - **Multipart upload**: Full lifecycle (Create, UploadPart, UploadPartCopy, Complete, Abort, ListUploads, ListParts)
 - **Bucket tagging**: S3-compatible tag sets with PUT/GET/DELETE

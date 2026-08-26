@@ -45,7 +45,7 @@ S3 API: `http://localhost:9000`
 - **Lambda triggers** -- webhook functions on S3 events
 - **Batch operations** -- bulk delete and copy processor
 - **Orphan reclaim** -- `vaults3-cli storage reclaim` frees data files that no metadata refers to, across every node
-- **Rate limiting** -- per-IP and per-access-key token bucket
+- **Rate limiting** -- per-IP and per-access-key token bucket, on by default
 - **Auto-TLS** -- Let's Encrypt with self-signed fallback
 - **PROXY protocol** -- real client IP behind load balancers
 - **Prometheus metrics** -- per-bucket request counts, bytes, errors at `/metrics`

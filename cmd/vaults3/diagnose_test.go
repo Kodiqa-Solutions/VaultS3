@@ -10,13 +10,27 @@ import (
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 )
 
-func TestDiagnoseDefaultConfigReportsNothingEnabled(t *testing.T) {
+// Rate limiting is the one subsystem a default install runs, so it is the whole
+// expected baseline. Pinning the exact list means any future default that is
+// silently flipped on shows up here rather than in a user's bug report.
+func TestDiagnoseDefaultConfigReportsOnlyRateLimiting(t *testing.T) {
 	d := buildDiagnosis(config.Defaults(), "4.4.63", "")
-	if len(d.Enabled) != 0 {
-		t.Fatalf("default config reported %v enabled, want none", d.Enabled)
+	if len(d.Enabled) != 1 || d.Enabled[0] != "rate limiting" {
+		t.Fatalf("default config reported %v enabled, want exactly [rate limiting]", d.Enabled)
 	}
 	if d.ConfigFile != "(none, using built-in defaults)" {
 		t.Errorf("ConfigFile = %q", d.ConfigFile)
+	}
+}
+
+// The "nothing enabled" wording still has to be reachable, for an operator who
+// turned the one default off.
+func TestDiagnoseReportsAPlainDeploymentWhenNothingIsOn(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.RateLimit.Enabled = false
+	d := buildDiagnosis(cfg, "4.4.63", "")
+	if len(d.Enabled) != 0 {
+		t.Fatalf("reported %v enabled, want none", d.Enabled)
 	}
 	if !strings.Contains(d.text(), "plain default deployment") {
 		t.Error("text should say this is a plain default deployment")

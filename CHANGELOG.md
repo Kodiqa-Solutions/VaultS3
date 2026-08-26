@@ -4,6 +4,60 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.65] - 2026-08-26
+### Security
+- **Bumped `klauspost/compress` from 1.18.2 to 1.18.7**, closing an out-of-bounds
+  read in its `s2` decompressor (GO-2026-5841, reported by Docker Scout as
+  GHSA-259r-337f-4rfw). VaultS3 uses this module for zstd compression and never
+  calls the affected `s2` code, so no released version was exploitable through
+  it, and `govulncheck` reported zero reachable vulnerabilities before and after.
+  The bump removes it from image scans regardless, since an unfixable finding in
+  a scan report is noise that hides the next real one.
+
+  Two findings remain in the image scan, both by design. `GO-2026-5932` flags
+  `golang.org/x/crypto/openpgp` as unmaintained: it has no fixed version, and
+  VaultS3 does not import it. `CVE-2025-60876` is in the base image's busybox
+  `wget`, which the image no longer uses for anything: the container health check
+  runs `vaults3 healthcheck` instead, so no shell or HTTP client is invoked.
+
+### Changed
+- **Rate limiting is now on by default**, at a ceiling far above real client
+  traffic: 2000 requests per second per IP and per access key, with a 4000
+  burst. An unauthenticated request is rate limited *before* it is
+  authenticated, so on a server reachable from the internet the limiter is the
+  only thing bounding what a flood costs. Scanners find a newly exposed
+  endpoint within seconds of it going up.
+
+  The ceiling was chosen by measurement rather than by feel. A saturating
+  8-thread `boto3` client runs at roughly 1300 requests per second, comfortably
+  inside the limit, while a 64-thread flood attempting 4455 requests per second
+  is cut off. The previously shipped numbers, 100 per IP and 50 per key, would
+  have throttled that same legitimate client to 48 requests per second, a 24x
+  reduction, which is why they were never safe to enable by default.
+
+  This matters most behind a proxy: the per-IP bucket keys on the connection's
+  real address, not the forgeable `X-Forwarded-For`, so every client behind an
+  nginx or Kubernetes ingress shares one bucket. A low ceiling would have
+  throttled an entire deployment at once. Helm and the Kubernetes manifests,
+  which already enabled rate limiting at 200 per second, move to the same
+  numbers.
+
+  Set `rate_limit.enabled: false` to turn it off. An explicit `false` in a
+  config file still wins over the new default, and is covered by a test.
+
+### Fixed
+- **The S3 conformance workflow could not build the server.** It ran a bare
+  `go build`, but the binary embeds the dashboard from `internal/dashboard/dist`,
+  which only exists after the web build, so a clean checkout failed with
+  `pattern all:dist: no matching files found`. It passed locally only because a
+  previous build had left that directory behind.
+
+  It now writes a stub there instead of building the real frontend: this job
+  drives the S3 API and never opens the dashboard, so building React would add
+  minutes per run to embed assets nothing requests. `ci.yml` still builds and
+  tests the dashboard properly. The failure-log step is guarded too, so a build
+  failure no longer produces a second, misleading error about a missing log.
+
 ## [4.4.64] - 2026-08-24
 ### Fixed
 - **`ListObjectVersions` returned nothing for a bucket that never had versioning
@@ -2260,7 +2314,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.64...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.65...HEAD
+[4.4.65]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.64...v4.4.65
 [4.4.64]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.63...v4.4.64
 [4.4.63]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.62...v4.4.63
 [4.4.62]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.61...v4.4.62

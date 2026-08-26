@@ -14,7 +14,7 @@ VaultS3 is designed with security in mind:
 - **Path traversal protection**: `..` segments rejected at S3, API, versioning API, CopyObject/UploadPartCopy source, and filesystem layers
 - **SSRF prevention**: webhook, lambda, and notification URLs blocked from targeting localhost, private IPs, and cloud metadata endpoints
 - **Upload size limits**: 5GB per PUT (S3 spec), enforced with `http.MaxBytesReader`
-- **Rate limiting**: per-IP token bucket using `RemoteAddr` (not spoofable via `X-Forwarded-For`)
+- **Rate limiting**: per-IP and per-access-key token bucket, **on by default** (2000 req/s, 4000 burst), using `RemoteAddr` (not spoofable via `X-Forwarded-For`). The ceiling sits far above real client traffic so it bounds a flood without throttling legitimate use. Because the per-IP bucket keys on the connection address, every client behind a reverse proxy or ingress shares one bucket: raise `requests_per_sec` in that setup rather than lowering it
 - **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault / local key) modes
 - **IAM with default-deny**: policy evaluation engine with wildcard matching
 - **Security headers**: CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy

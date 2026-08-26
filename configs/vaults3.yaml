@@ -166,12 +166,17 @@ tiering:
   migrate_after_days: 30
   scan_interval_secs: 3600
 
+# On by default. The ceiling is far above what a real client sends, so it bounds
+# a flood without throttling anything legitimate. Note the per-IP limit uses the
+# connection's real address, not X-Forwarded-For (which a caller can forge), so
+# behind a reverse proxy every client counts against the proxy's address: raise
+# requests_per_sec rather than lowering it in that setup.
 rate_limit:
-  enabled: false
-  requests_per_sec: 100   # per IP
-  burst_size: 200
-  per_key_rps: 50         # per access key
-  per_key_burst: 100
+  enabled: true
+  requests_per_sec: 2000  # per IP
+  burst_size: 4000
+  per_key_rps: 2000       # per access key
+  per_key_burst: 4000
 
 backup:
   enabled: false

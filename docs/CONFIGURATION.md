@@ -224,18 +224,22 @@ These complement the existing global metrics and per-bucket storage metrics, ena
 
 ## Rate Limiting
 
-Protect against abuse and DDoS with token bucket rate limiting:
+Token bucket rate limiting is **on by default**, because an unauthenticated request is rate limited before it is authenticated, so the limiter is the only thing bounding what a flood costs the server:
 
 ```yaml
 rate_limit:
   enabled: true
-  requests_per_sec: 100   # per client IP
-  burst_size: 200
-  per_key_rps: 50         # per access key
-  per_key_burst: 100
+  requests_per_sec: 2000  # per client IP
+  burst_size: 4000
+  per_key_rps: 2000       # per access key
+  per_key_burst: 4000
 ```
 
-When enabled, each client IP and access key gets an independent token bucket. Requests exceeding the limit receive `429 Too Many Requests` with a `Retry-After: 1` header. Stale buckets are cleaned up after 5 minutes of inactivity.
+Each client IP and access key gets an independent token bucket. Requests exceeding the limit receive `429 Too Many Requests` with a `Retry-After: 1` header, which S3 SDKs retry automatically. Stale buckets are cleaned up after 5 minutes of inactivity.
+
+The defaults sit far above what a real client sends: a saturating 8-thread `boto3` client measures around 1300 requests per second, well inside the ceiling, while a 64-thread flood is cut off. Set `enabled: false` to turn it off entirely.
+
+**Behind a reverse proxy**, the per-IP bucket keys on the connection's real address rather than `X-Forwarded-For`, since a caller can forge that header. Every client arriving through nginx or a Kubernetes ingress therefore shares a single per-IP bucket. Raise `requests_per_sec` to cover your combined traffic in that setup, and rely on `per_key_rps` for per-tenant fairness.
 
 ```bash
 # Check rate limiter status

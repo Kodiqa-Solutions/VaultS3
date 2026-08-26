@@ -500,11 +500,21 @@ func parse(data []byte) (*Config, error) {
 			ScheduleCron:  "0 2 * * *",
 			RetentionDays: 30,
 		},
+		// On by default. A server reachable from the internet is found by
+		// scanners within seconds, and an unauthenticated flood is answered
+		// before authentication runs, so the limiter is the only thing bounding
+		// what it costs us. The ceiling is set far above what a real client
+		// sends (measured: a saturating 8-thread boto3 client runs at ~1300
+		// req/s) so enabling it by default throttles abuse and nothing else.
+		// It is also per-IP on RemoteAddr, and behind a reverse proxy every
+		// client shares that address, so a low ceiling here would throttle a
+		// whole deployment at once.
 		RateLimit: RateLimitConfig{
-			RequestsPerSec: 100,
-			BurstSize:      200,
-			PerKeyRPS:      50,
-			PerKeyBurst:    100,
+			Enabled:        true,
+			RequestsPerSec: 2000,
+			BurstSize:      4000,
+			PerKeyRPS:      2000,
+			PerKeyBurst:    4000,
 		},
 		OIDC: OIDCConfig{
 			JWKSCacheSecs: 3600,

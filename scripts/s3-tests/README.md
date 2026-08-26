@@ -53,7 +53,8 @@ Captured 2026-08-24 against a single node with default settings:
 | failing | 155 |
 | errored | 492 |
 
-The gate runs in about 12 seconds. The tests outside the whitelist are a mix of
+The gate takes about 13 seconds locally and about 28 seconds on a GitHub
+runner, inside a job of roughly two minutes. The tests outside the whitelist are a mix of
 features VaultS3 does not implement (ACL-based authorization, several SSE-KMS
 variants, RGW-specific behaviour) and genuine gaps worth fixing. The sweep is how
 they get triaged, one promotion at a time.

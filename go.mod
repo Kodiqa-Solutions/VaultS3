@@ -10,7 +10,7 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/klauspost/compress v1.18.2
+	github.com/klauspost/compress v1.18.7
 	github.com/klauspost/reedsolomon v1.13.2
 	github.com/lib/pq v1.11.2
 	github.com/nats-io/nats.go v1.49.0

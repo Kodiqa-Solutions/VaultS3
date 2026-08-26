@@ -236,3 +236,37 @@ func TestDefaultBucketsFromYAML(t *testing.T) {
 		t.Fatalf("default_buckets = %v", cfg.Storage.DefaultBuckets)
 	}
 }
+
+// Rate limiting is on by default because an unauthenticated flood is answered
+// before authentication runs, so nothing else bounds what it costs the server.
+func TestRateLimitIsEnabledByDefault(t *testing.T) {
+	cfg := Defaults()
+	if !cfg.RateLimit.Enabled {
+		t.Fatal("rate limiting is off by default, so a server exposed with no config absorbs a flood unthrottled")
+	}
+	// The ceiling has to stay far above a real client. A saturating 8-thread
+	// boto3 client measured ~1300 req/s, and the per-IP bucket keys on the
+	// connection address, so behind a proxy a whole deployment shares one
+	// bucket. A low ceiling here throttles legitimate traffic, not abuse.
+	if cfg.RateLimit.RequestsPerSec < 1000 || cfg.RateLimit.PerKeyRPS < 1000 {
+		t.Errorf("default ceiling is low enough to throttle a real client: ip=%v key=%v",
+			cfg.RateLimit.RequestsPerSec, cfg.RateLimit.PerKeyRPS)
+	}
+	if cfg.RateLimit.BurstSize < int(cfg.RateLimit.RequestsPerSec) {
+		t.Errorf("burst %d is below the per-second rate %v", cfg.RateLimit.BurstSize, cfg.RateLimit.RequestsPerSec)
+	}
+}
+
+// Turning a default on is only safe if the operator can still turn it off. The
+// defaults are the starting struct that YAML is unmarshalled over, so an
+// explicit false has to survive that merge.
+func TestRateLimitCanBeTurnedOffExplicitly(t *testing.T) {
+	p := writeConfig(t, "rate_limit:\n  enabled: false\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RateLimit.Enabled {
+		t.Fatal("an explicit rate_limit.enabled: false was overridden by the default")
+	}
+}
