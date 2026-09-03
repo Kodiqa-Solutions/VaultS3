@@ -521,18 +521,33 @@ func (s *Store) DeleteBucketPolicy(bucket string) error {
 	})
 }
 
-// IsBucketPublicRead reports whether the bucket policy lets an anonymous caller
-// read objects (s3:GetObject).
-func (s *Store) IsBucketPublicRead(bucket string) bool {
-	return s.policyAllowsAnonymous(bucket, "s3:GetObject")
+// HasPublicReadPolicy reports whether the bucket has any statement granting
+// s3:GetObject to everyone. It is a bucket-wide summary, used only to render the
+// synthetic AllUsers grant in GetBucketACL, and it deliberately ignores the
+// Resource key scope: a policy publishing a single prefix still counts.
+//
+// It must NEVER decide whether to serve a request. Anonymous read access is a
+// per-object question, answered by IsObjectPublicRead, which matches the
+// caller's key against the statement's Resource.
+func (s *Store) HasPublicReadPolicy(bucket string) bool {
+	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, anyKey: true}, "s3:GetObject")
+}
+
+// IsObjectPublicRead reports whether the bucket policy lets an anonymous caller
+// read this specific object (s3:GetObject). The key is part of the decision: a
+// statement scoped to "arn:aws:s3:::bucket/public/*" publishes that prefix and
+// nothing else. Evaluating the bucket alone once made every object in a bucket
+// with any public-read policy anonymously readable.
+func (s *Store) IsObjectPublicRead(bucket, key string) bool {
+	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, key: key}, "s3:GetObject")
 }
 
 // IsBucketPublicList reports whether the bucket policy lets an anonymous caller
 // list the bucket's contents (s3:ListBucket). This is deliberately separate from
-// IsBucketPublicRead: listing a bucket and reading its objects are different
+// IsObjectPublicRead: listing a bucket and reading its objects are different
 // permissions in S3, and a policy that grants only one must not imply the other.
 func (s *Store) IsBucketPublicList(bucket string) bool {
-	return s.policyAllowsAnonymous(bucket, "s3:ListBucket")
+	return s.policyAllowsAnonymous(policyTarget{bucket: bucket}, "s3:ListBucket")
 }
 
 // policyAllowsAnonymous evaluates the bucket policy for an unsigned (anonymous)
@@ -541,7 +556,8 @@ func (s *Store) IsBucketPublicList(bucket string) bool {
 // (in any of the spellings AWS accepts), the action must match, and the resource
 // must refer to this bucket. Public Access Block, if configured, overrides the
 // policy and blocks anonymous access outright.
-func (s *Store) policyAllowsAnonymous(bucket, action string) bool {
+func (s *Store) policyAllowsAnonymous(target policyTarget, action string) bool {
+	bucket := target.bucket
 	// A bucket with Public Access Block enabled is never anonymously accessible,
 	// regardless of what its policy says — that is the point of the setting, which
 	// was previously stored and reported but never actually enforced.
@@ -575,7 +591,7 @@ func (s *Store) policyAllowsAnonymous(bucket, action string) bool {
 		if !matchesPolicyAction(stmt.Action, action) {
 			continue
 		}
-		if !policyResourceCoversBucket(stmt.Resource, bucket) {
+		if !policyResourceCovers(stmt.Resource, target) {
 			continue
 		}
 		// Explicit Deny wins over any Allow, exactly as in AWS.
@@ -636,20 +652,57 @@ func matchesPolicyAction(actions interface{}, want string) bool {
 	return false
 }
 
-// policyResourceCoversBucket reports whether a statement's Resource refers to this
-// bucket. Without this check a policy written for a different bucket would make
-// this one public. A statement with no Resource is treated as covering the bucket,
-// since the policy is stored per bucket.
-func policyResourceCoversBucket(resources interface{}, bucket string) bool {
-	patterns := policyStringList(resources)
-	if len(patterns) == 0 {
+// s3ARNPrefix is the fixed part of an S3 resource ARN. S3 ARNs carry no region
+// or account, so everything after it is "<bucket>" or "<bucket>/<key>".
+const s3ARNPrefix = "arn:aws:s3:::"
+
+// policyTarget is what a statement's Resource is matched against: one object, or
+// the bucket itself for a bucket-level action such as s3:ListBucket.
+type policyTarget struct {
+	bucket string
+	// key is the object the caller asked for, empty for a bucket-level action.
+	key string
+	// anyKey matches any object in the bucket regardless of the Resource's key
+	// scope. It answers the display-only "is this bucket public at all", and must
+	// never be set when deciding whether to serve a request.
+	anyKey bool
+}
+
+// arn renders the target as the ARN a policy Resource would name it by.
+func (t policyTarget) arn() string {
+	if t.key == "" {
+		return s3ARNPrefix + t.bucket
+	}
+	return s3ARNPrefix + t.bucket + "/" + t.key
+}
+
+// coveredBy reports whether one Resource pattern refers to this target. The full
+// ARN is compared, key included, so "arn:aws:s3:::b/public/*" covers b/public/x
+// and not b/secret/x. MatchWildcard also treats a trailing "/*" as covering the
+// bare bucket ARN, so the common "arn:aws:s3:::b/*" still covers s3:ListBucket.
+func (t policyTarget) coveredBy(pattern string) bool {
+	if pattern == "*" {
 		return true
 	}
-	for _, pattern := range patterns {
-		if bucketPatternFromARN(pattern) == "" {
-			continue
-		}
-		if iam.MatchWildcard(bucketPatternFromARN(pattern), bucket) {
+	if !strings.HasPrefix(pattern, s3ARNPrefix) {
+		return false
+	}
+	if t.anyKey {
+		return iam.MatchWildcard(bucketPatternFromARN(pattern), t.bucket)
+	}
+	return iam.MatchWildcard(pattern, t.arn())
+}
+
+// policyResourceCovers reports whether a statement's Resource refers to the
+// target. Without this check a policy written for a different bucket, or for a
+// different prefix of this one, would apply here.
+//
+// A statement with no Resource covers nothing. Resource is required in an S3
+// bucket policy, and treating a missing one as "everything" turned a malformed
+// policy into a grant.
+func policyResourceCovers(resources interface{}, target policyTarget) bool {
+	for _, pattern := range policyStringList(resources) {
+		if target.coveredBy(pattern) {
 			return true
 		}
 	}
@@ -657,16 +710,10 @@ func policyResourceCoversBucket(resources interface{}, bucket string) bool {
 }
 
 // bucketPatternFromARN extracts the bucket portion of an S3 resource ARN, so
-// "arn:aws:s3:::photos/*" yields "photos". A bare "*" covers every bucket.
+// "arn:aws:s3:::photos/*" yields "photos". It answers only the bucket-wide
+// question: use the full ARN for anything that authorizes a request.
 func bucketPatternFromARN(pattern string) string {
-	if pattern == "*" {
-		return "*"
-	}
-	const prefix = "arn:aws:s3:::"
-	if !strings.HasPrefix(pattern, prefix) {
-		return ""
-	}
-	rest := strings.TrimPrefix(pattern, prefix)
+	rest := strings.TrimPrefix(pattern, s3ARNPrefix)
 	if i := strings.Index(rest, "/"); i >= 0 {
 		rest = rest[:i]
 	}

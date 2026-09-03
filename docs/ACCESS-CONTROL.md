@@ -51,6 +51,45 @@ requests.post(f"{API}/iam/policies", headers=headers,
 
 Policy evaluation follows AWS IAM semantics: default deny, explicit Allow required, explicit Deny always wins. Admin keys and legacy keys (without a user) retain full access.
 
+## Anonymous (public) Access
+
+A bucket policy granting an action to `Principal: "*"` lets unauthenticated
+callers perform it. The `Resource` is matched as a full object ARN, so a policy
+publishes exactly the keys it names and nothing more:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::my-bucket/public/*"
+  }]
+}
+```
+
+Anonymous `GET my-bucket/public/index.html` succeeds. Anonymous
+`GET my-bucket/private/secrets.env` returns 403, because its key is outside the
+published prefix.
+
+Rules worth knowing:
+
+- `s3:GetObject` needs an object ARN (`arn:aws:s3:::bucket/*`). A bare
+  `arn:aws:s3:::bucket` does not cover the objects in the bucket.
+- `s3:ListBucket` is a separate permission on the bucket ARN
+  (`arn:aws:s3:::bucket`). Granting object reads never makes the listing public,
+  and granting the listing never makes objects readable.
+- A statement with no `Resource` grants nothing.
+- An explicit `Deny` always wins over an `Allow`.
+- **Public Access Block overrides the policy.** With `BlockPublicPolicy` or
+  `RestrictPublicBuckets` set, the bucket is never anonymously accessible no
+  matter what its policy says.
+
+Static website hosting is separate from all of this: enabling it serves GET and
+HEAD without authentication for the whole bucket by design. Do not enable it on a
+bucket holding anything private.
+
 ## CORS per Bucket
 
 Configure Cross-Origin Resource Sharing on a per-bucket basis:

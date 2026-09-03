@@ -319,7 +319,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check for public-read policy bypass on GET/HEAD object requests
 	authRequired := true
 	if bucket != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		if key != "" && h.store.IsBucketPublicRead(bucket) {
+		// The key is part of this decision: a policy scoped to one prefix
+		// publishes that prefix only, never the rest of the bucket.
+		if key != "" && h.store.IsObjectPublicRead(bucket, key) {
 			authRequired = false
 		}
 		// A policy granting s3:ListBucket to everyone makes the object listing

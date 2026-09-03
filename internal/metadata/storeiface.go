@@ -81,8 +81,9 @@ type StoreAPI interface {
 	GetUserPolicies(userName string) ([]IAMPolicy, error)
 	GetVersionTag(key string) ([]byte, error)
 	GetWebsiteConfig(bucket string) (*WebsiteConfig, error)
+	HasPublicReadPolicy(bucket string) bool
 	IsBucketPublicList(bucket string) bool
-	IsBucketPublicRead(bucket string) bool
+	IsObjectPublicRead(bucket, key string) bool
 	IsBucketWebsite(bucket string) bool
 	IterateAllObjects(fn func(bucket, key string, meta ObjectMeta) bool) error
 	LatestObjectVersion(bucket, key string) (*ObjectMeta, error)

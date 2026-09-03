@@ -37,6 +37,27 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Upgrading to 4.4.67
+
+**Anonymous bucket policies are now enforced per object key.** This closes a
+disclosure where a policy scoped to one prefix published the whole bucket, and it
+makes three cases stricter. Check your public bucket policies if any of these
+describe yours:
+
+- A Resource naming a prefix, such as `arn:aws:s3:::bucket/public/*`, now
+  publishes that prefix **only**. Previously it published every key in the
+  bucket. If you were relying on the wider access, widen the Resource to
+  `arn:aws:s3:::bucket/*` deliberately.
+- A statement with **no `Resource` field** no longer grants anything. `Resource`
+  is required in an S3 bucket policy, and treating a missing one as "everything"
+  turned a malformed policy into a public grant.
+- A bare bucket ARN, `arn:aws:s3:::bucket`, no longer covers the objects in the
+  bucket for `s3:GetObject`. Use `arn:aws:s3:::bucket/*` for object access. The
+  bare form remains correct for `s3:ListBucket`.
+
+Authenticated access is unchanged: the IAM path already matched the full object
+ARN. Nothing needs to change in your config files.
+
 ## Upgrading to 4.4.65
 
 **Rate limiting is now on by default.** Nothing is required of you, but it is a

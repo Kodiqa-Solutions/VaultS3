@@ -4,6 +4,38 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.67] - 2026-09-03
+### Security
+- **A public-read bucket policy scoped to one prefix published the whole bucket.**
+  Anonymous access was evaluated per bucket, never per key: a policy granting
+  `s3:GetObject` to `Principal: "*"` on `arn:aws:s3:::bucket/public/*` made every
+  object in that bucket anonymously readable, including keys the operator
+  believed were private.
+
+  The cause was in the resource matcher. `bucketPatternFromARN` truncated the
+  Resource ARN at the first `/` and threw the key away, so
+  `arn:aws:s3:::bucket/public/*` and `arn:aws:s3:::bucket/*` were the same
+  pattern by the time the policy was evaluated. The authenticated IAM path always
+  matched the full object ARN, so only unauthenticated access was affected.
+
+  The truncation cut both ways. An explicit `Deny` scoped to a narrow prefix was
+  widened the same way, so a policy allowing `bucket/one/*` and `bucket/two/*`
+  while denying `bucket/one/nested/*` denied **all three**, since Deny wins and
+  every pattern collapsed to the bucket. Scoped Allow and Deny statements now
+  both apply exactly where they are written.
+
+  Anonymous reads are now decided per object, matching the caller's full
+  `arn:aws:s3:::<bucket>/<key>` against the statement's Resource with the same
+  wildcard matcher the authenticated path uses. Two related hardening changes
+  come with it: a statement with **no Resource at all** now grants nothing rather
+  than matching everything, and a bare bucket ARN such as `arn:aws:s3:::bucket`
+  no longer covers the objects inside it, which is how AWS evaluates it.
+
+  Operators who had scoped a policy to a prefix were exposed without any signal
+  that it was not being honoured. Enabling Public Access Block blocked the
+  exposure but also disabled public reads entirely, so it was a workaround rather
+  than a fix. Reported privately by Cheng Fu.
+
 ## [4.4.66] - 2026-08-26
 ### Fixed
 - **An unauthenticated request could panic the S3 handler.** A bucket with no CORS
@@ -2334,7 +2366,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.66...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.67...HEAD
+[4.4.67]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.66...v4.4.67
 [4.4.66]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.65...v4.4.66
 [4.4.65]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.64...v4.4.65
 [4.4.64]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.63...v4.4.64

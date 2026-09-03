@@ -1319,8 +1319,10 @@ func (h *BucketHandler) GetBucketACL(w http.ResponseWriter, r *http.Request, buc
 			Permission: "FULL_CONTROL",
 		}},
 	}
-	// Add public read grant if bucket is public
-	if h.store.IsBucketPublicRead(bucket) {
+	// Add public read grant if any part of the bucket is public. This is a
+	// display-only summary, not an access decision: a policy scoped to one
+	// prefix still shows the grant, and reads are authorized per object.
+	if h.store.HasPublicReadPolicy(bucket) {
 		resp.ACL = append(resp.ACL, grant{
 			Grantee:    grantee{XMLNS: "http://www.w3.org/2001/XMLSchema-instance", Type: "Group", ID: "http://acs.amazonaws.com/groups/global/AllUsers"},
 			Permission: "READ",
