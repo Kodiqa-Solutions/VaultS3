@@ -37,6 +37,22 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Upgrading to 4.4.68
+
+**Dependency security updates only. Nothing to change.** No configuration, API,
+or behaviour changes, so this upgrade is a straight swap of the binary or image.
+
+- `github.com/rabbitmq/amqp091-go` 1.10.0 to 1.13.0 (GHSA-6c5v-hqjr-5xxp). A
+  malicious or compromised AMQP broker could send content body frames larger
+  than the negotiated `frame_max` and drive the client into unbounded memory
+  use. This is only reachable if you enable AMQP event notifications and point
+  them at a broker you do not control.
+- `golang.org/x/crypto` 0.53.0 to 0.56.0, clearing three `x/crypto/ssh`
+  advisories. VaultS3 uses this module only for `acme/autocert`, so none of the
+  three were reachable from VaultS3 code.
+- Dashboard build dependencies `browserslist` and `postcss-selector-parser`.
+  Build-time only, never part of the shipped bundle or the server binary.
+
 ## Upgrading to 4.4.67
 
 **Anonymous bucket policies are now enforced per object key.** This closes a
