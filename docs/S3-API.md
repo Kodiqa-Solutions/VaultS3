@@ -101,5 +101,4 @@ Every S3 API call VaultS3 implements.
 | Manual Heal | `POST /api/v1/heal` | Done |
 | Speedtest | `POST /api/v1/speedtest` | Done |
 | Batch Operations | `POST /api/v1/batch` | Done |
-| STS AssumeRole | `POST /api/v1/sts/assume-role` | Done |
 | Inventory Reports | `GET /api/v1/inventory` | Done |

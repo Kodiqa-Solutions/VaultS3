@@ -113,9 +113,9 @@ What is planned, and what has already shipped.
 - [x] Advanced lifecycle rules (NoncurrentVersionExpiration, AbortIncompleteMultipartUpload, MaxNoncurrentVersions, ExpiredObjectDeleteMarker cleanup, object size filter)
 - [x] IAM policy conditions (StringEquals, StringLike, IpAddress, DateLessThan)
 - [x] Policy variables (${aws:username}, ${aws:userid})
-- [x] LDAP authentication with group mapping
-- [x] STS AssumeRole with session policies
-- [x] External auth webhook
+- [ ] LDAP authentication with group mapping
+- [ ] STS AssumeRole with session policies
+- [ ] External auth webhook
 - [x] Access key description & status
 - [x] Governance bypass (x-amz-bypass-governance-retention)
 - [x] Per-bucket replication rules with prefix/tag filters

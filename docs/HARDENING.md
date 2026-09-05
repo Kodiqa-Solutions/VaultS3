@@ -50,8 +50,6 @@ VaultS3 is designed with security in mind:
 - **S3 Select record cap**: JSON/CSV parsing capped at 1M records to prevent memory exhaustion
 - **FUSE cache size caps**: Signature cache, HEAD cache, and LIST cache bounded to prevent unbounded memory growth
 - **GetObjectAttributes version support**: Respects `versionId` parameter and handles delete markers
-- **LDAP authentication**: Bind-based LDAP/LDAPS with group-to-policy mapping and TLS support
-- **External auth webhook**: Delegate authentication to an external HTTP endpoint with request validation
 - **KMS envelope encryption**: HashiCorp Vault and local key provider for data encryption key management
 - **Auto-TLS**: Automatic Let's Encrypt certificate provisioning with self-signed fallback
 - **PROXY protocol v1**: Real client IP extraction behind PROXY protocol-aware load balancers

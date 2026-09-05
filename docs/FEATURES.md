@@ -119,9 +119,6 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Object size filter**: Lifecycle rules with `ObjectSizeGreaterThan` / `ObjectSizeLessThan` conditions
 - **IAM policy conditions**: `StringEquals`, `StringLike`, `IpAddress`, `DateLessThan` condition operators
 - **Policy variables**: `${aws:username}`, `${aws:userid}` substitution in policy resources
-- **LDAP authentication**: Bind-based LDAP/LDAPS authentication with group mapping
-- **STS AssumeRole**: Federated access via STS AssumeRole with session policies
-- **External auth webhook**: Delegate authentication to an external HTTP endpoint
 - **Access key description & status**: Metadata fields and active/inactive status on access keys
 - **Governance bypass**: `x-amz-bypass-governance-retention` header for admin override of GOVERNANCE locks
 - **Per-bucket replication rules**: Replication rules with prefix and tag filters per bucket

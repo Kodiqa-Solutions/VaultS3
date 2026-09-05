@@ -4,6 +4,22 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [Unreleased]
+### Fixed
+- Corrected the documentation for three access-control features that were listed
+  as shipped but were never wired into the server. LDAP authentication, STS
+  AssumeRole and the external auth webhook exist as library code under
+  `internal/iam` with no configuration surface and no caller, so they have never
+  been reachable in any release. They are now listed as planned rather than
+  done. Reported in #52.
+- Removed `POST /api/v1/sts/assume-role` from the API reference. That route does
+  not exist and returns 404. STS session tokens are unaffected and continue to
+  work at `POST /api/v1/sts/session-token`.
+- Removed the claim in `SECURITY.md` that the external auth webhook validates
+  its URL against SSRF. No such validation exists, and both related entries have
+  been dropped from the in-scope list so researchers are not pointed at code
+  that cannot be reached.
+
 ## [4.4.68] - 2026-09-04
 ### Security
 - Updated `github.com/rabbitmq/amqp091-go` from 1.10.0 to 1.13.0 for
