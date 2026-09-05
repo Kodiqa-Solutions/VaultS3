@@ -115,7 +115,7 @@ What is planned, and what has already shipped.
 - [x] Policy variables (${aws:username}, ${aws:userid})
 - [ ] LDAP authentication with group mapping
 - [ ] STS AssumeRole with session policies
-- [ ] External auth webhook
+- [x] External auth webhook
 - [x] Access key description & status
 - [x] Governance bypass (x-amz-bypass-governance-retention)
 - [x] Per-bucket replication rules with prefix/tag filters

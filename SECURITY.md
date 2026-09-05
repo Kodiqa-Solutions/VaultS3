@@ -45,6 +45,7 @@ The following are in scope:
 - Raft cluster membership manipulation
 - Replication sync endpoint abuse
 - Inter-node proxy loop exploitation
+- External authorization webhook abuse (response spoofing, or a decision cache poisoned across identities)
 - KMS key exposure or unauthorized key access
 - PROXY protocol spoofing (forged client IP)
 - Bandwidth throttler bypass
@@ -84,6 +85,7 @@ VaultS3 includes multiple security layers:
 - **Replication SSRF protection** (peer URLs validated against localhost, private IPs, link-local, and cloud metadata endpoints)
 - **Replication peer authentication** (bidirectional sync uses SigV4-signed requests, peer access keys registered at startup)
 - **Rebalance isolation** (`X-VaultS3-Rebalance` header marks internal object transfers)
+- **External authorization webhook** (per-request decision delegated to an operator-configured HTTP endpoint, deny-only by default so it cannot widen IAM, fail-closed by default, explicit IAM Deny always wins, admin exempt, bounded response read, decision cache)
 - **KMS envelope encryption** (HashiCorp Vault and local key provider, data encryption keys wrapped by master key, key rotation support)
 - **Auto-TLS** (automatic Let's Encrypt certificate provisioning via ACME, self-signed fallback for development)
 - **PROXY protocol v1** (extract real client IP from PROXY protocol header, validated format parsing)

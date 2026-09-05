@@ -442,6 +442,7 @@
   "settings.dataTiering": "数据分层",
   "settings.backupScheduler": "备份调度器",
   "settings.lambdaTriggers": "Lambda 触发器",
+  "settings.externalAuth": "外部授权",
   "settings.semanticVectorSearch": "语义 / 向量搜索",
   "settings.erasureCoding": "纠删码",
   "settings.clustering": "集群",

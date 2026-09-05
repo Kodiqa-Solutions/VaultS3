@@ -52,6 +52,15 @@ data:
       burst_size: 4000
       per_key_rps: 2000
       per_key_burst: 4000
+    # Optional: delegate each access decision to an endpoint you run.
+    # Deny-only and fail-closed by default. See docs/ACCESS-CONTROL.md.
+    external_auth:
+      enabled: false
+      url: ""
+      timeout_ms: 2000
+      cache_ttl_secs: 10
+      authoritative: false
+      fail_open: false
 ---
 apiVersion: v1
 kind: Service

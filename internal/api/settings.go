@@ -35,6 +35,7 @@ type settingsResponse struct {
 		Cluster             bool `json:"cluster"`
 		Packing             bool `json:"packing"`
 		PerBucketEncryption bool `json:"perBucketEncryption"`
+		ExternalAuth        bool `json:"externalAuth"`
 		Debug               bool `json:"debug"`
 	} `json:"features"`
 	Lifecycle struct {
@@ -81,6 +82,7 @@ func (h *APIHandler) handleSettings(w http.ResponseWriter, _ *http.Request) {
 	resp.Features.Vector = h.cfg.Vector.Enabled
 	resp.Features.Erasure = h.cfg.Erasure.Enabled
 	resp.Features.Cluster = h.cfg.Cluster.Enabled
+	resp.Features.ExternalAuth = h.cfg.ExternalAuth.Enabled
 	resp.Features.Debug = h.cfg.Debug
 
 	resp.Lifecycle.ScanIntervalSecs = h.cfg.Lifecycle.ScanIntervalSecs

@@ -8,6 +8,20 @@ import (
 
 // EvaluateWithContext checks policies with additional context for condition evaluation.
 func EvaluateWithContext(policies []Policy, action, resource string, ctx map[string]string) bool {
+	allowed, _ := EvaluateDetailed(policies, action, resource, ctx)
+	return allowed
+}
+
+// EvaluateDetailed is EvaluateWithContext plus the reason a request was refused:
+// explicitDeny distinguishes "a statement said Deny" from "nothing said Allow".
+// Both refuse, but only the first is a decision the operator actually wrote, and
+// an external authorizer running in authoritative mode must not be able to
+// overturn one (explicit Deny wins, issue #41).
+//
+// The two functions share this one body deliberately. The Action/Resource
+// matching rules already exist in exactly one place for the same reason: a
+// second, subtly different copy is how a Deny stops protecting anything.
+func EvaluateDetailed(policies []Policy, action, resource string, ctx map[string]string) (allowed, explicitDeny bool) {
 	hasAllow := false
 
 	for _, pol := range policies {
@@ -37,7 +51,7 @@ func EvaluateWithContext(policies []Policy, action, resource string, ctx map[str
 				switch {
 				case !determined:
 					if stmt.Effect == "Deny" {
-						return false
+						return false, true
 					}
 					continue
 				case !ok:
@@ -46,7 +60,7 @@ func EvaluateWithContext(policies []Policy, action, resource string, ctx map[str
 			}
 
 			if stmt.Effect == "Deny" {
-				return false
+				return false, true
 			}
 			if stmt.Effect == "Allow" {
 				hasAllow = true
@@ -54,7 +68,7 @@ func EvaluateWithContext(policies []Policy, action, resource string, ctx map[str
 		}
 	}
 
-	return hasAllow
+	return hasAllow, false
 }
 
 // evaluateConditions checks all condition operators.

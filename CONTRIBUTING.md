@@ -32,7 +32,7 @@ internal/
   erasure/      Reed-Solomon erasure coding + background healer
   cluster/      Raft metadata, consistent-hash ring, failure detector
   replication/  Active-active (vector clocks) + one-way push
-  iam/          Access keys, policies, OIDC
+  iam/          Access keys, policies, OIDC, external authz webhook
   ...
 web/            React dashboard (Vite)
 docs/           Operator docs (see docs/SCALING.md)

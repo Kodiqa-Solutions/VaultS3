@@ -72,6 +72,17 @@ config: |
     burst_size: 4000
     per_key_rps: 2000
     per_key_burst: 4000
+  # Delegate each access decision to an HTTP endpoint you run. Off by default.
+  # Deny-only means it can narrow IAM but never widen it, and fail_open false
+  # means an unreachable endpoint refuses rather than serves. The admin identity
+  # is never sent to it. See docs/ACCESS-CONTROL.md.
+  external_auth:
+    enabled: false
+    url: ""
+    timeout_ms: 2000
+    cache_ttl_secs: 10
+    authoritative: false
+    fail_open: false
 
 # Buckets created on startup if they are missing, so the release needs no init
 # container or S3 client to get its first bucket. Existing buckets are left

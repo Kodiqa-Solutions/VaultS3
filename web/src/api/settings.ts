@@ -29,6 +29,7 @@ export interface Settings {
     cluster: boolean
     packing: boolean
     perBucketEncryption: boolean
+    externalAuth: boolean
     debug: boolean
   }
   lifecycle: {

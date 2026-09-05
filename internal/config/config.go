@@ -34,6 +34,7 @@ type Config struct {
 	Vector        VectorConfig        `yaml:"vector"`
 	AutoUpdate    AutoUpdateConfig    `yaml:"auto_update"`
 	Metrics       MetricsConfig       `yaml:"metrics"`
+	ExternalAuth  ExternalAuthConfig  `yaml:"external_auth"`
 	Debug         bool                `yaml:"debug"`
 }
 
@@ -338,6 +339,36 @@ type AuthConfig struct {
 	AdminSecretKey string `yaml:"admin_secret_key"`
 }
 
+// ExternalAuthConfig delegates the access decision to an HTTP endpoint the
+// operator runs. Off by default. See internal/iam/external.go for the semantics
+// and for why this URL is not run through the notification SSRF validator.
+//
+// The admin identity is never put to the webhook, on either the S3 or the
+// console path. That matches every other authorization path in this codebase,
+// and it means a webhook that is down or misconfigured cannot lock the operator
+// out of their own server.
+type ExternalAuthConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	URL     string `yaml:"url"` // POST target, http or https (env: VAULTS3_EXTERNAL_AUTH_URL)
+	// TimeoutMs is milliseconds rather than the timeout_secs used elsewhere in
+	// this file because this call sits on the request path: the difference
+	// between 300ms and a whole second is the difference between a slow request
+	// and a stalled one.
+	TimeoutMs int `yaml:"timeout_ms"`
+	// CacheTTLSecs is how long one decision is reused. 0 disables caching, which
+	// puts an HTTP round trip on every authorized request.
+	CacheTTLSecs int `yaml:"cache_ttl_secs"`
+	// FailOpen allows a request when the endpoint cannot be reached. Off by
+	// default: an authorizer that cannot answer has not authorized anything.
+	FailOpen bool `yaml:"fail_open"`
+	// Authoritative lets the webhook grant access IAM alone would refuse. An
+	// explicit Deny in an IAM policy still wins.
+	Authoritative bool `yaml:"authoritative"`
+	// Token is sent as a bearer token. Kept settable from the environment so it
+	// can come from a Kubernetes or Docker secret rather than a mounted config.
+	Token string `yaml:"token"` // (env: VAULTS3_EXTERNAL_AUTH_TOKEN)
+}
+
 type EncryptionConfig struct {
 	Enabled bool                `yaml:"enabled"`
 	Key     string              `yaml:"key"` // hex-encoded 32-byte key (64 hex chars) for SSE-S3
@@ -519,6 +550,10 @@ func parse(data []byte) (*Config, error) {
 		OIDC: OIDCConfig{
 			JWKSCacheSecs: 3600,
 		},
+		ExternalAuth: ExternalAuthConfig{
+			TimeoutMs:    2000,
+			CacheTTLSecs: 10,
+		},
 		Lambda: LambdaConfig{
 			MaxResponseSize: 10 * 1024 * 1024, // 10MB
 			TimeoutSecs:     30,
@@ -585,6 +620,15 @@ func applyEnvOverrides(cfg *Config) {
 	// Kubernetes Secret or a Docker secret rather than a mounted ConfigMap.
 	if v := os.Getenv("VAULTS3_OIDC_CLIENT_SECRET"); v != "" {
 		cfg.OIDC.ClientSecret = v
+	}
+	if v := os.Getenv("VAULTS3_EXTERNAL_AUTH_URL"); v != "" {
+		cfg.ExternalAuth.URL = v
+		cfg.ExternalAuth.Enabled = true
+	}
+	// Same reasoning as the OAuth client secret: a shared secret belongs in a
+	// Kubernetes Secret, not in a ConfigMap-mounted config file.
+	if v := os.Getenv("VAULTS3_EXTERNAL_AUTH_TOKEN"); v != "" {
+		cfg.ExternalAuth.Token = v
 	}
 	if v := os.Getenv("VAULTS3_ADDRESS"); v != "" {
 		cfg.Server.Address = v

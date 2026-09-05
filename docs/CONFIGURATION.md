@@ -222,6 +222,30 @@ vaults3_bucket_errors_total{bucket="my-bucket"} 3
 
 These complement the existing global metrics and per-bucket storage metrics, enabling monitoring and alerting per bucket.
 
+## External Authorization
+
+Delegate each access decision to an HTTP endpoint you run. Off by default:
+
+```yaml
+external_auth:
+  enabled: false
+  url: ""                # POST target, http or https
+  timeout_ms: 2000
+  cache_ttl_secs: 10     # 0 is 9x slower, see the guide before changing
+  authoritative: false   # deny-only: narrows IAM, never widens it
+  fail_open: false       # unreachable endpoint DENIES
+  token: ""              # sent as "Authorization: Bearer <token>"
+```
+
+VaultS3 POSTs `{"accessKey","user","action","resource","sourceIP"}` and expects a
+200 carrying `{"allow": true|false}`. The admin identity is never sent, so a
+broken endpoint cannot lock you out. Set the URL with
+`VAULTS3_EXTERNAL_AUTH_URL` and the shared secret with
+`VAULTS3_EXTERNAL_AUTH_TOKEN`.
+
+Full guide, including the two modes and what this costs on the request path:
+[Access control](ACCESS-CONTROL.md#external-authorization-webhook).
+
 ## Rate Limiting
 
 Token bucket rate limiting is **on by default**, because an unauthenticated request is rate limited before it is authenticated, so the limiter is the only thing bounding what a flood costs the server:

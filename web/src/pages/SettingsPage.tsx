@@ -51,6 +51,7 @@ export default function SettingsPage() {
     { label: t('settings.dataTiering'), enabled: features.tiering },
     { label: t('settings.backupScheduler'), enabled: features.backup },
     { label: 'OIDC / SSO', enabled: features.oidc },
+    { label: t('settings.externalAuth'), enabled: features.externalAuth },
     { label: t('settings.lambdaTriggers'), enabled: features.lambda },
     { label: t('settings.semanticVectorSearch'), enabled: features.vector },
     { label: t('settings.erasureCoding'), enabled: features.erasure },

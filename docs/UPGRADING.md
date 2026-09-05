@@ -37,6 +37,28 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Upgrading to 4.4.69
+
+**Nothing to change.** The external authorization webhook added in this release
+is off unless you set `external_auth.enabled`, and every other behaviour is
+unchanged.
+
+If you do enable it, read [the guide](ACCESS-CONTROL.md#external-authorization-webhook)
+first. Two defaults are deliberate and worth understanding before you deploy:
+
+- **Fail-closed.** An endpoint that cannot be reached refuses requests rather
+  than serving them, so your authorization service becomes a dependency of your
+  storage. `fail_open: true` inverts that, at the cost of an outage silently
+  widening access.
+- **`cache_ttl_secs: 10`.** Leave it on. With caching off, throughput becomes
+  whatever your endpoint can serve: measured at 220 req/s against a simple
+  endpoint versus 1960 with the default, a 9x drop. The server warns at startup
+  if you turn it off.
+
+The admin identity is never sent to the webhook, on either the S3 or the
+dashboard path, so a misconfigured endpoint cannot lock you out of your own
+server.
+
 ## Upgrading to 4.4.68
 
 **Dependency security updates only. Nothing to change.** No configuration, API,

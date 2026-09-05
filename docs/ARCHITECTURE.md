@@ -17,7 +17,7 @@ VaultS3/
 │   ├── storage/               — Storage engine interface + filesystem + encryption + KMS + storage classes
 │   ├── metadata/              — BoltDB metadata store
 │   ├── metrics/               — Prometheus-compatible metrics collector
-│   ├── iam/                   — IAM policy engine, identity, IP access control, policy conditions
+│   ├── iam/                   — IAM policy engine, identity, IP access control, policy conditions, external authorization webhook
 │   ├── notify/                — Event notification dispatcher (webhook, Kafka, NATS, Redis, AMQP, PostgreSQL, Elasticsearch)
 │   ├── replication/           — Async + active-active replication (SigV4 signer, queue processor, vector-clock conflict resolution)
 │   ├── erasure/               — Reed-Solomon erasure coding + background healer (multi-disk shard placement)

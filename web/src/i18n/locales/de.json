@@ -442,6 +442,7 @@
   "settings.dataTiering": "Daten-Tiering",
   "settings.backupScheduler": "Backup-Planer",
   "settings.lambdaTriggers": "Lambda-Trigger",
+  "settings.externalAuth": "Externe Autorisierung",
   "settings.semanticVectorSearch": "Semantische / Vektorsuche",
   "settings.erasureCoding": "Erasure Coding",
   "settings.clustering": "Clustering",

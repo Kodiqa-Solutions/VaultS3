@@ -32,6 +32,7 @@ import (
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/dashboard"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/erasure"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/lambda"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/lifecycle"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -555,6 +556,39 @@ func New(cfg *config.Config) (*Server, error) {
 	// the proxy strips before we see it, so SigV4 verification must add it back to
 	// match (issue #36). Reuses server.base_path.
 	auth.SetBasePath(cfg.Server.BasePath, cfg.Server.TrustForwardedPrefix)
+
+	// External authorization webhook (issue #52). Off unless configured. A bad
+	// URL stops startup rather than failing every request once traffic arrives.
+	if cfg.ExternalAuth.Enabled {
+		ext, err := iam.NewExternalAuth(iam.ExternalAuthConfig{
+			Enabled:       true,
+			URL:           cfg.ExternalAuth.URL,
+			Timeout:       time.Duration(cfg.ExternalAuth.TimeoutMs) * time.Millisecond,
+			CacheTTL:      time.Duration(cfg.ExternalAuth.CacheTTLSecs) * time.Second,
+			FailOpen:      cfg.ExternalAuth.FailOpen,
+			Authoritative: cfg.ExternalAuth.Authoritative,
+			Token:         cfg.ExternalAuth.Token,
+		})
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		auth.SetExternalAuth(ext)
+		slog.Info("external authorization enabled",
+			"url", cfg.ExternalAuth.URL,
+			"authoritative", cfg.ExternalAuth.Authoritative,
+			"fail_open", cfg.ExternalAuth.FailOpen,
+			"cache_ttl_secs", cfg.ExternalAuth.CacheTTLSecs)
+		if cfg.ExternalAuth.FailOpen {
+			slog.Warn("external authorization is fail-open: a webhook that cannot be reached will ALLOW the request")
+		}
+		if cfg.ExternalAuth.Authoritative {
+			slog.Warn("external authorization is authoritative: the webhook can grant access no IAM policy allows (an explicit Deny still wins)")
+		}
+		if cfg.ExternalAuth.CacheTTLSecs <= 0 {
+			slog.Warn("external authorization has no decision cache, so every authorized request makes an HTTP call and throughput becomes whatever the endpoint can serve (measured 9x slower than the default 10s cache)")
+		}
+	}
 
 	// generatedAdminSecret is non-empty only on a first run, and is printed once
 	// when the server starts serving.

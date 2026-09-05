@@ -217,6 +217,50 @@ oidc:
   allow_implicit_flow: false
   jwks_cache_secs: 3600    # JWKS key cache duration
 
+# External authorization webhook (issue #52). When enabled, VaultS3 asks an HTTP
+# endpoint you run whether each request may proceed, so entitlements that live in
+# another system can gate access without being copied into IAM policies.
+#
+# The admin identity is never sent to the webhook, on either the S3 or the
+# dashboard path. That is deliberate: a webhook that is down or misconfigured
+# must not be able to lock you out of your own server.
+external_auth:
+  enabled: false
+  # POST target, http or https. VaultS3 sends
+  #   {"accessKey","user","action","resource","sourceIP"}
+  # and expects {"allow": true|false, "reason": "..."} with a 200.
+  #
+  # Unlike notification and lambda endpoints, this URL is NOT rejected for being
+  # a private address. Those are set by bucket owners over the S3 API, so they
+  # are attacker-controlled; this one is set by you, here, and a private address
+  # is exactly where an authorization service normally lives.
+  # (env: VAULTS3_EXTERNAL_AUTH_URL, which also switches enabled on)
+  url: ""
+  # Milliseconds, not seconds: this call sits on the request path, so the
+  # difference between 300ms and a whole second is a stalled request.
+  timeout_ms: 2000
+  # How long one decision is reused, keyed on every field sent above.
+  #
+  # Do not set this to 0 without meaning it. Caching off puts an HTTP round trip
+  # on every single authorized request, and throughput then becomes whatever your
+  # endpoint can serve: measured at 220 req/s against a simple Python endpoint
+  # versus 1960 req/s with this default, a 9x drop, on 8 concurrent readers.
+  # At 10s the same benchmark is indistinguishable from having the feature off.
+  cache_ttl_secs: 10
+  # false (default): the webhook can only narrow what IAM already allowed, so a
+  # spoofed or compromised endpoint costs availability, not your objects.
+  # true: an allow from the webhook grants access no IAM policy allows. An
+  # explicit Deny in an IAM policy still refuses, in both modes.
+  authoritative: false
+  # false (default): a webhook that cannot be reached DENIES, so the endpoint
+  # going down takes storage down with it. true serves the request instead,
+  # which means an outage silently widens access. Each fail-open allow is logged.
+  fail_open: false
+  # Sent as "Authorization: Bearer <token>" so the endpoint can tell VaultS3
+  # apart from anything else that can reach it.
+  # (env: VAULTS3_EXTERNAL_AUTH_TOKEN, prefer that over writing it here)
+  token: ""
+
 lambda:
   enabled: false
   max_response_size: 10485760  # 10MB max response from function

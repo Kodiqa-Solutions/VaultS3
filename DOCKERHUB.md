@@ -30,6 +30,7 @@ S3 API: `http://localhost:9000`
 - **IAM users, groups, policies** -- fine-grained access control with policy conditions
 - **STS temporary credentials** -- short-lived, auto-expiring access keys
 - **OIDC/SSO** -- Google, Keycloak, Auth0 via OpenID Connect
+- **External authorization webhook** -- delegate each access decision to an endpoint you run
 - **Lifecycle rules** -- expiration, noncurrent version cleanup, abort incomplete multipart
 - **Event notifications** -- Kafka, NATS, Redis, AMQP/RabbitMQ, PostgreSQL, Elasticsearch, webhooks
 - **Replication** -- async push and active-active bidirectional with vector clocks

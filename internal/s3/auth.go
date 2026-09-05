@@ -27,6 +27,21 @@ type Authenticator struct {
 	globalBlockCIDR []string
 	basePath        string // reverse-proxy subpath the client signed but a path-stripping proxy removed (issue #36)
 	trustForwarded  bool   // honor the client-supplied X-Forwarded-Prefix when basePath is unset
+	external        *iam.ExternalAuth
+}
+
+// SetExternalAuth attaches an external authorizer consulted on every non-admin
+// authorization decision. Nil leaves authorization exactly as it was (issue #52).
+func (a *Authenticator) SetExternalAuth(e *iam.ExternalAuth) { a.external = e }
+
+// ExternalAuth returns the configured external authorizer, or nil. The console
+// path consults the same instance so its cache and its mode are shared with the
+// S3 path rather than duplicated.
+func (a *Authenticator) ExternalAuth() *iam.ExternalAuth {
+	if a == nil {
+		return nil
+	}
+	return a.external
 }
 
 // SetBasePath configures the reverse-proxy subpath (e.g. "/vaults3") under which
@@ -393,10 +408,40 @@ func (a *Authenticator) AuthorizeWithContext(identity *iam.Identity, action, res
 	if identity.PolicyLoadFailed {
 		return fmt.Errorf("access denied: %s on %s (a policy attached to this identity could not be parsed)", action, resource)
 	}
-	if iam.EvaluateWithContext(identity.Policies, action, resource, ctx) {
-		return nil
+	allowed, explicitDeny := iam.EvaluateDetailed(identity.Policies, action, resource, ctx)
+
+	// An explicit Deny written by the operator is final. It is not put to the
+	// external authorizer even in authoritative mode, so turning that mode on
+	// cannot quietly reopen access a policy closed (issue #41).
+	if explicitDeny {
+		return fmt.Errorf("access denied: %s on %s", action, resource)
 	}
-	return fmt.Errorf("access denied: %s on %s", action, resource)
+	if a.external == nil {
+		if allowed {
+			return nil
+		}
+		return fmt.Errorf("access denied: %s on %s", action, resource)
+	}
+	// Deny-only mode narrows what IAM already allowed, so a request IAM refused
+	// is refused without troubling the endpoint. Authoritative mode asks anyway,
+	// because there the webhook is what decides.
+	if !allowed && !a.external.Authoritative() {
+		return fmt.Errorf("access denied: %s on %s", action, resource)
+	}
+	ok, err := a.external.Allow(iam.AuthRequest{
+		AccessKey: identity.AccessKey,
+		User:      identity.UserID,
+		Action:    action,
+		Resource:  resource,
+		SourceIP:  ctx["aws:SourceIp"],
+	})
+	// Trust the decision, not the error. Allow already folded fail_open into ok,
+	// so testing err first would deny a request the operator asked to let
+	// through. err is carried only to say why a denial happened.
+	if !ok {
+		return &iam.DeniedError{Action: action, Resource: resource, Err: err}
+	}
+	return nil
 }
 
 func parseAuthParams(s string) map[string]string {

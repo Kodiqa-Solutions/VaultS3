@@ -4,7 +4,35 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
-## [Unreleased]
+## [4.4.69] - 2026-09-06
+### Added
+- External authorization webhook (`external_auth` in the config file). VaultS3
+  can now POST each access decision to an HTTP endpoint you run and act on the
+  answer, so entitlements held in another system can gate access without being
+  copied into IAM policies. Off by default. This closes the gap reported in #52,
+  where the feature was documented from 2026-02-28 but had never been wired to
+  anything: the type existed, nothing called it, and no config key could enable it.
+  - Deny-only by default. IAM must allow and the webhook must allow, so the
+    endpoint can narrow access but never widen it. `authoritative: true` opts in
+    to letting the webhook grant. An explicit `Deny` in an IAM policy wins in
+    both modes and is never sent to the endpoint.
+  - Fail-closed by default. An endpoint that times out, refuses the connection,
+    answers non-200, or returns an unparseable body denies. `fail_open: true`
+    serves the request instead and logs every such allow at WARN.
+  - Decisions are cached for `cache_ttl_secs` (default 10), keyed on every field
+    sent to the webhook, so the network hop stays off the hot path. Failures are
+    never cached. At the default the feature costs nothing measurable (1959 vs
+    1913 req/s on 8 concurrent readers), while `cache_ttl_secs: 0` drops the same
+    benchmark to 220 req/s, so throughput becomes whatever the endpoint can
+    serve. The server warns at startup when caching is off.
+  - All 192 gated S3 conformance tests pass with the webhook enabled, both with
+    and without the decision cache.
+  - The admin identity is never sent to the webhook, on either the S3 or the
+    dashboard path, so a broken endpoint cannot lock the operator out.
+  - Configurable via `VAULTS3_EXTERNAL_AUTH_URL` and
+    `VAULTS3_EXTERNAL_AUTH_TOKEN`. Reported by `vaults3 diagnose` and shown in
+    the dashboard Settings page. See docs/ACCESS-CONTROL.md.
+
 ### Fixed
 - Corrected the documentation for three access-control features that were listed
   as shipped but were never wired into the server. LDAP authentication, STS
@@ -2399,7 +2427,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.68...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.69...HEAD
+[4.4.69]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.68...v4.4.69
 [4.4.68]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.67...v4.4.68
 [4.4.67]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.66...v4.4.67
 [4.4.66]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.65...v4.4.66

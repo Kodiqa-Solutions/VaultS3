@@ -123,10 +123,31 @@ func (h *APIHandler) authorizeConsoleBucket(r *http.Request, rest string) error 
 	if !ok {
 		return nil
 	}
-	if h.allowsConsole(user, act) {
-		return nil
+	allowed := h.allowsConsole(user, act)
+	ext := h.s3Auth.ExternalAuth()
+	if ext == nil {
+		if allowed {
+			return nil
+		}
+		return fmt.Errorf("access denied: %s on %s", act.action, act.resource())
 	}
-	return fmt.Errorf("access denied: %s on %s", act.action, act.resource())
+	// Same shape as the S3 path: deny-only narrows what IAM allowed, so a refusal
+	// here needs no webhook call; authoritative mode asks either way (issue #52).
+	if !allowed && !ext.Authoritative() {
+		return fmt.Errorf("access denied: %s on %s", act.action, act.resource())
+	}
+	permit, aerr := ext.Allow(iam.AuthRequest{
+		User:     user,
+		Action:   act.action,
+		Resource: act.resource(),
+		SourceIP: iam.SourceIPOf(r.RemoteAddr),
+	})
+	// As on the S3 path: the decision is authoritative, the error only explains a
+	// denial. Checking the error first would defeat fail_open.
+	if !permit {
+		return &iam.DeniedError{Action: act.action, Resource: act.resource(), Err: aerr}
+	}
+	return nil
 }
 
 // allowsConsole reports whether a subject's IAM policies permit an action. A
@@ -157,6 +178,12 @@ func (h *APIHandler) allowsConsole(user string, act consoleAction) bool {
 // visibleBuckets filters a bucket list to those the caller may list. Admin sees
 // everything; anyone else sees only what their policies allow, so the dashboard
 // stops advertising the existence of buckets a user cannot open.
+//
+// This is deliberately IAM-only. An external authorizer is consulted when the
+// user acts on a bucket, not when the list is drawn: asking it once per bucket
+// would turn one dashboard load into an unbounded fan-out of webhook calls. The
+// cost is that a bucket the webhook would refuse can still appear in the list,
+// which leaks its name and nothing else, since opening it is still refused.
 func (h *APIHandler) visibleBuckets(r *http.Request, names []string) []string {
 	user, err := h.authenticateUser(r)
 	if err != nil {
