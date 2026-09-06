@@ -76,6 +76,10 @@ encryption:
 
 # Transparent zstd compression on write / decompress on read (reads legacy gzip
 # objects too). Skips already-compressed file types (jpg, mp4, zip, ...).
+# Compression runs on the plaintext, before encryption, so it composes with
+# encryption at rest. Objects written before 4.4.70 were compressed AFTER
+# encryption and so were never really compressed; they still read, but they
+# keep their original size until they are rewritten.
 compression:
   enabled: false
 

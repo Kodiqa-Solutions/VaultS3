@@ -70,19 +70,27 @@ func TestDiagnoseEncryptionModePrecedence(t *testing.T) {
 // Each note exists because the interaction behind it already cost a round trip
 // on a real issue. They must fire only when the interaction is actually present.
 func TestDiagnoseNotes(t *testing.T) {
-	t.Run("compression under encryption is called out", func(t *testing.T) {
+	// Compression under encryption is no longer a no-op: it runs on plaintext.
+	// The note that remains explains that objects written before the layering was
+	// fixed keep their original size, which is the question an operator will ask
+	// when the numbers do not move after upgrading.
+	t.Run("compression under encryption explains the pre-4.4.70 objects", func(t *testing.T) {
 		cfg := config.Defaults()
 		cfg.Compression.Enabled = true
 		cfg.Encryption.Enabled = true
-		if !hasNote(buildDiagnosis(cfg, "v", "c"), "compression saves nothing") {
-			t.Fatal("want the compression no-op note")
+		d := buildDiagnosis(cfg, "v", "c")
+		if !hasNote(d, "compression now runs on plaintext") {
+			t.Fatal("want the note explaining the current layering")
+		}
+		if hasNote(d, "compression saves nothing") {
+			t.Fatal("the old no-op warning is still being emitted, but compression now works")
 		}
 	})
 	t.Run("compression alone is not called out", func(t *testing.T) {
 		cfg := config.Defaults()
 		cfg.Compression.Enabled = true
-		if hasNote(buildDiagnosis(cfg, "v", "c"), "compression saves nothing") {
-			t.Fatal("compression alone works, it must not be flagged")
+		if hasNote(buildDiagnosis(cfg, "v", "c"), "compression now runs on plaintext") {
+			t.Fatal("compression alone needs no note about encryption")
 		}
 	})
 	t.Run("packing skipped under erasure is called out", func(t *testing.T) {

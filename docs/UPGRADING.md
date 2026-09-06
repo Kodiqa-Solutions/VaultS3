@@ -37,6 +37,23 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Upgrading to 4.4.70
+
+**Nothing to change, but read this if you run compression with encryption.**
+
+Compression now runs on plaintext, before encryption, instead of being handed
+ciphertext. Objects written by earlier versions are still read correctly and
+nothing has to be rewritten, but they keep the size they were stored at. Only
+objects written from this release on get smaller, so the numbers on an existing
+deployment move as data is rewritten rather than at upgrade time.
+
+Two correctness fixes need no action. A delete marker placed over an object that
+predates versioning on its bucket is now reversible, and objects already orphaned
+by the old behaviour remain reclaimable with `vaults3-cli storage reclaim`. In a
+cluster, a node that holds bytes older than its metadata now routes the read to a
+holder that has the current data, and answers `503 SlowDown` if none can be
+reached yet, which S3 SDKs retry automatically.
+
 ## Upgrading to 4.4.69
 
 **Nothing to change.** The external authorization webhook added in this release

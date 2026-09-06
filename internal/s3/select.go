@@ -57,7 +57,7 @@ func (h *ObjectHandler) SelectObjectContent(w http.ResponseWriter, r *http.Reque
 	// Read the object (handle versioned storage)
 	var reader io.ReadCloser
 	if meta != nil && meta.VersionID != "" {
-		r, _, err := h.engine.GetObjectVersion(bucket, key, meta.VersionID)
+		r, _, err := h.readObjectData(bucket, key, meta.VersionID)
 		if err != nil {
 			writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
 			return

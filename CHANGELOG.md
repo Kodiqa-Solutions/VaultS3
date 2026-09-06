@@ -4,6 +4,39 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.70] - 2026-09-06
+### Fixed
+- **A delete marker over an object that predated versioning is now reversible.**
+  An object written before versioning was enabled on its bucket carries no
+  version id, and the delete-marker path only demoted objects that had one. The
+  marker therefore overwrote the latest pointer, which was the only record naming
+  the object, so removing the marker could not bring it back and the bytes were
+  left on disk with nothing referring to them. S3 calls such an object the "null"
+  version, and it is now adopted as one before the marker goes over it. Reads of
+  the null version fall back to the ordinary object path, where those bytes live,
+  and deleting it explicitly now removes them instead of orphaning them.
+- **Compression now actually compresses when encryption is on.** The compressor
+  wrapped the encryptor, so it was handed ciphertext, which does not compress:
+  a 216,000 byte repetitive payload occupied 216,056 bytes on disk, exactly 1.00x,
+  while the CPU cost of attempting it was still paid. Compression now runs on
+  plaintext, before encryption. The same payload now occupies 123 bytes. Objects
+  written under the old layering are still read correctly, without any rewrite:
+  the outer compression is unwrapped before the blob reaches the decryptor, and
+  both layouts can coexist in one bucket indefinitely.
+- **A cluster node no longer serves stale bytes under fresh metadata.** Metadata
+  replicates through Raft synchronously while object data is copied
+  asynchronously, so after an overwrite a node could hold the previous bytes and
+  the new metadata at once. The read path only consulted a peer when opening the
+  local file FAILED, so it answered with the old object under the new object's
+  `ETag` and `Last-Modified`: a silent wrong answer rather than a miss. A node now
+  checks what it holds against the metadata, by size and, for objects written in
+  the last minute, by content, and routes the read to a holder that has the
+  current bytes, or answers `503 SlowDown` if none can be reached yet. Measured on
+  a real three-node cluster: 24 of 40 immediate cross-node reads returned stale
+  bytes before the fix and 0 of 40 after, in both the changed-size and the
+  same-size case, converging in a median of 2 ms. Single-node servers skip the
+  check entirely, and single-node throughput is unchanged.
+
 ## [4.4.69] - 2026-09-06
 ### Added
 - External authorization webhook (`external_auth` in the config file). VaultS3
@@ -2427,7 +2460,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.69...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.70...HEAD
+[4.4.70]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.69...v4.4.70
 [4.4.69]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.68...v4.4.69
 [4.4.68]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.67...v4.4.68
 [4.4.67]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.66...v4.4.67

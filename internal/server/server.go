@@ -185,33 +185,6 @@ type Server struct {
 	reapElsewhere func(bucket, key, versionID string)
 }
 
-// compressionDefeatedBy reports which encryption layer stops an enabled compressor
-// from achieving anything, and how much of the data it affects. It returns empty
-// strings when compression is off, when encryption is off, or when the two do not
-// collide.
-//
-// Encryption wraps compression (see the engine layering in New), so a write is
-// encrypted first and the compressor only ever sees ciphertext, which does not
-// compress: measured 1.00x on a highly repetitive payload. The operator still pays
-// the CPU, so this is worth saying out loud instead of the usual "compression
-// enabled" line.
-//
-// Per-bucket encryption is the one case that is not total. A bucket that never
-// opted in is stored as plaintext, so its objects still compress normally.
-func compressionDefeatedBy(cfg *config.Config) (by, scope string) {
-	if !cfg.Compression.Enabled || !cfg.Encryption.Enabled {
-		return "", ""
-	}
-	switch {
-	case cfg.Encryption.PerBucket:
-		return "per-bucket encryption", "objects in buckets that opted into encryption"
-	case cfg.Encryption.KMS.Enabled:
-		return "SSE-KMS encryption", "any object"
-	default:
-		return "SSE-S3 encryption", "any object"
-	}
-}
-
 func New(cfg *config.Config) (*Server, error) {
 	// Initialize storage engine
 	fs, err := storage.NewFileSystem(cfg.Storage.DataDir)
@@ -221,27 +194,6 @@ func New(cfg *config.Config) (*Server, error) {
 
 	var engine storage.Engine = fs
 	var perBucketEngine *storage.PerBucketEngine
-
-	// Compression is wrapped first, which makes encryption the OUTER engine: a
-	// write is encrypted and then handed to the compressor. That is the reverse
-	// of what this comment used to claim, and it means compression saves nothing
-	// when encryption is on, since ciphertext does not compress (measured 1.00x
-	// on a highly repetitive payload). Swapping the order would fix that but
-	// changes the on-disk layering, so existing objects would need format
-	// detection in both directions; left as its own change.
-	if cfg.Compression.Enabled {
-		engine = storage.NewCompressedEngine(engine)
-		// Writes are zstd; gzip is still decoded on read for objects written by
-		// older versions. The log said "gzip" long after that stopped being true.
-		if by, scope := compressionDefeatedBy(cfg); by != "" {
-			slog.Warn("compression is enabled but will not compress "+scope+": "+by+
-				" wraps compression, so the compressor is handed ciphertext, which does not compress. "+
-				"The CPU cost is still paid. Disable compression, or disable encryption at rest",
-				"algorithm", "zstd", "defeated_by", by, "affects", scope)
-		} else {
-			slog.Info("compression enabled", "algorithm", "zstd", "reads", "zstd+gzip")
-		}
-	}
 
 	// Wrap with encryption if enabled (SSE-S3 or SSE-KMS)
 	if cfg.Encryption.Enabled {
@@ -295,6 +247,26 @@ func New(cfg *config.Config) (*Server, error) {
 			engine = enc
 			slog.Info("SSE-S3 encryption enabled", "algorithm", "AES-256-GCM")
 		}
+	}
+
+	// Compression is wrapped LAST, which makes it the OUTER engine: a write is
+	// compressed and only then encrypted, so the compressor sees plaintext.
+	//
+	// It used to be wrapped first, which put encryption on the outside and handed
+	// the compressor ciphertext. Ciphertext does not compress (measured 1.00x on a
+	// highly repetitive payload), so with encryption on, compression did nothing
+	// at all while still costing the CPU to attempt it.
+	//
+	// Objects written under the old layering are compress(encrypt(plaintext)) and
+	// still read: openSealed in the storage package unwraps an outer compression
+	// before the blob reaches the decryptor. Nothing has to be rewritten, and both
+	// layouts can coexist in one bucket forever.
+	if cfg.Compression.Enabled {
+		engine = storage.NewCompressedEngine(engine)
+		// Writes are zstd; gzip is still decoded on read for objects written by
+		// older versions. The log said "gzip" long after that stopped being true.
+		slog.Info("compression enabled", "algorithm", "zstd", "reads", "zstd+gzip",
+			"compresses", "plaintext, before encryption")
 	}
 
 	// Wrap with erasure coding if enabled

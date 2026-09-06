@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -110,6 +111,90 @@ type ObjectHandler struct {
 	onSearchUpdate     SearchUpdateFunc
 	onLambda           LambdaFunc
 	accessUpdater      *metadata.AccessUpdater
+}
+
+// localCopyIsStale reports that the bytes this node holds are not the bytes the
+// metadata describes, which in a cluster means an overwrite landed elsewhere and
+// has not replicated here yet.
+//
+// Metadata is Raft-replicated and synchronous, object data is copied
+// asynchronously, so the two are briefly out of step after an overwrite. The read
+// path used to hand back whatever the local engine could open and only consulted
+// a peer when opening FAILED, so a node holding the PREVIOUS bytes served them
+// under the NEW object's ETag and Last-Modified: a silent wrong answer rather
+// than a miss, which is the worst shape a storage bug can take.
+//
+// Size is the signal because it is already in hand: the engine returns it from
+// the open, and after decompression and decryption it is the plaintext length the
+// metadata records. Comparing it costs nothing and never gives a false positive.
+// An overwrite that keeps the byte count identical still slips through, so this
+// narrows the window rather than closing it completely.
+//
+// Single-node servers skip the check: there is no second copy to be behind, and
+// no peer to ask if the check were to fire.
+func (h *ObjectHandler) localCopyIsStale(meta *metadata.ObjectMeta, opened int64) bool {
+	if h.dataHolderFallback == nil || meta == nil {
+		return false
+	}
+	if meta.DeleteMarker || meta.Size < 0 || opened < 0 {
+		return false
+	}
+	return meta.Size != opened
+}
+
+// staleVerifyWindow is how long after a write a clustered node still checks the
+// CONTENT of its local copy instead of trusting it. Data replication settles in
+// about two seconds, so a minute is generous. Outside the window the local copy
+// has certainly caught up and reads cost nothing extra, which is the case for
+// almost every read a real workload makes.
+const staleVerifyWindow = 60 * time.Second
+
+// staleVerifyMaxSize bounds the work: verifying means hashing the local copy, so
+// it is only worth doing while the object is small enough that the hash is
+// cheap next to serving it. A larger object inside the window falls back to the
+// size check alone.
+const staleVerifyMaxSize = 64 << 20
+
+// localCopyNeedsContentCheck reports whether a same-size local copy is recent
+// enough to be worth verifying byte for byte.
+//
+// The size check alone catches an overwrite that changed the byte count, which
+// is most of them, but an overwrite that keeps the size identical slips through
+// and is served as a silent wrong answer. Content is the only signal that
+// catches that, and hashing every read would undo the streaming work from issue
+// #38, so it is limited to objects that were written moments ago: exactly the
+// window in which replication can still be in flight.
+func (h *ObjectHandler) localCopyNeedsContentCheck(meta *metadata.ObjectMeta, opened int64) bool {
+	if h.dataHolderFallback == nil || meta == nil || meta.DeleteMarker {
+		return false
+	}
+	if opened <= 0 || opened > staleVerifyMaxSize {
+		return false
+	}
+	// A multipart ETag is not the MD5 of the object, so it cannot be recomputed
+	// from the bytes here.
+	if meta.ETag == "" || strings.Contains(meta.ETag, "-") {
+		return false
+	}
+	if meta.LastModified == 0 {
+		return false
+	}
+	return time.Since(time.Unix(meta.LastModified, 0)) < staleVerifyWindow
+}
+
+// localCopyContentMatches hashes what the engine opened and compares it with the
+// ETag the metadata records, then rewinds so the caller can still serve it.
+// Returns true when it cannot tell, so an unreadable or unseekable copy is not
+// mistaken for a stale one.
+func (h *ObjectHandler) localCopyContentMatches(reader storage.ReadSeekCloser, meta *metadata.ObjectMeta) bool {
+	sum := md5.New()
+	if _, err := io.Copy(sum, reader); err != nil {
+		return true
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return true
+	}
+	return strings.Trim(meta.ETag, `"`) == hex.EncodeToString(sum.Sum(nil))
 }
 
 // serveFromDataHolder asks a peer holder to serve a read this node has metadata
@@ -703,7 +788,7 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			writeS3Error(w, "NoSuchKey", "Object is a delete marker", http.StatusNotFound)
 			return
 		}
-		reader, size, err = h.engine.GetObjectVersion(bucket, key, versionID)
+		reader, size, err = h.readObjectData(bucket, key, versionID)
 		if err != nil {
 			// The version's metadata is here but its bytes may live on another
 			// holder that has not been copied to yet (issue #42).
@@ -741,10 +826,39 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		}
 		if meta.VersionID != "" {
 			// Versioned bucket — read from version storage
-			reader, size, err = h.engine.GetObjectVersion(bucket, key, meta.VersionID)
+			reader, size, err = h.readObjectData(bucket, key, meta.VersionID)
 			w.Header().Set("X-Amz-Version-Id", meta.VersionID)
 		} else {
 			reader, size, err = h.engine.GetObject(bucket, key)
+		}
+		if err == nil && !h.localCopyIsStale(meta, size) && h.localCopyNeedsContentCheck(meta, size) &&
+			!h.localCopyContentMatches(reader, meta) {
+			// Same byte count, different bytes: an overwrite that kept the size
+			// landed on another holder and has not replicated here yet.
+			reader.Close()
+			slog.Info("local object copy has the right size but the wrong content, routing the read to a holder",
+				"bucket", bucket, "key", key)
+			if h.serveFromDataHolder(w, r, bucket, key) {
+				return
+			}
+			writeS3Error(w, "SlowDown", "Object data is being replicated, please retry", http.StatusServiceUnavailable)
+			return
+		}
+		if err == nil && h.localCopyIsStale(meta, size) {
+			// The bytes here are not the bytes the metadata describes, so serving
+			// them would answer with the previous object under the new object's
+			// ETag. Ask a holder that has the current data instead.
+			reader.Close()
+			slog.Info("local object copy is behind its metadata, routing the read to a holder",
+				"bucket", bucket, "key", key, "meta_size", meta.Size, "local_size", size)
+			if h.serveFromDataHolder(w, r, bucket, key) {
+				return
+			}
+			// No peer could serve the current bytes either. Replication is still in
+			// flight, so ask the client to retry rather than hand back data known to
+			// be wrong. Every S3 SDK retries this on its own (issue #42).
+			writeS3Error(w, "SlowDown", "Object data is being replicated, please retry", http.StatusServiceUnavailable)
+			return
 		}
 		if err != nil {
 			// Metadata says the object exists but this node cannot read its data.
@@ -1074,6 +1188,15 @@ func (h *ObjectHandler) deleteObjectVersion(bucket, key, versionID string, bypas
 		if meta, err := h.store.GetObjectMeta(bucket, key); err == nil && meta != nil && meta.VersionID == "" {
 			return h.deleteCurrentObject(bucket, key, bypassGovernance)
 		}
+		// The null version can also be hidden behind a delete marker, in which
+		// case the latest pointer names the marker rather than the object and the
+		// branch above does not fire. Its bytes are still at the ordinary object
+		// path, so the version-aware delete below would remove a .vs/ file that
+		// was never written and leave the real data orphaned. Remove it here.
+		if err := h.engine.DeleteObject(bucket, key); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("could not remove the data of a null version hidden by a delete marker",
+				"bucket", bucket, "key", key, "error", err)
+		}
 	}
 	if err := h.checkObjectLock(bucket, key, versionID, bypassGovernance); err != nil {
 		return objectDeletion{}, &deleteRefused{err: err}
@@ -1106,10 +1229,32 @@ func (h *ObjectHandler) deleteObjectVersion(bucket, key, versionID string, bypas
 // No object-lock check: nothing is destroyed, which is also why S3 allows it on
 // a locked object.
 func (h *ObjectHandler) writeDeleteMarker(bucket, key, markerVersionID string) (objectDeletion, error) {
-	if old, err := h.store.GetObjectMeta(bucket, key); err == nil && old.VersionID != "" {
-		old.IsLatest = false
-		if err := h.store.PutObjectVersion(*old); err != nil {
-			return objectDeletion{}, &deleteNotRecorded{op: "demote previous version", err: err}
+	if old, err := h.store.GetObjectMeta(bucket, key); err == nil && old != nil {
+		// An object written BEFORE versioning was enabled on its bucket carries no
+		// version id, and the guard here used to be `old.VersionID != ""`, so such
+		// an object was never demoted into a version record. The marker then
+		// overwrote the latest pointer, which was the only thing naming it: taking
+		// the marker away could not bring the object back, and its bytes sat on
+		// disk with nothing referring to them. That is silent data loss on a
+		// bucket the user had just asked to keep every version.
+		//
+		// S3 calls an object that predates versioning the "null" version, so adopt
+		// it as one before hiding it. Its bytes stay at the ordinary object path
+		// rather than under .vs/, which readObjectData and deleteObjectVersion
+		// both account for.
+		if old.VersionID == "" {
+			if old.DeleteMarker {
+				// A marker with no version id is not an object to preserve.
+				old = nil
+			} else {
+				old.VersionID = nullVersionID
+			}
+		}
+		if old != nil {
+			old.IsLatest = false
+			if err := h.store.PutObjectVersion(*old); err != nil {
+				return objectDeletion{}, &deleteNotRecorded{op: "demote previous version", err: err}
+			}
 		}
 	}
 	dm := metadata.ObjectMeta{
@@ -1717,6 +1862,23 @@ func (h *ObjectHandler) DeleteObjectTagging(w http.ResponseWriter, r *http.Reque
 	if h.onSearchUpdate != nil {
 		h.onSearchUpdate("put", bucket, key)
 	}
+}
+
+// readObjectData opens the bytes for the version the metadata names.
+//
+// The "null" version is the special case. It names an object stored before its
+// bucket was versioned, whose data lives at the ordinary object path and NOT
+// under .vs/<key>/<version>, so asking the engine for it as a version finds
+// nothing. Falling back keeps a restored pre-versioning object readable.
+func (h *ObjectHandler) readObjectData(bucket, key, versionID string) (storage.ReadSeekCloser, int64, error) {
+	if versionID == "" {
+		return h.engine.GetObject(bucket, key)
+	}
+	reader, size, err := h.engine.GetObjectVersion(bucket, key, versionID)
+	if err != nil && versionID == nullVersionID {
+		return h.engine.GetObject(bucket, key)
+	}
+	return reader, size, err
 }
 
 // nullVersionID is the version id S3 reports for an object stored before its

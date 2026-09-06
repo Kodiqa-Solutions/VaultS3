@@ -42,6 +42,10 @@ func (e *KMSEncryptedEngine) dataKey() ([]byte, error) {
 // decrypt serves a stored blob, streaming when it carries a VS3S header and
 // falling back to the whole-object KMS path for objects written before it.
 func (e *KMSEncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	reader, stored, uerr := openSealed(reader, stored)
+	if uerr != nil {
+		return nil, 0, uerr
+	}
 	if h, ok := peekStreamHeader(reader); ok {
 		dek, err := e.dataKey()
 		if err != nil {

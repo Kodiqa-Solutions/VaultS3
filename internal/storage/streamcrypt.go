@@ -434,3 +434,19 @@ func openLegacyWhole(src io.Reader, stored int64, gcm cipher.AEAD) ([]byte, erro
 	// unauthenticated bytes.
 	return gcm.Open(ct[:0], nonce, ct, nil)
 }
+
+// openSealed prepares a stored blob for decryption, and is the one place every
+// encryption engine goes through on the way in.
+//
+// Until VaultS3 4.4.70 the compressor wrapped the encryptor, so an object
+// written with both enabled is compress(encrypt(plaintext)) and its bytes start
+// with a zstd or gzip magic rather than the VS3S stream header. That layering
+// saved nothing, because ciphertext does not compress, which is why the order is
+// now the other way round. Those objects still have to read, so the outer
+// compression is unwrapped here before the blob reaches the decryptor.
+//
+// A blob that is not compressed is streamed through untouched, so this costs a
+// four-byte peek on the ordinary path.
+func openSealed(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	return decompressIfCompressed(reader, stored)
+}

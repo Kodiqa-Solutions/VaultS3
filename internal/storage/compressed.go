@@ -254,19 +254,27 @@ func (c *CompressedEngine) getAndDecompress(getFn func() (ReadSeekCloser, int64,
 	if err != nil {
 		return nil, 0, err
 	}
+	return decompressIfCompressed(src, storedSize)
+}
+
+// decompressIfCompressed decodes a stored blob when it carries a zstd or gzip
+// magic and streams it through untouched when it does not. Split out of the
+// engine method so the encryption layer can use it to unwrap the legacy
+// compress-outside-encrypt layering (see openSealed).
+func decompressIfCompressed(src ReadSeekCloser, storedSize int64) (ReadSeekCloser, int64, error) {
 
 	magic := make([]byte, 4)
 	n, _ := io.ReadFull(src, magic)
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		// Source is not seekable — cannot peek/stream, use the buffered path.
-		return c.bufferedDecompress(src)
+		return bufferedDecompress(src)
 	}
 
 	switch {
 	case n >= 4 && magic[0] == 0x28 && magic[1] == 0xB5 && magic[2] == 0x2F && magic[3] == 0xFD:
 		size, ok := zstdContentSize(src)
 		if !ok || size > maxCompressedSize {
-			return c.bufferedDecompress(src)
+			return bufferedDecompress(src)
 		}
 		return &decompressStream{src: src, size: size, newDec: func(r io.Reader) (io.ReadCloser, error) {
 			d, err := zstd.NewReader(r)
@@ -278,7 +286,7 @@ func (c *CompressedEngine) getAndDecompress(getFn func() (ReadSeekCloser, int64,
 	case n >= 2 && magic[0] == 0x1F && magic[1] == 0x8B:
 		size, ok := gzipISize(src)
 		if !ok || size > maxCompressedSize {
-			return c.bufferedDecompress(src)
+			return bufferedDecompress(src)
 		}
 		return &decompressStream{src: src, size: size, newDec: func(r io.Reader) (io.ReadCloser, error) {
 			return gzip.NewReader(r)
@@ -293,7 +301,7 @@ func (c *CompressedEngine) getAndDecompress(getFn func() (ReadSeekCloser, int64,
 // bufferedDecompress is the fallback path: read the whole blob, decompress in memory,
 // serve from a bytes reader. Used when the source is not seekable or the decompressed
 // size cannot be read from the header.
-func (c *CompressedEngine) bufferedDecompress(src ReadSeekCloser) (ReadSeekCloser, int64, error) {
+func bufferedDecompress(src ReadSeekCloser) (ReadSeekCloser, int64, error) {
 	defer src.Close()
 	compressed, err := io.ReadAll(io.LimitReader(src, maxCompressedSize+1))
 	if err != nil {

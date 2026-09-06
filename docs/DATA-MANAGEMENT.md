@@ -128,7 +128,7 @@ compression:
 
 All objects are transparently compressed (zstd) on write and decompressed on read. Objects written by older gzip builds are still read correctly.
 
-**Compression currently has no effect when encryption at rest is enabled.** Encryption wraps compression, so the compressor is handed ciphertext, which does not compress: measured on a 1.12 MB highly repetitive payload with both enabled, the stored object is 1.00x the plaintext. Enabling both costs CPU for no saving. Pick one until this is addressed.
+**Compression works with encryption at rest.** Compression runs on the plaintext, before encryption, so the two compose: a 216 KB highly repetitive payload with both enabled is stored in 123 bytes. This was not always true. Encryption used to wrap compression, so the compressor was handed ciphertext, which does not compress, and the same payload occupied 216,056 bytes, exactly 1.00x, while still costing the CPU to attempt it. Objects written under that layering are still read correctly and need no rewrite, but they keep the size they were stored at, so the saving on an existing deployment appears as data is rewritten rather than at upgrade time.
 
 Both directions stream, so a large object costs a compression window rather than a copy of itself: peak memory scales with concurrency, not with concurrency multiplied by object size. An upload that does not declare its length falls back to buffering, because the decompressed size has to be recorded in the frame header for reads to stream.
 

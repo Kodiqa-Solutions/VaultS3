@@ -152,6 +152,10 @@ func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64
 	if stored == 0 {
 		return reader, 0, nil
 	}
+	reader, stored, uerr := openSealed(reader, stored)
+	if uerr != nil {
+		return nil, 0, uerr
+	}
 	if h, ok := peekStreamHeader(reader); ok {
 		dek, err := e.streamKey(bucket, h.keyVersion)
 		if err != nil {

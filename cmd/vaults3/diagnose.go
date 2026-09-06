@@ -201,8 +201,9 @@ func buildDiagnosis(cfg *config.Config, ver, loadedFrom string) diagnosis {
 	// Known interactions worth surfacing without being asked, because each one
 	// has already cost a round trip on an issue.
 	if cfg.Compression.Enabled && cfg.Encryption.Enabled {
-		d.Notes = append(d.Notes, "compression saves nothing here: encryption wraps compression, so the "+
-			"compressor only sees ciphertext (measured 1.00x). The CPU cost is still paid.")
+		d.Notes = append(d.Notes, "compression now runs on plaintext, before encryption, so it works with "+
+			"encryption on. Objects written before 4.4.70 were compressed AFTER encryption and so were "+
+			"never really compressed; they still read, but they keep their original size until rewritten.")
 	}
 	if cfg.Packing.Enabled && (cfg.Encryption.Enabled || cfg.Erasure.Enabled) {
 		d.Notes = append(d.Notes, "small-file packing is skipped while encryption or erasure coding is on, "+

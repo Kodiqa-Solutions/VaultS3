@@ -79,6 +79,10 @@ func (e *EncryptedEngine) GetObject(bucket, key string) (ReadSeekCloser, int64, 
 // decrypt picks the format from the blob itself: a VS3S header means the object
 // streams, anything else is the original whole-object format.
 func (e *EncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	reader, stored, err := openSealed(reader, stored)
+	if err != nil {
+		return nil, 0, err
+	}
 	if h, ok := peekStreamHeader(reader); ok {
 		sr, err := newStreamReader(reader, stored, h, e.key)
 		if err != nil {
