@@ -550,7 +550,8 @@ func New(cfg *config.Config) (*Server, error) {
 			"url", cfg.ExternalAuth.URL,
 			"authoritative", cfg.ExternalAuth.Authoritative,
 			"fail_open", cfg.ExternalAuth.FailOpen,
-			"cache_ttl_secs", cfg.ExternalAuth.CacheTTLSecs)
+			"cache_ttl_secs", cfg.ExternalAuth.CacheTTLSecs,
+			"evaluates", "non-admin identities only")
 		if cfg.ExternalAuth.FailOpen {
 			slog.Warn("external authorization is fail-open: a webhook that cannot be reached will ALLOW the request")
 		}

@@ -37,6 +37,18 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Upgrading to 4.4.71
+
+**Nothing to change.** No behaviour, configuration or API changes.
+
+If you use the external authorization webhook, the server is now clearer about
+who it evaluates. The admin identity is never sent to the hook, and a login is
+authentication rather than an access decision, so testing with the admin
+credential sends the endpoint nothing at all. That was true before and is
+unchanged. The difference is that the server now says so in its log the first
+time it happens, names the audience in its startup line, and repeats it in
+`vaults3 diagnose`. Test the hook with a non-admin access key.
+
 ## Upgrading to 4.4.70
 
 **Nothing to change, but read this if you run compression with encryption.**

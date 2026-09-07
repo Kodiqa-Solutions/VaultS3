@@ -117,6 +117,7 @@ func (h *APIHandler) authorizeConsoleBucket(r *http.Request, rest string) error 
 		return err
 	}
 	if user == "admin" {
+		h.s3Auth.ExternalAuth().NoteAdminBypass()
 		return nil
 	}
 	act, ok := consoleActionFor(r.Method, rest)

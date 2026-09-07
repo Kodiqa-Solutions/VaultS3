@@ -82,6 +82,8 @@ type ExternalAuth struct {
 
 	mu    sync.Mutex
 	cache map[string]cachedDecision
+
+	adminNote sync.Once
 }
 
 type cachedDecision struct {
@@ -134,6 +136,30 @@ func NewExternalAuth(cfg ExternalAuthConfig) (*ExternalAuth, error) {
 // Authoritative reports whether an allow from this webhook may grant access that
 // IAM alone would refuse.
 func (e *ExternalAuth) Authoritative() bool { return e != nil && e.cfg.Authoritative }
+
+// NoteAdminBypass explains, once per process, that a request was authorized
+// without asking the webhook because it came from the admin identity.
+//
+// This exists because of how the feature reads when you first switch it on. The
+// admin credential is the one everybody tests with, admin is deliberately never
+// sent to the webhook, and a login is authentication rather than an access
+// decision, so a new user points the hook at a request bin, signs in, browses a
+// bucket, and sees precisely nothing arrive. The server said "external
+// authorization enabled" and then behaved as though it were not. It was
+// documented in five places and still cost the first person to try it an hour
+// (issue #52), which means the documentation was in the wrong place: the answer
+// belongs where they were already looking, which is the log.
+//
+// Once per process, not per request: this is an explanation, not an audit trail.
+func (e *ExternalAuth) NoteAdminBypass() {
+	if e == nil {
+		return
+	}
+	e.adminNote.Do(func() {
+		slog.Info("external authorization is not consulted for the admin identity, so admin requests reach no webhook. " +
+			"Only non-admin access keys and dashboard users are evaluated. Create an IAM user and an access key to exercise it")
+	})
+}
 
 // Endpoint returns the configured URL, for diagnostics.
 func (e *ExternalAuth) Endpoint() string {

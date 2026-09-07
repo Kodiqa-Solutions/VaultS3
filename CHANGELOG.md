@@ -4,6 +4,20 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.71] - 2026-09-07
+### Fixed
+- The external authorization webhook now explains why it is not being called.
+  The admin identity is deliberately never sent to it, and a login is
+  authentication rather than an access decision, so pointing the hook at a
+  request bin, signing in as admin and browsing sent it nothing at all: the
+  server logged "external authorization enabled" and then behaved exactly as
+  though it were not. It was documented in five places and still cost the first
+  person who tried it an hour (#52), which means the documentation was in the
+  wrong place. The server now says it once in the log the first time an admin
+  request bypasses the hook, names the audience in the startup line
+  (`evaluates="non-admin identities only"`), repeats it in `vaults3 diagnose`,
+  and answers it up front in the access-control guide. No behaviour changed.
+
 ## [4.4.70] - 2026-09-06
 ### Fixed
 - **A delete marker over an object that predated versioning is now reversible.**
@@ -2460,7 +2474,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.70...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.71...HEAD
+[4.4.71]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.70...v4.4.71
 [4.4.70]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.69...v4.4.70
 [4.4.69]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.68...v4.4.69
 [4.4.68]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.67...v4.4.68

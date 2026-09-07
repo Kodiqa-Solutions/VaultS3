@@ -209,6 +209,11 @@ func buildDiagnosis(cfg *config.Config, ver, loadedFrom string) diagnosis {
 		d.Notes = append(d.Notes, "small-file packing is skipped while encryption or erasure coding is on, "+
 			"so objects are stored individually despite packing being enabled.")
 	}
+	if cfg.ExternalAuth.Enabled {
+		d.Notes = append(d.Notes, "external authorization is never consulted for the admin identity, and a "+
+			"login is authentication rather than an access decision, so signing in with the admin key and "+
+			"browsing sends the webhook nothing. Test it with a non-admin access key.")
+	}
 	if cfg.ExternalAuth.Enabled && cfg.ExternalAuth.FailOpen {
 		d.Notes = append(d.Notes, "external authorization is fail-open: if the webhook cannot be reached "+
 			"the request is ALLOWED, so an endpoint outage silently widens access.")

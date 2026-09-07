@@ -1,10 +1,14 @@
 package iam
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -285,4 +289,40 @@ func TestSourceIPOf(t *testing.T) {
 			t.Fatalf("SourceIPOf(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// The admin bypass has to explain itself, once, because a webhook that never
+// fires is indistinguishable from a broken one. Issue #52: the first person to
+// try the feature pointed it at a request bin, signed in as admin, and saw
+// nothing arrive.
+func TestNoteAdminBypassIsSafeAndOnlyFiresOnce(t *testing.T) {
+	var nilAuth *ExternalAuth
+	nilAuth.NoteAdminBypass() // must not panic: the common case is no webhook at all
+
+	srv, _ := webhook(t, true)
+	e := newExt(t, ExternalAuthConfig{URL: srv.URL})
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	for i := 0; i < 25; i++ {
+		e.NoteAdminBypass()
+	}
+	if n := strings.Count(buf.String(), "not consulted for the admin identity"); n != 1 {
+		t.Fatalf("logged %d times, want exactly 1: this is an explanation, not an audit trail", n)
+	}
+}
+
+// Concurrent admin requests are the normal case, so the note must be race-free.
+func TestNoteAdminBypassIsConcurrencySafe(t *testing.T) {
+	srv, _ := webhook(t, true)
+	e := newExt(t, ExternalAuthConfig{URL: srv.URL})
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); e.NoteAdminBypass() }()
+	}
+	wg.Wait()
 }

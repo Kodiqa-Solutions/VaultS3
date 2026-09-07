@@ -397,6 +397,10 @@ func (a *Authenticator) Authorize(identity *iam.Identity, action, resource strin
 // assessment finding 12).
 func (a *Authenticator) AuthorizeWithContext(identity *iam.Identity, action, resource string, ctx map[string]string) error {
 	if identity.IsAdmin {
+		// Admin is the break-glass path and is never put to the external
+		// authorizer, so a broken endpoint cannot lock an operator out. Say so
+		// once, because a webhook that never fires otherwise looks broken.
+		a.external.NoteAdminBypass()
 		return nil
 	}
 	if ctx == nil {

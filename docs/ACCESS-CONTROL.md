@@ -151,6 +151,23 @@ external_auth:
 `VAULTS3_EXTERNAL_AUTH_TOKEN` sets the bearer token, so the shared secret can
 come from a Kubernetes Secret rather than a mounted config file.
 
+### Nothing is reaching my webhook
+
+Two reasons, and between them they explain almost every empty request log.
+
+**You are testing with the admin credential.** The admin identity is never sent
+to the webhook, on either the S3 or the dashboard path, so admin requests reach
+no endpoint at all. That is deliberate: it is the break-glass route, and an
+endpoint that is down or misconfigured must not be able to lock you out of your
+own server. Create an IAM user and an access key, and use those. The server says
+so once in its log the first time an admin request bypasses the hook, and
+`vaults3 diagnose` repeats it.
+
+**A login is not an access decision.** This is an authorization hook, not an
+authentication one. Signing into the dashboard mints a session, and an S3 client
+has no login step at all, so neither sends anything. The first call that does is
+the client's opening `ListBuckets`, and only for a non-admin key.
+
 ### The contract
 
 VaultS3 POSTs one JSON object per decision and expects a 200 with `allow`:

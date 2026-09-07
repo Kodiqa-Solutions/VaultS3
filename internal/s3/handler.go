@@ -383,7 +383,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Authorize non-admin identities
+		// Authorize non-admin identities. Admin skips authorization altogether,
+		// which also means it never reaches the external authorizer, so say that
+		// once: a webhook that never fires otherwise looks broken (issue #52).
+		if identity.IsAdmin {
+			h.auth.ExternalAuth().NoteAdminBypass()
+		}
 		if !identity.IsAdmin {
 			action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
 			resource := formatResource(bucket, key)
