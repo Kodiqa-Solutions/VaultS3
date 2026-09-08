@@ -136,6 +136,11 @@ Delegate the access decision to an HTTP endpoint you run, so entitlements that
 live in another system can gate VaultS3 without being copied into IAM policies.
 Off by default.
 
+**Auth here means authorization, not authentication.** The hook is asked whether
+a caller may perform an action on a resource. It is not asked whether someone may
+log in, so a dashboard sign-in never reaches it, and an S3 client has no login
+step to intercept in the first place.
+
 ```yaml
 external_auth:
   enabled: true
@@ -150,6 +155,43 @@ external_auth:
 `VAULTS3_EXTERNAL_AUTH_URL` sets the URL and switches the feature on.
 `VAULTS3_EXTERNAL_AUTH_TOKEN` sets the bearer token, so the shared secret can
 come from a Kubernetes Secret rather than a mounted config file.
+
+### Quick start
+
+Requires 4.4.69 or later, and 4.4.71 or later is worth having because the server
+explains the admin rule below in its own log rather than leaving you to find it.
+
+1. Set `external_auth.enabled` to `true`.
+2. Set `external_auth.url` to your endpoint, for example
+   `http://localhost:3000/authorize`.
+3. Set `external_auth.token` to a shared secret, for example `demo-key`. Your
+   endpoint should reject anything that does not present it.
+4. In the dashboard, create an IAM user and an access key **for a non-admin
+   user**. This step is the one people miss: the admin identity is never sent to
+   the webhook, so testing with the admin credential sends your endpoint nothing
+   at all.
+5. Point an S3 client at VaultS3 using that access key and secret.
+6. Watch your endpoint. The client's opening `ListBucket` is usually the first
+   decision to arrive.
+
+VaultS3 POSTs one JSON object per decision:
+
+```json
+{
+  "accessKey": "63f1432919ecdb3387b8",
+  "user": "tester",
+  "action": "s3:ListBucket",
+  "resource": "arn:aws:s3:::my-bucket",
+  "sourceIP": "172.25.144.1"
+}
+```
+
+and expects `{"allow": true|false, "reason": "..."}` with a `200 OK`.
+
+This walkthrough follows the one [@rscataran](https://github.com/rscataran)
+worked out and posted in
+[#52](https://github.com/Kodiqa-Solutions/VaultS3/issues/52), which was a better
+starting point than the reference material that preceded it here.
 
 ### Nothing is reaching my webhook
 

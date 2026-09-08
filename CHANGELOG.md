@@ -4,6 +4,19 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [Unreleased]
+### Changed
+- The external authorization guide now opens with a quick start: enable the hook,
+  point it at an endpoint, set a shared token, and then the step everyone misses,
+  create an access key for a **non-admin** user, because the admin identity is
+  never sent to the webhook. It also states up front that "auth" here means
+  authorization and not authentication, so a dashboard login never reaches the
+  hook and an S3 client has no login step to intercept. The section previously
+  led with reference material, which is accurate but is not what someone needs
+  when nothing is arriving at their endpoint. Follows the walkthrough
+  [@rscataran](https://github.com/rscataran) worked out and posted in #52, which
+  was a better starting point than what was here before.
+
 ## [4.4.71] - 2026-09-07
 ### Fixed
 - The external authorization webhook now explains why it is not being called.
