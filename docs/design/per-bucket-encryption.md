@@ -114,8 +114,12 @@ object as one message:
   **key version**. Key version 0 in a `VS3S` blob means it was sealed with a
   server-wide key (per-bucket versions start at 1), so it routes to the legacy key.
 - If it starts with neither magic, it is either a legacy global-key object
-  (decrypt with the legacy engine key if configured) or plaintext (opt-out bucket)
-, handled by the integration layer.
+  (decrypt with the legacy engine key if configured) or plaintext (opt-out
+  bucket). The decision is made from the first four bytes; a plaintext object
+  is handed back as the underlying seekable reader and is never buffered, so a
+  range read costs only its range and object size is unbounded (#53). Only
+  `VS3X` and legacy global-key blobs are read whole, because those formats
+  cannot be authenticated any other way.
 
 ### Per-bucket opt-in / opt-out
 

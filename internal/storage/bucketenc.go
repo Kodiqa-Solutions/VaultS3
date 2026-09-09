@@ -91,9 +91,37 @@ func (e *PerBucketEngine) open(bucket string, data []byte) ([]byte, error) {
 	return data, nil
 }
 
-func (e *PerBucketEngine) readAll(r ReadSeekCloser) ([]byte, error) {
+// maxWholeObjectStored bounds the blobs that still take the whole-object read
+// path (VS3X and legacy global-key objects): the plaintext limit plus room for
+// the largest header, nonce and tag any of those formats carries. Plaintext
+// objects never pass through here and have no such limit.
+const maxWholeObjectStored = maxEncryptedSize + 64
+
+// readWhole reads a whole-object blob into memory so it can be authenticated.
+// A blob larger than the format allows is refused outright: the previous
+// LimitReader silently cut such objects short and handed the client an
+// incomplete file with a 200 (issue #53).
+func (e *PerBucketEngine) readWhole(r ReadSeekCloser, stored int64) ([]byte, error) {
 	defer r.Close()
-	return io.ReadAll(io.LimitReader(r, maxEncryptedSize+int64(64)))
+	if stored < 0 || stored > maxWholeObjectStored {
+		return nil, fmt.Errorf("storage: encrypted object too large (%d bytes)", stored)
+	}
+	buf := make([]byte, stored)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// peekPerBucketHeader reports whether the blob starts with the VS3X whole-object
+// header, leaving the reader positioned at the start.
+func peekPerBucketHeader(r io.ReadSeeker) (bool, error) {
+	var magic [4]byte
+	n, _ := io.ReadFull(r, magic[:])
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	return bucketcrypto.HasHeader(magic[:n]), nil
 }
 
 // put writes reader through the bucket's key, streaming when the bucket is
@@ -143,7 +171,7 @@ func (e *PerBucketEngine) streamKey(bucket string, keyVersion uint32) ([]byte, e
 
 // get resolves the format from the stored blob: VS3S streams with the key
 // version named in its header, VS3X and legacy global-key blobs take the
-// whole-object path they were written with.
+// whole-object path they were written with, and plaintext passes through.
 func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	// An empty object carries no header and no ciphertext, so there is nothing to
 	// decrypt. Without this it fell through to the whole-object path, which
@@ -170,7 +198,23 @@ func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64
 		return sr, sr.Size(), nil
 	}
 
-	data, err := e.readAll(reader)
+	// Only two formats remain: a VS3X whole-object blob, or a headerless blob
+	// that is legacy global-key ciphertext when a legacy key is configured and
+	// plaintext otherwise. Plaintext needs no work, so it is handed back as the
+	// underlying reader: seekable, streamed, and never held in memory. Before
+	// this, every object in an opted-out bucket was read whole on every GET,
+	// which turned a 1 KB range read of a large object into a full copy of it
+	// and truncated anything past 1 GiB (issue #53).
+	perBucket, err := peekPerBucketHeader(reader)
+	if err != nil {
+		reader.Close()
+		return nil, 0, fmt.Errorf("read object: %w", err)
+	}
+	if !(perBucket && e.manager() != nil) && e.legacy == nil {
+		return reader, stored, nil
+	}
+
+	data, err := e.readWhole(reader, stored)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read object: %w", err)
 	}
