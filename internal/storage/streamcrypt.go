@@ -121,12 +121,11 @@ func parseStreamHeader(src io.Reader) (streamHeader, error) {
 // peekStreamHeader decides between the streaming and legacy formats.
 //
 // On success src is left positioned at the first chunk and is deliberately NOT
-// rewound: an inner reader is not always cheap to seek. The decompressor
-// materialises the entire object to satisfy a Seek (it has to, the codecs are
-// not seekable), so rewinding here would cost, per concurrent reader, exactly
-// the copy of the object this format exists to avoid. Only when the blob turns
-// out not to be a stream does src rewind, for the legacy path that buffers it
-// anyway.
+// rewound: an inner reader is not always cheap to seek. A legacy single-frame
+// decompressor satisfies a backward Seek by restarting its decoder from the
+// front, so rewinding here would make every read of a compress-outside-encrypt
+// object decode its header twice. Only when the blob turns out not to be a
+// stream does src rewind, for the legacy path that buffers it anyway.
 func peekStreamHeader(src ReadSeekCloser) (streamHeader, bool) {
 	h, err := parseStreamHeader(src)
 	if err == nil {
@@ -232,9 +231,8 @@ func sealStream(dst io.Writer, src io.Reader, key []byte, keyVersion uint32, chu
 // pipe, so the inner engine writes bytes to disk as they are produced.
 //
 // size is the plaintext length (-1 when unknown). When it is known the exact
-// stored length is computed and passed down, which matters because an inner
-// engine given an unknown length can fall back to buffering (the compression
-// engine does exactly that when it cannot record a frame content size).
+// stored length is computed and passed down, so an inner engine that sizes its
+// write up front (preallocation, erasure striping) is not forced to stream blind.
 func sealStreamToEngine(key []byte, keyVersion uint32, reader io.Reader, size int64,
 	put func(sealed io.Reader, storedSize int64) (int64, string, error),
 ) (int64, string, error) {
@@ -413,8 +411,10 @@ func (r *streamReader) Size() int64 { return r.plainSize }
 // making several copies of it. Reading into one exact-size buffer skips
 // io.ReadAll's grow-and-copy, and opening in place reuses that same buffer for
 // the plaintext, which took the cost of a read from roughly 3x the object size
-// down to 1x. Objects rewritten (or written after this change) use the streaming
-// format above and cost a chunk instead.
+// down to 1x. Concurrent readers of the same blob then share that one buffer
+// through wholeFlight (wholeflight.go), so the cost is per object rather than
+// per request. Objects rewritten (or written after this change) use the
+// streaming format above and cost a chunk instead.
 func openLegacyWhole(src io.Reader, stored int64, gcm cipher.AEAD) ([]byte, error) {
 	if stored < 0 || stored > maxEncryptedSize+int64(gcm.NonceSize())+streamTagLen {
 		return nil, fmt.Errorf("storage: encrypted object too large (%d bytes)", stored)

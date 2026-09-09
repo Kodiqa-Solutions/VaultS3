@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"fmt"
@@ -26,6 +25,9 @@ type PerBucketEngine struct {
 	// legacyKey is the same key as legacy, kept in raw form because the streaming
 	// format derives a per-chunk AEAD rather than reusing one.
 	legacyKey []byte
+	// whole shares the plaintext of VS3X and legacy global-key objects between
+	// concurrent readers, since those formats decrypt in one piece.
+	whole wholeFlight
 }
 
 // NewPerBucketEngine wraps inner. legacyKey (32 bytes) is optional and only used
@@ -186,7 +188,9 @@ func (e *PerBucketEngine) streamKey(bucket string, keyVersion uint32) ([]byte, e
 // version named in its header (or passes through when that version says the
 // key is the customer's), VS3X and legacy global-key blobs take the
 // whole-object path they were written with, and plaintext passes through.
-func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+// flightKey names the stored blob so concurrent whole-object reads of it share
+// one plaintext (see wholeflight.go).
+func (e *PerBucketEngine) get(bucket, flightKey string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	// An empty object carries no header and no ciphertext, so there is nothing to
 	// decrypt. Without this it fell through to the whole-object path, which
 	// rejected it as "encrypted data too short", making every zero-byte object in
@@ -233,16 +237,17 @@ func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64
 	if !(perBucket && e.manager() != nil) && e.legacy == nil {
 		return reader, stored, nil
 	}
-
-	data, err := e.readWhole(reader, stored)
-	if err != nil {
-		return nil, 0, fmt.Errorf("read object: %w", err)
-	}
-	plain, err := e.open(bucket, data)
-	if err != nil {
-		return nil, 0, fmt.Errorf("decrypt: %w", err)
-	}
-	return &bytesReadSeekCloser{Reader: bytes.NewReader(plain)}, int64(len(plain)), nil
+	return e.whole.open(flightKey, reader, func() ([]byte, error) {
+		data, err := e.readWhole(reader, stored)
+		if err != nil {
+			return nil, fmt.Errorf("read object: %w", err)
+		}
+		plain, err := e.open(bucket, data)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt: %w", err)
+		}
+		return plain, nil
+	})
 }
 
 func (e *PerBucketEngine) PutObject(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
@@ -262,7 +267,7 @@ func (e *PerBucketEngine) GetObject(bucket, key string) (ReadSeekCloser, int64, 
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.get(bucket, reader, stored)
+	return e.get(bucket, wholeFlightKey(bucket, key, "", stored), reader, stored)
 }
 
 func (e *PerBucketEngine) PutObjectVersion(bucket, key, versionID string, reader io.Reader, size int64) (int64, string, error) {
@@ -276,5 +281,5 @@ func (e *PerBucketEngine) GetObjectVersion(bucket, key, versionID string) (ReadS
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.get(bucket, reader, stored)
+	return e.get(bucket, wholeFlightKey(bucket, key, versionID, stored), reader, stored)
 }

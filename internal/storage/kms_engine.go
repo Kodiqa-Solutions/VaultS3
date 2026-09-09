@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 )
@@ -14,6 +13,9 @@ type KMSEncryptedEngine struct {
 	inner   Engine
 	kms     *KMS
 	keyName string
+	// whole shares the plaintext of pre-VS3S objects between concurrent readers,
+	// since the KMS-wrapped format has to be decrypted in one piece.
+	whole wholeFlight
 }
 
 // NewKMSEncryptedEngine creates an encrypting wrapper using KMS for key management.
@@ -41,7 +43,9 @@ func (e *KMSEncryptedEngine) dataKey() ([]byte, error) {
 
 // decrypt serves a stored blob, streaming when it carries a VS3S header and
 // falling back to the whole-object KMS path for objects written before it.
-func (e *KMSEncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+// flightKey names the stored blob so concurrent whole-object reads share one
+// plaintext (see wholeflight.go).
+func (e *KMSEncryptedEngine) decrypt(flightKey string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	reader, stored, uerr := openSealed(reader, stored)
 	if uerr != nil {
 		return nil, 0, uerr
@@ -63,16 +67,18 @@ func (e *KMSEncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadS
 		}
 		return sr, sr.Size(), nil
 	}
-	defer reader.Close()
-	encrypted, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1024))
-	if err != nil {
-		return nil, 0, fmt.Errorf("read encrypted: %w", err)
-	}
-	plaintext, err := e.kms.Decrypt(e.keyName, encrypted)
-	if err != nil {
-		return nil, 0, fmt.Errorf("kms decrypt: %w", err)
-	}
-	return &bytesReadSeekCloser{Reader: bytes.NewReader(plaintext)}, int64(len(plaintext)), nil
+	return e.whole.open(flightKey, reader, func() ([]byte, error) {
+		defer reader.Close()
+		encrypted, err := io.ReadAll(io.LimitReader(reader, maxEncryptedSize+1024))
+		if err != nil {
+			return nil, fmt.Errorf("read encrypted: %w", err)
+		}
+		plaintext, err := e.kms.Decrypt(e.keyName, encrypted)
+		if err != nil {
+			return nil, fmt.Errorf("kms decrypt: %w", err)
+		}
+		return plaintext, nil
+	})
 }
 
 func (e *KMSEncryptedEngine) PutObject(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
@@ -96,7 +102,7 @@ func (e *KMSEncryptedEngine) GetObject(bucket, key string) (ReadSeekCloser, int6
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.decrypt(reader, stored)
+	return e.decrypt(wholeFlightKey(bucket, key, "", stored), reader, stored)
 }
 
 func (e *KMSEncryptedEngine) DeleteObject(bucket, key string) error {
@@ -134,7 +140,7 @@ func (e *KMSEncryptedEngine) GetObjectVersion(bucket, key, versionID string) (Re
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.decrypt(reader, stored)
+	return e.decrypt(wholeFlightKey(bucket, key, versionID, stored), reader, stored)
 }
 
 func (e *KMSEncryptedEngine) DeleteObjectVersion(bucket, key, versionID string) error {

@@ -15,11 +15,13 @@ import (
 // nor a GET holds more than a chunk of the object. Objects written by earlier
 // versions used one GCM seal over the whole object and are still read, by the
 // legacy path, which necessarily buffers because a single tag covers everything
-// (issue #49).
+// (issue #49). Concurrent reads of one such object share a single buffer
+// (see wholeflight.go).
 type EncryptedEngine struct {
 	inner Engine
 	gcm   cipher.AEAD
 	key   []byte
+	whole wholeFlight
 }
 
 // NewEncryptedEngine creates an encrypting wrapper around the given engine.
@@ -73,12 +75,13 @@ func (e *EncryptedEngine) GetObject(bucket, key string) (ReadSeekCloser, int64, 
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.decrypt(reader, stored)
+	return e.decrypt(wholeFlightKey(bucket, key, "", stored), reader, stored)
 }
 
 // decrypt picks the format from the blob itself: a VS3S header means the object
-// streams, anything else is the original whole-object format.
-func (e *EncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+// streams, anything else is the original whole-object format. flightKey names
+// the stored blob so concurrent whole-object reads of it share one plaintext.
+func (e *EncryptedEngine) decrypt(flightKey string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	reader, stored, err := openSealed(reader, stored)
 	if err != nil {
 		return nil, 0, err
@@ -95,12 +98,14 @@ func (e *EncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeek
 		}
 		return sr, sr.Size(), nil
 	}
-	defer reader.Close()
-	plaintext, err := openLegacyWhole(reader, stored, e.gcm)
-	if err != nil {
-		return nil, 0, fmt.Errorf("decrypt: %w", err)
-	}
-	return &bytesReadSeekCloser{Reader: bytes.NewReader(plaintext)}, int64(len(plaintext)), nil
+	return e.whole.open(flightKey, reader, func() ([]byte, error) {
+		defer reader.Close()
+		plaintext, err := openLegacyWhole(reader, stored, e.gcm)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt: %w", err)
+		}
+		return plaintext, nil
+	})
 }
 
 func (e *EncryptedEngine) DeleteObject(bucket, key string) error {
@@ -137,7 +142,7 @@ func (e *EncryptedEngine) GetObjectVersion(bucket, key, versionID string) (ReadS
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.decrypt(reader, stored)
+	return e.decrypt(wholeFlightKey(bucket, key, versionID, stored), reader, stored)
 }
 
 func (e *EncryptedEngine) DeleteObjectVersion(bucket, key, versionID string) error {

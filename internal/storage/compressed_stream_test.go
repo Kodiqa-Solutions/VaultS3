@@ -26,9 +26,10 @@ func newCompressedFS(t *testing.T) (*CompressedEngine, string) {
 	return c, dir
 }
 
-// The streaming encoder must still record the zstd frame content size. Reads
-// depend on it to stream instead of materialising the whole object, so losing it
-// would silently undo the TTFB and memory work from issue #38.
+// Each frame must still record the zstd frame content size. The seekable reader
+// takes sizes from the table, but a decoder that ignores the table (and the
+// legacy single-frame path) depends on it to stream instead of materialising the
+// whole object, so losing it would silently undo the work from issue #38.
 func TestStreamCompressRecordsFrameContentSize(t *testing.T) {
 	c, dir := newCompressedFS(t)
 	payload := bytes.Repeat([]byte("compress me please "), 50000) // ~950 KB
@@ -91,9 +92,10 @@ func TestStreamCompressRoundTrip(t *testing.T) {
 	}
 }
 
-// An unknown length cannot be written into the frame header, so that case must
-// keep using the buffered encoder rather than produce a frame without an FCS.
-func TestUnknownLengthFallsBackToBuffered(t *testing.T) {
+// An upload of unknown length used to buffer so the frame content size could be
+// recorded. The seek table now carries the sizes, so it streams like any other
+// write and must still produce frames with a content size and read back whole.
+func TestUnknownLengthStreamsSeekable(t *testing.T) {
 	c, dir := newCompressedFS(t)
 	payload := bytes.Repeat([]byte("unknown length "), 10000)
 
@@ -110,7 +112,7 @@ func TestUnknownLengthFallsBackToBuffered(t *testing.T) {
 		t.Fatalf("not a zstd frame: %v", err)
 	}
 	if !hdr.HasFCS {
-		t.Error("buffered fallback also dropped the frame content size")
+		t.Error("unknown-length write dropped the frame content size")
 	}
 
 	rc, _, err := c.GetObject("b", "chunked")
@@ -120,7 +122,7 @@ func TestUnknownLengthFallsBackToBuffered(t *testing.T) {
 	defer rc.Close()
 	got, _ := io.ReadAll(rc)
 	if !bytes.Equal(got, payload) {
-		t.Error("buffered fallback corrupted the object")
+		t.Error("unknown-length write corrupted the object")
 	}
 }
 
