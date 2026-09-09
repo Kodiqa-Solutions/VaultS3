@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kodiqa-Solutions/VaultS3/internal/bucketcrypto"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
@@ -76,6 +77,9 @@ type ObjectHandler struct {
 	multipartPeers    func(bucket string) []metadata.MultipartUpload
 	engine            storage.Engine
 	encryptionEnabled bool
+	// keyMgr is the per-bucket key manager, non-nil only in per-bucket mode. It
+	// answers whether a given bucket actually opted into encryption.
+	keyMgr *bucketcrypto.Manager
 	// reapReplicas, if set (cluster mode), removes an object's data file from every
 	// OTHER node after a delete. Writes land on a single node, but a ring/primary
 	// change can leave an orphan copy elsewhere; without reaping it lingers on disk
@@ -111,6 +115,25 @@ type ObjectHandler struct {
 	onSearchUpdate     SearchUpdateFunc
 	onLambda           LambdaFunc
 	accessUpdater      *metadata.AccessUpdater
+}
+
+// sseHeaderApplies reports whether this object really is encrypted at rest, and
+// so whether the response may claim `x-amz-server-side-encryption: AES256`.
+//
+// It used to be the global encryption flag alone. In per-bucket mode that is not
+// the same question: a bucket that never opted in stores plaintext, and the
+// server was telling every client its objects were encrypted when they were not.
+// A false claim of encryption is worse than no claim, because it is the answer a
+// compliance check reads (issue #53).
+func (h *ObjectHandler) sseHeaderApplies(bucket string) bool {
+	if !h.encryptionEnabled {
+		return false
+	}
+	if h.keyMgr == nil {
+		// Not per-bucket mode: one server-wide key covers every object.
+		return true
+	}
+	return h.keyMgr.IsEncrypted(bucket)
 }
 
 // localCopyIsStale reports that the bytes this node holds are not the bytes the
@@ -556,7 +579,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 
 		w.Header().Set("ETag", etag)
 		w.Header().Set("X-Amz-Version-Id", versionID)
-		if h.encryptionEnabled {
+		if h.sseHeaderApplies(bucket) {
 			w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 		}
 		setChecksumHeaders(w, &meta)
@@ -636,7 +659,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 
 		w.Header().Set("ETag", etag)
 		w.Header().Set("X-Amz-Version-Id", "null")
-		if h.encryptionEnabled {
+		if h.sseHeaderApplies(bucket) {
 			w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 		}
 		setChecksumHeaders(w, &meta)
@@ -736,7 +759,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	if ssecKey != nil {
 		w.Header().Set(hdrSSECAlgo, "AES256")
 		w.Header().Set(hdrSSECKeyMD5, ssecKey.keyMD5)
-	} else if h.encryptionEnabled {
+	} else if h.sseHeaderApplies(bucket) {
 		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 	}
 	setChecksumHeaders(w, &meta)
@@ -932,7 +955,7 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		}
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
-	if h.encryptionEnabled {
+	if h.sseHeaderApplies(bucket) {
 		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 	}
 
@@ -1467,7 +1490,7 @@ func (h *ObjectHandler) HeadObject(w http.ResponseWriter, r *http.Request, bucke
 	if meta.SSECustomerKeyMD5 != "" {
 		w.Header().Set(hdrSSECAlgo, "AES256")
 		w.Header().Set(hdrSSECKeyMD5, meta.SSECustomerKeyMD5)
-	} else if h.encryptionEnabled {
+	} else if h.sseHeaderApplies(bucket) {
 		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 	}
 	w.WriteHeader(http.StatusOK)

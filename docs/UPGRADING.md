@@ -37,6 +37,19 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Upgrading to 4.4.72
+
+**Nothing to change.** No configuration, API or on-disk format changes.
+
+If you run `encryption.per_bucket`, this release is worth taking. Reads of
+objects in buckets that never opted in no longer buffer the whole object, objects
+over 1 GiB in those buckets are no longer served truncated, and the
+`x-amz-server-side-encryption` response header now reflects whether the bucket is
+actually encrypted rather than whether the server has encryption switched on. If
+you also set `encryption.legacy_key`, plaintext objects in opted-out buckets that
+previously returned `404 NoSuchKey` are readable again, with no migration and no
+rewrite: the data was always on disk, only the read path was wrong.
+
 ## Upgrading to 4.4.71
 
 **Nothing to change.** No behaviour, configuration or API changes.

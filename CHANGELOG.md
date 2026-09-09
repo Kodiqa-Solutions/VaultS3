@@ -17,6 +17,36 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   [@rscataran](https://github.com/rscataran) worked out and posted in #52, which
   was a better starting point than what was here before.
 
+## [4.4.72] - 2026-09-09
+### Fixed
+- **Objects in buckets that never opted into per-bucket encryption are no longer
+  read whole into memory.** With `encryption.enabled` and `encryption.per_bucket`
+  both on, every read that was not a `VS3S` stream was buffered entirely before
+  the server worked out it was looking at plaintext that needed no work at all.
+  A 1 KiB range read of a large object copied the whole object. Measured on a
+  400 MiB object with 20 concurrent range reads: peak memory 3554 MiB with 18 of
+  the 20 requests failing outright, against 37 MiB and no failures after.
+  Reported and fixed by [@zhyc9de](https://github.com/zhyc9de) in #53 and #54.
+- **Plaintext objects larger than 1 GiB are no longer served truncated.** The
+  same read path passed the object through a reader capped at 1 GiB, so anything
+  past that was handed to the client short, with a `200` and no error. A 1.1 GB
+  object now returns every byte, and a blob genuinely too large for the
+  whole-object formats is refused instead of quietly cut. Fixed in #54.
+- **The `x-amz-server-side-encryption: AES256` response header now reflects the
+  bucket rather than the global flag.** In per-bucket mode it was set from
+  `encryption.enabled` alone, so buckets that had never opted in, and whose
+  objects were plaintext on disk, were reported to clients as encrypted at rest.
+  A false claim of encryption is worse than no claim, because it is the answer a
+  compliance check reads. Reported in #53.
+- **A plaintext object in an opted-out bucket is readable again when
+  `encryption.legacy_key` is configured.** A headerless blob is either a legacy
+  global-key object or plaintext, and nothing on disk distinguishes them, so the
+  server assumed legacy and failed authentication on everything else: the write
+  returned `200` and the read returned `404 NoSuchKey`, telling a client that an
+  object it had just stored did not exist. The legacy key is now tried and the
+  bytes are passed through when it does not apply. The zero-byte case had already
+  been special-cased for this reason. This is the rest of it.
+
 ## [4.4.71] - 2026-09-07
 ### Fixed
 - The external authorization webhook now explains why it is not being called.
@@ -2487,7 +2517,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.71...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.72...HEAD
+[4.4.72]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.71...v4.4.72
 [4.4.71]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.70...v4.4.71
 [4.4.70]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.69...v4.4.70
 [4.4.69]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.68...v4.4.69

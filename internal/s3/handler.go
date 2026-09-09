@@ -152,6 +152,9 @@ func (h *Handler) SetPlacementReplicator(fn func(bucket, key string)) {
 // SetKeyManager wires the per-bucket encryption key manager (may be nil).
 func (h *Handler) SetKeyManager(m *bucketcrypto.Manager) {
 	h.buckets.keyMgr = m
+	// The object handler needs it too, to answer whether a bucket really is
+	// encrypted before claiming so in a response header (issue #53).
+	h.objects.keyMgr = m
 }
 
 // SetActivityFunc sets the callback for recording S3 activity.

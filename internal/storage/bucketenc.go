@@ -83,10 +83,23 @@ func (e *PerBucketEngine) open(bucket string, data []byte) ([]byte, error) {
 	}
 	if e.legacy != nil {
 		ns := e.legacy.NonceSize()
-		if len(data) < ns {
-			return nil, fmt.Errorf("encrypted data too short")
+		if len(data) >= ns {
+			if plain, err := e.legacy.Open(nil, data[:ns], data[ns:], nil); err == nil {
+				return plain, nil
+			}
 		}
-		return e.legacy.Open(nil, data[:ns], data[ns:], nil)
+		// Not sealed with the legacy key. A headerless blob is either a legacy
+		// global-key object or the plaintext of a bucket that never opted in, and
+		// nothing on disk distinguishes them, so the only way to tell is to try.
+		// Failing outright here made every plaintext object in an opted-out bucket
+		// unreadable the moment a legacy_key was configured: the write returned
+		// 200 and the read returned 404, which told the client an object it had
+		// just stored did not exist. The zero-byte case was already special-cased
+		// in get() for exactly this reason; this is the rest of it.
+		//
+		// Serving the bytes untouched is safe to get wrong in only one direction:
+		// if this really were a corrupt legacy blob, the client compares it with
+		// the ETag and rejects it, rather than silently accepting bad data.
 	}
 	return data, nil
 }

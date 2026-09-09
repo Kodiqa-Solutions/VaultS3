@@ -113,13 +113,23 @@ object as one message:
 - On read, `VS3S` or `VS3X` both decrypt with the bucket's DEK for the embedded
   **key version**. Key version 0 in a `VS3S` blob means it was sealed with a
   server-wide key (per-bucket versions start at 1), so it routes to the legacy key.
-- If it starts with neither magic, it is either a legacy global-key object
-  (decrypt with the legacy engine key if configured) or plaintext (opt-out
-  bucket). The decision is made from the first four bytes; a plaintext object
-  is handed back as the underlying seekable reader and is never buffered, so a
-  range read costs only its range and object size is unbounded (#53). Only
-  `VS3X` and legacy global-key blobs are read whole, because those formats
-  cannot be authenticated any other way.
+- If it starts with neither magic, it is either a legacy global-key object or
+  the plaintext of a bucket that never opted in, and nothing on disk
+  distinguishes the two.
+
+  The decision is made from the first four bytes. A plaintext object is handed
+  back as the underlying seekable reader and is never buffered, so a range read
+  costs only its range and object size is unbounded (#53). Only `VS3X` and
+  legacy global-key blobs are read whole, because those formats cannot be
+  authenticated any other way.
+
+  When a `legacy_key` is configured the key is tried first, and the bytes are
+  passed through untouched when it does not authenticate them. Assuming legacy
+  instead made every plaintext object in an opted-out bucket return
+  `404 NoSuchKey` the moment a legacy key was set, so a write returned `200` and
+  the read that followed said the object did not exist. Guessing wrong is safe
+  in only one direction: a client compares a wrongly passed-through blob against
+  its ETag and rejects it, rather than silently accepting bad data.
 
 ### Per-bucket opt-in / opt-out
 
