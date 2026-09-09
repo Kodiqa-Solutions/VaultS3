@@ -183,7 +183,8 @@ func (e *PerBucketEngine) streamKey(bucket string, keyVersion uint32) ([]byte, e
 }
 
 // get resolves the format from the stored blob: VS3S streams with the key
-// version named in its header, VS3X and legacy global-key blobs take the
+// version named in its header (or passes through when that version says the
+// key is the customer's), VS3X and legacy global-key blobs take the
 // whole-object path they were written with, and plaintext passes through.
 func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	// An empty object carries no header and no ciphertext, so there is nothing to
@@ -198,6 +199,12 @@ func (e *PerBucketEngine) get(bucket string, reader ReadSeekCloser, stored int64
 		return nil, 0, uerr
 	}
 	if h, ok := peekStreamHeader(reader); ok {
+		if h.keyVersion == CustomerKeyVersion {
+			// An SSE-C object in an opted-out bucket: sealed by the handler with the
+			// customer's key, which this engine never sees. It must not be mistaken
+			// for a version-0 server-wide blob and fed to the legacy key.
+			return passThroughCustomerBlob(reader, stored)
+		}
 		dek, err := e.streamKey(bucket, h.keyVersion)
 		if err != nil {
 			reader.Close()

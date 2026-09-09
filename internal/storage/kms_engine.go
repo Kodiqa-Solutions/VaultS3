@@ -47,6 +47,10 @@ func (e *KMSEncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadS
 		return nil, 0, uerr
 	}
 	if h, ok := peekStreamHeader(reader); ok {
+		if h.keyVersion == CustomerKeyVersion {
+			// Sealed by the handler with a customer key (SSE-C), not by this engine.
+			return passThroughCustomerBlob(reader, stored)
+		}
 		dek, err := e.dataKey()
 		if err != nil {
 			reader.Close()

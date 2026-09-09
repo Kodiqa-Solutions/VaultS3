@@ -450,3 +450,63 @@ func openLegacyWhole(src io.Reader, stored int64, gcm cipher.AEAD) ([]byte, erro
 func openSealed(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	return decompressIfCompressed(reader, stored)
 }
+
+// Customer-key (SSE-C) streams.
+//
+// SSE-C objects used to be sealed at the S3 handler as one whole AES-GCM
+// message, the format the engines above abandoned in 4.4.53 (issue #49): every
+// GET, a 1 KiB Range request included, read the entire ciphertext and allocated
+// the entire plaintext, and N concurrent range readers of one object held N
+// copies of it. The handler now seals and opens SSE-C objects with the VS3S
+// format through the two functions below, so there is one format and one reader
+// for every kind of key. The helpers are exported because the customer key is
+// per request and lives in the handler; the crypto stays here.
+//
+// CustomerKeyVersion is what the header's key-version field carries for such a
+// blob. Per-bucket DEK versions start at 1 and 0 means a server-wide key, so an
+// engine that peeks at a stored blob and sees this value knows the key is not
+// one it holds: the blob belongs to the layer above and is passed through
+// untouched. Without that marker an opted-out bucket under PerBucketEngine
+// would read an SSE-C object as a version-0 server-wide blob and refuse it.
+const CustomerKeyVersion uint32 = 1<<32 - 1
+
+// SealStreamWithKey encrypts reader in the VS3S format under key (32 bytes) and
+// hands the ciphertext to put, exactly as the encrypting engines do for their
+// own keys. size is the plaintext length (-1 when unknown). It returns the
+// number of PLAINTEXT bytes sealed, which is what the object's recorded size
+// and Content-Length must be, and the ETag put produced.
+func SealStreamWithKey(key []byte, reader io.Reader, size int64,
+	put func(sealed io.Reader, storedSize int64) (int64, string, error),
+) (int64, string, error) {
+	return sealStreamToEngine(key, CustomerKeyVersion, reader, size, put)
+}
+
+// OpenStreamWithKey serves a stored blob as plaintext under key when the blob
+// is a VS3S stream. ok reports whether it was one: when it is, the returned
+// reader decrypts a chunk at a time and seeks without materialising the object,
+// and size is the plaintext length. When it is not, reader is handed back
+// rewound to its start with ok false, so the caller can fall back to the format
+// the object was written in (for SSE-C, the pre-streaming whole-object seal).
+func OpenStreamWithKey(key []byte, reader ReadSeekCloser, stored int64) (out ReadSeekCloser, size int64, ok bool, err error) {
+	h, isStream := peekStreamHeader(reader)
+	if !isStream {
+		return reader, stored, false, nil
+	}
+	sr, err := newStreamReader(reader, stored, h, key)
+	if err != nil {
+		return nil, 0, true, fmt.Errorf("open encrypted stream: %w", err)
+	}
+	return sr, sr.Size(), true, nil
+}
+
+// passThroughCustomerBlob rewinds a blob that peekStreamHeader has consumed the
+// header of and returns it as-is, for an engine that has found a stream sealed
+// with a key it does not hold (see CustomerKeyVersion). The seek is cheap on a
+// file and is only ever paid for SSE-C objects.
+func passThroughCustomerBlob(reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		reader.Close()
+		return nil, 0, fmt.Errorf("storage: rewind customer-sealed blob: %w", err)
+	}
+	return reader, stored, nil
+}

@@ -8,11 +8,16 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
+
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
-// ssecReader is an in-memory ReadSeekCloser over decrypted SSE-C plaintext, so
-// the GET handler's range/part logic operates on plaintext.
+// ssecReader is an in-memory ReadSeekCloser over decrypted SSE-C plaintext. It
+// is only used for objects in the pre-streaming whole-object format, which have
+// to be buffered because one tag covers everything; new objects stream (see
+// ssecOpenStored).
 type ssecReader struct{ *bytes.Reader }
 
 func (ssecReader) Close() error { return nil }
@@ -21,6 +26,12 @@ func (ssecReader) Close() error { return nil }
 // a 32-byte key per request; the server encrypts/decrypts with it and stores only
 // the key's MD5 (for verification) — never the key itself. This is the
 // operator-blind option: lose the key and the data is unrecoverable.
+//
+// Objects are sealed in the chunked VS3S streaming format from
+// internal/storage/streamcrypt.go, the same one server-side encryption moved to
+// in 4.4.53 (issue #49), so a GET or Range request decrypts a chunk at a time
+// instead of buffering the object. Before this SSE-C sealed the whole object as
+// one AES-GCM message (ssecSeal), and those objects are still read by ssecOpen.
 //
 // Headers (mirroring S3):
 //
@@ -69,7 +80,48 @@ func ssecGCM(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-// ssecSeal encrypts plaintext with the customer key (nonce prepended).
+// ssecSealStream encrypts reader with the customer key in the streaming format
+// and hands the ciphertext to put (an engine PutObject). It returns the
+// plaintext length, which is the size the object must record: the stored length
+// is larger by the header and one tag per chunk.
+func ssecSealStream(k *sseCustomerKey, reader io.Reader, size int64,
+	put func(sealed io.Reader, storedSize int64) (int64, string, error),
+) (int64, string, error) {
+	return storage.SealStreamWithKey(k.key, reader, size, put)
+}
+
+// ssecOpenStored serves a stored SSE-C object as plaintext, picking the format
+// from the bytes themselves the way the encrypting engines do: a VS3S header
+// means a streaming reader that seeks without materialising anything; anything
+// else is the pre-streaming whole-object seal, which is read and opened in full
+// because it cannot be done any other way. Existing objects therefore keep
+// working with no migration, and are converted by being rewritten.
+//
+// On success the returned reader owns (or wraps) reader; on failure reader is
+// left for the caller to close.
+func ssecOpenStored(k *sseCustomerKey, reader storage.ReadSeekCloser, stored int64) (storage.ReadSeekCloser, int64, error) {
+	out, size, ok, err := storage.OpenStreamWithKey(k.key, reader, stored)
+	if err != nil {
+		return nil, 0, err
+	}
+	if ok {
+		return out, size, nil
+	}
+	sealed, err := io.ReadAll(out)
+	if err != nil {
+		return nil, 0, err
+	}
+	plain, err := ssecOpen(k, sealed)
+	if err != nil {
+		return nil, 0, err
+	}
+	return ssecReader{bytes.NewReader(plain)}, int64(len(plain)), nil
+}
+
+// ssecSeal encrypts plaintext with the customer key as one AES-GCM message
+// (nonce prepended). This is the format SSE-C wrote before it moved to the
+// streaming one; it is kept so tests can produce such objects and prove they
+// still read. New writes go through ssecSealStream.
 func ssecSeal(k *sseCustomerKey, plaintext []byte) ([]byte, error) {
 	gcm, err := ssecGCM(k.key)
 	if err != nil {
@@ -82,7 +134,8 @@ func ssecSeal(k *sseCustomerKey, plaintext []byte) ([]byte, error) {
 	return append(nonce, gcm.Seal(nil, nonce, plaintext, nil)...), nil
 }
 
-// ssecOpen decrypts data produced by ssecSeal with the customer key.
+// ssecOpen decrypts data produced by ssecSeal (the whole-object format) with the
+// customer key.
 func ssecOpen(k *sseCustomerKey, data []byte) ([]byte, error) {
 	gcm, err := ssecGCM(k.key)
 	if err != nil {

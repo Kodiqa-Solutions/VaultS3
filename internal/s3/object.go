@@ -1,7 +1,6 @@
 package s3
 
 import (
-	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
@@ -686,26 +685,16 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	var written int64
 	var etag string
 	var err error
-	var plainSize int64
 	if ssecKey != nil {
-		// SSE-C still seals the object as one AEAD message and so still buffers it.
-		// That is now a gap rather than a necessity: the chunked format in
-		// internal/storage/streamcrypt.go would bound this too, but SSE-C keys are
-		// per-request and the stored format would need the same read-both-formats
-		// migration, so it is left for its own change. Memory here scales with
-		// object size times concurrent SSE-C requests (the shape of issue #49).
-		body, rerr := io.ReadAll(digests)
-		if rerr != nil {
-			writeS3Error(w, "InternalError", "Failed to read request body", http.StatusInternalServerError)
-			return
-		}
-		plainSize = int64(len(body))
-		sealed, serr := ssecSeal(ssecKey, body)
-		if serr != nil {
-			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
-			return
-		}
-		written, etag, err = h.engine.PutObject(bucket, key, bytes.NewReader(sealed), int64(len(sealed)))
+		// SSE-C seals with the customer key in the same chunked streaming format
+		// the encrypting engines use, so the body flows to the engine a chunk at
+		// a time. It used to be sealed as one AEAD message, which meant buffering
+		// the whole object per request: the shape of issue #49, fixed for
+		// server-side encryption in 4.4.53 and here for customer keys. `written`
+		// is the plaintext length; the engine stored a little more.
+		written, etag, err = ssecSealStream(ssecKey, digests, r.ContentLength, func(sealed io.Reader, storedSize int64) (int64, string, error) {
+			return h.engine.PutObject(bucket, key, sealed, storedSize)
+		})
 	} else {
 		written, etag, err = h.engine.PutObject(bucket, key, digests, r.ContentLength)
 	}
@@ -719,9 +708,6 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 	csha256, ccrc32, ccrc32c, csha1 := sums.SHA256, sums.CRC32, sums.CRC32C, sums.SHA1
-	if ssecKey != nil {
-		written = plainSize // report the plaintext size, not the SSE-C ciphertext size
-	}
 
 	meta := metadata.ObjectMeta{
 		Bucket:             bucket,
@@ -904,9 +890,11 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	defer reader.Close()
 
-	// SSE-C: object was encrypted with a customer-provided key. Require + verify it,
-	// then decrypt into an in-memory reader so range/part logic runs on plaintext.
-	// This buffers the whole object; see the note on the SSE-C write path.
+	// SSE-C: object was encrypted with a customer-provided key. Require + verify
+	// it, then swap in a plaintext reader so the range/part logic below works on
+	// plaintext offsets. For objects in the streaming format that reader decrypts
+	// a chunk at a time and seeks without buffering, so a Range request costs a
+	// chunk, not the object; only pre-streaming objects are still read in full.
 	if meta != nil && meta.SSECustomerKeyMD5 != "" {
 		ssecKey, perr := parseSSECHeaders(r)
 		if perr != nil || ssecKey == nil {
@@ -917,18 +905,17 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			writeS3Error(w, "AccessDenied", "SSE-C key does not match the one used to encrypt this object", http.StatusForbidden)
 			return
 		}
-		sealed, rerr := io.ReadAll(reader)
-		if rerr != nil {
-			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
-			return
-		}
-		plain, derr := ssecOpen(ssecKey, sealed)
+		plain, plainSize, derr := ssecOpenStored(ssecKey, reader, size)
 		if derr != nil {
+			// A wrong key and a corrupt blob both surface as an authentication
+			// failure, which is the one answer that does not leak which it was.
 			writeS3Error(w, "AccessDenied", "SSE-C decryption failed", http.StatusForbidden)
 			return
 		}
-		reader = ssecReader{bytes.NewReader(plain)}
-		size = int64(len(plain))
+		// The deferred Close above still closes the engine reader; the streaming
+		// reader closes the same source and the legacy one has nothing to close.
+		reader = plain
+		size = plainSize
 	}
 
 	// Conditional GET: check preconditions before sending body
