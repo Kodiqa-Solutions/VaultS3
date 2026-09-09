@@ -169,3 +169,41 @@ func TestSSEC_LegacyWholeObjectStillReads(t *testing.T) {
 		t.Fatalf("legacy range mismatch: %q", got)
 	}
 }
+
+// On a cluster node the stale-copy check compares the opened size with
+// meta.Size, which is the plaintext length. It used to run against the SSE-C
+// ciphertext, so every SSE-C GET looked like a copy that had not caught up and
+// was routed to a peer or refused with SlowDown.
+func TestSSEC_ClusterStaleCheckSeesPlaintextSize(t *testing.T) {
+	h, store, _, ts := newObjTestServer(t)
+	fallbacks := 0
+	h.objects.dataHolderFallback = func(http.ResponseWriter, *http.Request, string, string) (bool, bool) {
+		fallbacks++
+		return false, false
+	}
+	bucket, key := "vault", "clustered.bin"
+	if err := store.CreateBucket(bucket); err != nil {
+		t.Fatal(err)
+	}
+	custKey := make([]byte, 32)
+	rand.Read(custKey)
+	plain := make([]byte, 3000)
+	rand.Read(plain)
+
+	resp := doSignedWithHeaders(t, http.MethodPut, ts.URL+"/"+bucket+"/"+key, plain, ssecHeaderMap(custKey))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT: %d %s", resp.StatusCode, readBody(t, resp))
+	}
+	resp.Body.Close()
+
+	resp = doSignedWithHeaders(t, http.MethodGet, ts.URL+"/"+bucket+"/"+key, nil, ssecHeaderMap(custKey))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET on a cluster node: %d %s", resp.StatusCode, readBody(t, resp))
+	}
+	if got := readBody(t, resp); got != string(plain) {
+		t.Fatal("round-trip mismatch")
+	}
+	if fallbacks != 0 {
+		t.Fatalf("a freshly written SSE-C object was treated as stale %d time(s)", fallbacks)
+	}
+}

@@ -190,6 +190,12 @@ func (h *ObjectHandler) localCopyNeedsContentCheck(meta *metadata.ObjectMeta, op
 	if h.dataHolderFallback == nil || meta == nil || meta.DeleteMarker {
 		return false
 	}
+	// An SSE-C object's ETag is the MD5 of the stored ciphertext and the reader
+	// by now yields plaintext, so the two can never agree; the size check alone
+	// has to do.
+	if meta.SSECustomerKeyMD5 != "" {
+		return false
+	}
 	if opened <= 0 || opened > staleVerifyMaxSize {
 		return false
 	}
@@ -217,6 +223,45 @@ func (h *ObjectHandler) localCopyContentMatches(reader storage.ReadSeekCloser, m
 		return true
 	}
 	return strings.Trim(meta.ETag, `"`) == hex.EncodeToString(sum.Sum(nil))
+}
+
+// openSSEC swaps the stored SSE-C blob for a plaintext reader, requiring and
+// verifying the customer key from the request. It runs BEFORE the stale-copy
+// checks because those compare the opened size with meta.Size, and meta.Size is
+// the plaintext length: compared against the ciphertext length every SSE-C GET
+// on a cluster node looked like a copy that had not caught up and was routed to
+// a peer or refused with SlowDown. For objects in the streaming format the
+// returned reader decrypts a chunk at a time and seeks without buffering; only
+// pre-streaming objects are still read in full. On failure the response has
+// been written, reader is closed, and ok is false.
+func (h *ObjectHandler) openSSEC(w http.ResponseWriter, r *http.Request, meta *metadata.ObjectMeta,
+	reader storage.ReadSeekCloser, size int64,
+) (storage.ReadSeekCloser, int64, bool) {
+	if meta == nil || meta.SSECustomerKeyMD5 == "" {
+		return reader, size, true
+	}
+	ssecKey, perr := parseSSECHeaders(r)
+	if perr != nil || ssecKey == nil {
+		reader.Close()
+		writeS3Error(w, "InvalidArgument", "object is SSE-C encrypted; a customer key is required", http.StatusBadRequest)
+		return nil, 0, false
+	}
+	if ssecKey.keyMD5 != meta.SSECustomerKeyMD5 {
+		reader.Close()
+		writeS3Error(w, "AccessDenied", "SSE-C key does not match the one used to encrypt this object", http.StatusForbidden)
+		return nil, 0, false
+	}
+	plain, plainSize, derr := ssecOpenStored(ssecKey, reader, size)
+	if derr != nil {
+		// A wrong key and a corrupt blob both surface as an authentication
+		// failure, which is the one answer that does not leak which it was.
+		reader.Close()
+		writeS3Error(w, "AccessDenied", "SSE-C decryption failed", http.StatusForbidden)
+		return nil, 0, false
+	}
+	// The streaming reader closes the engine reader it wraps; the legacy one has
+	// nothing to close, so closing plain is always enough for the caller.
+	return plain, plainSize, true
 }
 
 // serveFromDataHolder asks a peer holder to serve a read this node has metadata
@@ -807,6 +852,10 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
 			return
 		}
+		var ok bool
+		if reader, size, ok = h.openSSEC(w, r, meta, reader, size); !ok {
+			return
+		}
 		w.Header().Set("X-Amz-Version-Id", versionID)
 	} else {
 		// Get latest version. Consistent read: barrier-on-miss so a GET right after
@@ -839,6 +888,14 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			w.Header().Set("X-Amz-Version-Id", meta.VersionID)
 		} else {
 			reader, size, err = h.engine.GetObject(bucket, key)
+		}
+		if err == nil {
+			// Plaintext size and reader from here on, which is what the stale-copy
+			// checks below compare against the metadata.
+			var ok bool
+			if reader, size, ok = h.openSSEC(w, r, meta, reader, size); !ok {
+				return
+			}
 		}
 		if err == nil && !h.localCopyIsStale(meta, size) && h.localCopyNeedsContentCheck(meta, size) &&
 			!h.localCopyContentMatches(reader, meta) {
@@ -889,34 +946,6 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		}
 	}
 	defer reader.Close()
-
-	// SSE-C: object was encrypted with a customer-provided key. Require + verify
-	// it, then swap in a plaintext reader so the range/part logic below works on
-	// plaintext offsets. For objects in the streaming format that reader decrypts
-	// a chunk at a time and seeks without buffering, so a Range request costs a
-	// chunk, not the object; only pre-streaming objects are still read in full.
-	if meta != nil && meta.SSECustomerKeyMD5 != "" {
-		ssecKey, perr := parseSSECHeaders(r)
-		if perr != nil || ssecKey == nil {
-			writeS3Error(w, "InvalidArgument", "object is SSE-C encrypted; a customer key is required", http.StatusBadRequest)
-			return
-		}
-		if ssecKey.keyMD5 != meta.SSECustomerKeyMD5 {
-			writeS3Error(w, "AccessDenied", "SSE-C key does not match the one used to encrypt this object", http.StatusForbidden)
-			return
-		}
-		plain, plainSize, derr := ssecOpenStored(ssecKey, reader, size)
-		if derr != nil {
-			// A wrong key and a corrupt blob both surface as an authentication
-			// failure, which is the one answer that does not leak which it was.
-			writeS3Error(w, "AccessDenied", "SSE-C decryption failed", http.StatusForbidden)
-			return
-		}
-		// The deferred Close above still closes the engine reader; the streaming
-		// reader closes the same source and the legacy one has nothing to close.
-		reader = plain
-		size = plainSize
-	}
 
 	// Conditional GET: check preconditions before sending body
 	if checkGetPreconditions(w, r, meta) {
