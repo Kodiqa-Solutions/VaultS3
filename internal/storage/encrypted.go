@@ -84,6 +84,10 @@ func (e *EncryptedEngine) decrypt(reader ReadSeekCloser, stored int64) (ReadSeek
 		return nil, 0, err
 	}
 	if h, ok := peekStreamHeader(reader); ok {
+		if h.keyVersion == CustomerKeyVersion {
+			// Sealed by the handler with a customer key (SSE-C), not by this engine.
+			return passThroughCustomerBlob(reader, stored)
+		}
 		sr, err := newStreamReader(reader, stored, h, e.key)
 		if err != nil {
 			reader.Close()

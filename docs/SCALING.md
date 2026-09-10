@@ -622,10 +622,15 @@ backup:
   migrates it. If you have large encrypted objects from an earlier version and
   tight pod limits, copy them in place to convert them.
 
-  Two paths still buffer a whole object and should be sized for: SSE-C
-  (customer-key encryption still seals the object as one message) and an upload
-  whose length is not declared up front (the compressor cannot record the frame
-  size without it). Multipart uploads are bounded by part size, not object size.
+  SSE-C (customer-key encryption) uses the same chunked format, so a GET or Range
+  request of an SSE-C object also costs a chunk rather than the object. SSE-C
+  objects written before that change were sealed as one message and, like
+  pre-4.4.53 encrypted objects, still read but cost their own size until they are
+  rewritten.
+
+  One path still buffers a whole object and should be sized for: an upload whose
+  length is not declared up front (the compressor cannot record the frame size
+  without it). Multipart uploads are bounded by part size, not object size.
 
   Size per-pod memory for concurrency x part/object size plus headroom. If OOMKills
   persist after 4.4.48, that is worth reporting rather than only raising the limit.

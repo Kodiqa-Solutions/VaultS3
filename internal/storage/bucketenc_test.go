@@ -170,3 +170,52 @@ func TestPerBucketEngine_WholeObjectFormatStillReads(t *testing.T) {
 		t.Fatalf("VS3X round-trip mismatch: %q", got)
 	}
 }
+
+// An SSE-C object is sealed by the S3 handler with the customer's key and lands
+// in the engine as a VS3S blob whose key version is CustomerKeyVersion. In an
+// opted-out bucket the per-bucket engine sees that blob directly, and must hand
+// it back untouched rather than treat it as a version-0 server-wide object and
+// try (and fail) to open it with the legacy key.
+func TestPerBucketEngine_PassesThroughCustomerSealedBlob(t *testing.T) {
+	fs, _ := NewFileSystem(t.TempDir())
+	fs.CreateBucketDir("optout")
+	legacyKey := make([]byte, 32)
+	rand.Read(legacyKey)
+	pe, _ := NewPerBucketEngine(fs, legacyKey)
+	pe.SetManager(newMgr(t)) // manager present, "optout" never opted in
+
+	custKey := make([]byte, 32)
+	rand.Read(custKey)
+	plain := []byte("sealed above the engine with a key it does not hold")
+	if _, _, err := SealStreamWithKey(custKey, bytes.NewReader(plain), int64(len(plain)),
+		func(sealed io.Reader, storedSize int64) (int64, string, error) {
+			return pe.PutObject("optout", "c.bin", sealed, storedSize)
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := os.ReadFile(fs.ObjectPath("optout", "c.bin"))
+	r, stored, err := pe.GetObject("optout", "c.bin")
+	if err != nil {
+		t.Fatalf("customer-sealed blob should pass through, got: %v", err)
+	}
+	defer r.Close()
+	got, _ := io.ReadAll(r)
+	if !bytes.Equal(got, raw) || stored != int64(len(raw)) {
+		t.Fatal("engine altered a blob it does not hold the key for")
+	}
+
+	// And the handler-side opener streams it with the customer key.
+	src, stored, _ := pe.GetObject("optout", "c.bin")
+	out, size, ok, err := OpenStreamWithKey(custKey, src, stored)
+	if err != nil || !ok {
+		t.Fatalf("OpenStreamWithKey: ok=%v err=%v", ok, err)
+	}
+	defer out.Close()
+	if _, buffered := out.(*bytesReadSeekCloser); buffered {
+		t.Fatal("customer stream was buffered instead of streamed")
+	}
+	if b, _ := io.ReadAll(out); !bytes.Equal(b, plain) || size != int64(len(plain)) {
+		t.Fatalf("round-trip mismatch: %q (size %d)", b, size)
+	}
+}
