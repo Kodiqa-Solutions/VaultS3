@@ -113,6 +113,16 @@ func TestIndex_LRUEviction(t *testing.T) {
 	}
 }
 
+func TestSearchText(t *testing.T) {
+	got := SearchText("", "Report.PDF", "application/pdf", map[string]string{"Env": "Prod"})
+	if got != "report.pdf application/pdf env=prod" {
+		t.Fatalf("SearchText = %q", got)
+	}
+	if got := SearchText("", "folder", "", nil); got != "folder" {
+		t.Fatalf("SearchText(folder) = %q", got)
+	}
+}
+
 func TestIndex_EmptySearch(t *testing.T) {
 	idx := newTestIndex(100)
 	results := idx.Search("", "", 10)
@@ -129,6 +139,52 @@ func TestIndex_Count(t *testing.T) {
 	idx.Update("b", "k", metadata.ObjectMeta{})
 	if idx.Count() != 1 {
 		t.Error("expected 1 after update")
+	}
+}
+
+func TestParseQuery_Match(t *testing.T) {
+	tags := map[string]string{"env": "prod"}
+	cases := []struct {
+		q                       string
+		text, contentType, etag string
+		tags                    map[string]string
+		want                    bool
+	}{
+		{"aa", "aa-1", "", "", nil, true},
+		{"AA", "aa-1", "", "", nil, true}, // the query is lower-cased; text must already be
+		{"aa", "bb-1", "", "", nil, false},
+		{"aa 1", "aa-1", "", "", nil, true},  // terms AND together
+		{"aa 2", "aa-1", "", "", nil, false}, // terms AND together
+		{"type:pdf", "x", "application/pdf", "", nil, true},
+		{"type:pdf", "x", "text/plain", "", nil, false},
+		{"type:pdf", "folder", "", "", nil, false}, // folders have no type
+		{"tag:env", "x", "", "", tags, true},
+		{"tag:env=PROD", "x", "", "", tags, true},
+		{"tag:env=dev", "x", "", "", tags, false},
+		{"tag:env", "folder", "", "", nil, false},
+		{"tag:", "tag:", "", "", nil, true},                                     // a bare "tag:" is just text
+		{"etag:D41D", "x", "", `"d41d8cd98f00b204e9800998ecf8427e"`, nil, true}, // prefix, case-insensitive, quotes ignored
+		{"etag:8cd9", "x", "", "d41d8cd98f00b204e9800998ecf8427e", nil, false},  // a prefix, not a substring
+		{"etag:d41d", "folder", "", "", nil, false},                             // folders have no ETag
+		// Filter prefixes, tag keys and tag values are all case-insensitive.
+		{"Tag:env=PROD", "x", "", "", tags, true},
+		{"Type:PDF", "x", "application/pdf", "", nil, true},
+		{"ETag:D41D", "x", "", "d41d8cd98f00b204e9800998ecf8427e", nil, true},
+		{"TAG:Env", "x", "", "", map[string]string{"Env": "1"}, true},
+		{"tag:env=prod", "x", "", "", map[string]string{"ENV": "Prod"}, true},
+	}
+	for _, c := range cases {
+		if got := ParseQuery(c.q).Match(c.text, c.contentType, c.etag, c.tags); got != c.want {
+			t.Errorf("ParseQuery(%q).Match(%q, %q, %q, %v) = %v, want %v", c.q, c.text, c.contentType, c.etag, c.tags, got, c.want)
+		}
+	}
+	if !ParseQuery("   ").IsEmpty() || ParseQuery("x").IsEmpty() || ParseQuery("type:x").IsEmpty() || ParseQuery("etag:x").IsEmpty() {
+		t.Error("IsEmpty is wrong")
+	}
+	// A filter with nothing after the colon is no query at all — it used to
+	// match every object.
+	if !ParseQuery("type:").IsEmpty() || !ParseQuery("etag:").IsEmpty() {
+		t.Error("an empty filter must be an empty query")
 	}
 }
 
@@ -191,5 +247,27 @@ func TestIndex_BuildStopsAtTheCap(t *testing.T) {
 	}
 	if got := idx.Search("file-0010", "", 10); len(got) != 0 {
 		t.Fatalf("file-0010 (past the cap) was indexed: %+v", got)
+	}
+}
+
+// Plain terms must not match the ETag or the modification date: "4435" against a
+// store of MD5s hits one object in about two thousand by accident.
+func TestIndex_PlainTermsIgnoreETagAndDate(t *testing.T) {
+	idx := newTestIndex(100)
+	idx.Update("b", "photo.png", metadata.ObjectMeta{
+		ContentType:  "image/png",
+		ETag:         `"ab4435cd98f00b204e9800998ecf8427e"`,
+		LastModified: 1700000000, // 2023-11-14
+	})
+	for _, q := range []string{"4435", "2023-11-14", "2023"} {
+		if got := idx.Search(q, "", 10); len(got) != 0 {
+			t.Errorf("Search(%q) matched via ETag/date: %+v", q, got)
+		}
+	}
+	if got := idx.Search("etag:AB4435", "", 10); len(got) != 1 {
+		t.Errorf("etag: prefix filter did not match: %+v", got)
+	}
+	if got := idx.Search("photo etag:ab44", "", 10); len(got) != 1 {
+		t.Errorf("etag: does not AND with text terms: %+v", got)
 	}
 }
