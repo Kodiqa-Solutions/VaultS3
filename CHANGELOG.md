@@ -4,6 +4,16 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [Unreleased]
+### Security
+- Updated the dashboard test runner `vitest` from 4.1.9 to 4.1.11 for
+  GHSA-82fw-gwwq-j7x9 (CVE-2026-84373), clearing Dependabot alerts #24 and #25.
+  Path traversal and arbitrary file read through the `@vitest/mocker` redirect
+  mock, both rated moderate.
+  `vitest` is a build-time dependency: it never reaches the shipped dashboard
+  bundle or the server binary, which `npm audit --omit=dev` confirms at 0
+  vulnerabilities both before and after.
+
 ## [4.4.73] - 2026-09-11
 ### Fixed
 - **A range read of a compressed object no longer decompresses the whole thing,
