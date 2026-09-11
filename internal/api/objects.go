@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/search"
 )
 
 type objectListItem struct {
@@ -66,31 +67,172 @@ func (h *APIHandler) handleListObjects(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 
-	items := make([]objectListItem, 0, len(prefixes)+len(objects))
-	for _, folder := range prefixes {
-		item := objectListItem{Key: folder.Prefix, IsPrefix: true}
-		// Surface the folder's date (its directory marker or first child) so the
-		// browser shows a real date instead of a blank (issue #35).
-		if folder.LastModified > 0 {
-			item.LastModified = time.Unix(folder.LastModified, 0).UTC().Format(time.RFC3339)
-		}
-		items = append(items, item)
-	}
-	for _, obj := range objects {
-		items = append(items, objectListItem{
-			Key:          obj.Key,
-			Size:         obj.Size,
-			LastModified: time.Unix(obj.LastModified, 0).UTC().Format(time.RFC3339),
-			ContentType:  obj.ContentType,
-		})
-	}
-
 	writeJSON(w, http.StatusOK, objectListResponse{
-		Objects:        items,
+		Objects:        toObjectListItems(objects, prefixes),
 		Truncated:      truncated,
 		Prefix:         prefix,
 		NextStartAfter: nextStartAfter,
 	})
+}
+
+func folderItem(folder metadata.CommonPrefixInfo) objectListItem {
+	item := objectListItem{Key: folder.Prefix, IsPrefix: true}
+	// Surface the folder's date (its directory marker or first child) so the
+	// browser shows a real date instead of a blank (issue #35).
+	if folder.LastModified > 0 {
+		item.LastModified = time.Unix(folder.LastModified, 0).UTC().Format(time.RFC3339)
+	}
+	return item
+}
+
+func fileItem(obj metadata.ObjectMeta) objectListItem {
+	return objectListItem{
+		Key:          obj.Key,
+		Size:         obj.Size,
+		LastModified: time.Unix(obj.LastModified, 0).UTC().Format(time.RFC3339),
+		ContentType:  obj.ContentType,
+	}
+}
+
+// toObjectListItems renders a delimited listing the way the file browser shows
+// it: folders first, then files.
+func toObjectListItems(objects []metadata.ObjectMeta, prefixes []metadata.CommonPrefixInfo) []objectListItem {
+	items := make([]objectListItem, 0, len(prefixes)+len(objects))
+	for _, folder := range prefixes {
+		items = append(items, folderItem(folder))
+	}
+	for _, obj := range objects {
+		items = append(items, fileItem(obj))
+	}
+	return items
+}
+
+// searchScanPageSize is how many flat keys one store call walks while filtering
+// a folder; searchMaxScanPages bounds a single request so a folder with a
+// million children cannot pin a handler. The response's cursor lets the client
+// continue where the scan stopped.
+const (
+	searchScanPageSize = 1000
+	searchMaxScanPages = 20
+)
+
+// handleSearchObjects filters ONE folder level of a bucket — the direct
+// children of ?prefix=, folders and files — against ?q=, using the same query
+// grammar as the global search (case-insensitive substrings, AND of terms,
+// tag:k=v, type:x and etag:x filters) and the same fields (name, content type,
+// tags). Matching is on the child's own name, not the full key: in a/ the query
+// "aa" finds a/aa-1 and a/aa-2 but not a/bb-1/aa.pdf.
+//
+// It walks the metadata store with the delimited listing cursor rather than
+// the in-memory search index, so it is complete regardless of the index's
+// entry cap and needs no admin privilege: the route is authorised as a listing
+// of the bucket.
+//
+// The response is the same shape as the listing (objectListResponse).
+// Truncated means the scan stopped before the folder's end — because the page
+// filled OR because the per-request scan budget ran out — and NextStartAfter is
+// where to resume; a page can therefore come back with few (even zero)
+// matches and still be truncated.
+func (h *APIHandler) handleSearchObjects(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !h.store.BucketExists(bucket) {
+		writeError(w, http.StatusNotFound, "bucket not found")
+		return
+	}
+
+	q := search.ParseQuery(r.URL.Query().Get("q"))
+	if q.IsEmpty() {
+		writeError(w, http.StatusBadRequest, "query parameter 'q' is required")
+		return
+	}
+	prefix := r.URL.Query().Get("prefix")
+	cursor := r.URL.Query().Get("startAfter")
+	maxKeys := 200
+	if mk := r.URL.Query().Get("maxKeys"); mk != "" {
+		if v, err := strconv.Atoi(mk); err == nil && v > 0 && v <= 1000 {
+			maxKeys = v
+		}
+	}
+
+	items := []objectListItem{}
+	more := false // whether the folder has keys beyond the cursor when the scan stops
+scan:
+	for pages := 0; pages < searchMaxScanPages; pages++ {
+		objects, prefixes, pageMore, next, err := h.store.ListLatestObjectsDelimited(bucket, prefix, "/", cursor, searchScanPageSize)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list objects")
+			return
+		}
+		// Walk folders and files together in key order so that, when the page
+		// fills mid-way, the cursor can point just past the last item returned
+		// and nothing between it and the store's own cursor is skipped.
+		candidates := mergeChildren(prefix, prefixes, objects)
+		for i, c := range candidates {
+			if !q.Match(c.text, c.contentType, c.etag, c.tags) {
+				continue
+			}
+			items = append(items, c.item)
+			if len(items) >= maxKeys {
+				more = pageMore || i+1 < len(candidates)
+				cursor = c.resumeAfter
+				break scan
+			}
+		}
+		more, cursor = pageMore, next
+		if !more {
+			break
+		}
+	}
+	resp := objectListResponse{Objects: items, Truncated: more, Prefix: prefix}
+	if more {
+		resp.NextStartAfter = cursor
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// searchCandidate is one direct child of the folder being filtered, with the
+// haystack the query is matched against and the cursor that resumes after it.
+type searchCandidate struct {
+	item        objectListItem
+	text        string // search.SearchText of the child's own name, type and tags
+	contentType string
+	etag        string
+	tags        map[string]string
+	resumeAfter string // startAfter that continues just past this child
+}
+
+// mergeChildren interleaves a page's folders and files back into key order.
+// Both slices come sorted from the store; a folder sorts by its prefix. Folders
+// have no content type, ETag or tags, so a type:/etag:/tag: filter never
+// matches one — only files carry those. Plain terms see the child's name (not
+// the full key), its content type and its tags, the same fields the global
+// search index matches, so "prod" or "pdf" behaves the same in both places.
+func mergeChildren(prefix string, prefixes []metadata.CommonPrefixInfo, objects []metadata.ObjectMeta) []searchCandidate {
+	out := make([]searchCandidate, 0, len(prefixes)+len(objects))
+	i, j := 0, 0
+	for i < len(prefixes) || j < len(objects) {
+		if j >= len(objects) || (i < len(prefixes) && prefixes[i].Prefix < objects[j].Key) {
+			f := prefixes[i]
+			i++
+			name := strings.TrimSuffix(strings.TrimPrefix(f.Prefix, prefix), "/")
+			out = append(out, searchCandidate{
+				item:        folderItem(f),
+				text:        search.SearchText("", name, "", nil),
+				resumeAfter: f.Prefix + "\xff", // past every key under the folder
+			})
+			continue
+		}
+		o := objects[j]
+		j++
+		out = append(out, searchCandidate{
+			item:        fileItem(o),
+			text:        search.SearchText("", strings.TrimPrefix(o.Key, prefix), o.ContentType, o.Tags),
+			contentType: o.ContentType,
+			etag:        o.ETag,
+			tags:        o.Tags,
+			resumeAfter: o.Key,
+		})
+	}
+	return out
 }
 
 func (h *APIHandler) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
