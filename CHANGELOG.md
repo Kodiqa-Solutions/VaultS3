@@ -4,7 +4,44 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
-## [Unreleased]
+## [4.4.73] - 2026-09-11
+### Fixed
+- **A range read of a compressed object no longer decompresses the whole thing,
+  and concurrent readers of an object that must be expanded now share one copy.**
+  A compressed object was a single zstd frame, which cannot be entered in the
+  middle, so a 1 KiB range request decompressed the object and sliced it: twenty
+  concurrent range reads were twenty full copies in memory. New objects are
+  written in the zstd seekable format, independent 1 MiB frames aligned with the
+  `VS3S` chunk plus a seek table, so a range read decompresses one frame. Existing
+  single-frame zstd and gzip objects still read, and a range on them now positions
+  the decoder by discarding to the offset rather than materialising the object.
+  The formats that genuinely cannot be streamed, pre-4.4.53 whole-object GCM,
+  `VS3X` and KMS-wrapped blobs, now share a single decryption between concurrent
+  readers rather than each making its own. Measured on a 600 MiB object with 20
+  concurrent range reads: about 21 GiB peak before, about 59 MB after.
+  Contributed by [@zhyc9de](https://github.com/zhyc9de) in #55.
+  - A plain zstd decoder still reads a seekable object from the front, since it
+    skips the seek table as a skippable frame, so a server older than this
+    release reads these objects correctly.
+- **SSE-C objects are readable on a cluster again, and a read no longer expands
+  the whole object.** An object encrypted with a customer-provided key was sealed
+  as one AES-GCM message and decrypted after the cluster stale-copy check rather
+  than before it. That check compares what the engine opened against `meta.Size`,
+  which is the plaintext length, so it was comparing a ciphertext length with a
+  plaintext one and concluding the node held a copy that had not caught up: every
+  SSE-C read on a clustered node was routed to a peer and then refused with
+  `503 SlowDown`, and the peers answered the same way. SSE-C was unreadable on a
+  cluster from 4.4.70, where that check was introduced, through 4.4.72.
+  Single-node servers were never affected, since they have no peer to fall back
+  to. SSE-C objects now use the same chunked `VS3S` format as server-side
+  encryption, so a range read decrypts a chunk instead of the object: 232 MB
+  allocated for a 1 KiB range read of a 64 MiB object before, 2.1 MB after.
+  Reported and fixed by [@zhyc9de](https://github.com/zhyc9de) in #56.
+  - Objects written in the old whole-object SSE-C format still read, with no
+    migration. **Objects written in the new format cannot be read by a server
+    older than this release**, which returns `403`. See the upgrade notes.
+
+## [4.4.72] - 2026-09-09
 ### Changed
 - The external authorization guide now opens with a quick start: enable the hook,
   point it at an endpoint, set a shared token, and then the step everyone misses,
@@ -17,7 +54,6 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   [@rscataran](https://github.com/rscataran) worked out and posted in #52, which
   was a better starting point than what was here before.
 
-## [4.4.72] - 2026-09-09
 ### Fixed
 - **Objects in buckets that never opted into per-bucket encryption are no longer
   read whole into memory.** With `encryption.enabled` and `encryption.per_bucket`
@@ -2517,7 +2553,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.72...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.73...HEAD
+[4.4.73]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.72...v4.4.73
 [4.4.72]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.71...v4.4.72
 [4.4.71]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.70...v4.4.71
 [4.4.70]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.69...v4.4.70

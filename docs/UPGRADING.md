@@ -37,6 +37,48 @@ auto_update:
 
 The current/latest version is also exposed at `GET /api/v1/version`.
 
+## Rolling back
+
+Two releases changed how bytes are laid out on disk, and an older server cannot
+read what a newer one wrote in those formats. Neither is a reason to avoid
+upgrading, but both are worth knowing before you plan a rollback.
+
+- **SSE-C objects written after the release that introduced the chunked format**
+  are refused by an older server with `403`. A clean refusal, not bad data.
+- **Compressed objects written by 4.4.70 or later, with encryption also enabled**,
+  are read as corrupt by a server older than 4.4.70. Compression used to run
+  after encryption and now runs before it, and an older server unwraps the two in
+  the order it expects. This one is worse than the SSE-C case because the client
+  sees a checksum mismatch rather than a refusal. It was not documented at the
+  time and should have been.
+
+Compressed objects are not affected. The zstd seekable format added alongside
+these keeps its seek table in a skippable frame, which any plain zstd decoder
+ignores, so an older server reads those objects from the front correctly.
+
+Where a rollback is not safe the fix is the same: roll forward rather than back,
+or restore the data directory from a backup taken before the upgrade.
+
+## Upgrading to 4.4.73
+
+**Upgrade now if you run a cluster and use SSE-C.** Nothing to change, no
+configuration changes.
+
+Server-side encryption with a customer-provided key was unreadable on a
+multi-node cluster from 4.4.70 through 4.4.72: every GET was refused with
+`503 SlowDown`. Writes were fine and no data was ever at risk, only the read path
+was wrong, so objects written during that window read correctly as soon as you
+upgrade. Single-node servers were never affected.
+
+Two read paths also stopped expanding whole objects into memory: a range read of
+a compressed object now decompresses one frame rather than the object, and SSE-C
+reads decrypt a chunk at a time. Objects written by earlier versions still read
+with no migration, but they keep the format they were stored in, so the benefit
+appears as data is rewritten.
+
+Read "Rolling back" below before planning a downgrade. SSE-C objects written by
+this release cannot be read by an older server.
+
 ## Upgrading to 4.4.72
 
 **Nothing to change.** No configuration, API or on-disk format changes.
