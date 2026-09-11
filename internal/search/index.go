@@ -2,6 +2,7 @@ package search
 
 import (
 	"container/list"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ type Index struct {
 	lruElems   map[string]*list.Element
 	store      metadata.StoreAPI
 	maxEntries int
+	truncated  bool // the cap dropped objects (Build stopped early or Update evicted): incomplete
 }
 
 const defaultMaxSearchEntries = 50000
@@ -58,7 +60,14 @@ func NewIndex(store metadata.StoreAPI, maxEntries int) *Index {
 	}
 }
 
-// Build populates the index by scanning all object metadata from BoltDB.
+// Build populates the index by scanning object metadata from BoltDB. The scan
+// stops as soon as the index is full: an index that keeps whichever maxEntries
+// objects it saw first is no less arbitrary than one that keeps whichever it saw
+// last, and stopping avoids decoding and evicting every object past the cap —
+// at 250k objects and a 50k cap that is four fifths of the scan. The store
+// iterates in bucket/key order, so on a capped store the buckets that sort last
+// are the ones left out; raise memory.max_search_entries above the object
+// count for a complete index.
 func (idx *Index) Build() error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -66,29 +75,23 @@ func (idx *Index) Build() error {
 	idx.entries = make(map[string]*entry, idx.maxEntries)
 	idx.lru = list.New()
 	idx.lruElems = make(map[string]*list.Element, idx.maxEntries)
+	idx.truncated = false
 
 	err := idx.store.IterateAllObjects(func(bucket, key string, meta metadata.ObjectMeta) bool {
 		if meta.DeleteMarker {
 			return true // skip delete markers
 		}
-		mk := bucket + "/" + key
-		e := newEntry(bucket, key, meta)
-		idx.entries[mk] = e
-		elem := idx.lru.PushFront(mk)
-		idx.lruElems[mk] = elem
-
-		// Evict oldest if over cap
-		for len(idx.entries) > idx.maxEntries {
-			oldest := idx.lru.Back()
-			if oldest == nil {
-				break
-			}
-			idx.evictLocked(oldest.Value.(string))
+		if len(idx.entries) >= idx.maxEntries {
+			idx.truncated = true
+			return false // full: stop scanning
 		}
+		mk := bucket + "/" + key
+		idx.entries[mk] = newEntry(bucket, key, meta)
+		idx.lruElems[mk] = idx.lru.PushFront(mk)
 		return true
 	})
 
-	if err != nil && err.Error() == "stop" {
+	if errors.Is(err, metadata.ErrStopIteration) {
 		return nil
 	}
 	return err
@@ -120,6 +123,7 @@ func (idx *Index) Update(bucket, key string, meta metadata.ObjectMeta) {
 		if oldest == nil {
 			break
 		}
+		idx.truncated = true
 		idx.evictLocked(oldest.Value.(string))
 	}
 }
@@ -223,6 +227,15 @@ func (idx *Index) Count() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return len(idx.entries)
+}
+
+// Truncated reports whether the index has dropped objects — because Build
+// stopped at the entry cap, or because a later Update evicted the least recently
+// touched entry to stay under it — so that searches may miss objects.
+func (idx *Index) Truncated() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.truncated
 }
 
 func newEntry(bucket, key string, meta metadata.ObjectMeta) *entry {

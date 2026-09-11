@@ -1,6 +1,8 @@
 package search
 
 import (
+	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -106,6 +108,9 @@ func TestIndex_LRUEviction(t *testing.T) {
 	if len(results) != 1 {
 		t.Error("expected 4.txt to exist")
 	}
+	if !idx.Truncated() {
+		t.Error("an index that evicted on Update must report truncated")
+	}
 }
 
 func TestIndex_EmptySearch(t *testing.T) {
@@ -124,5 +129,67 @@ func TestIndex_Count(t *testing.T) {
 	idx.Update("b", "k", metadata.ObjectMeta{})
 	if idx.Count() != 1 {
 		t.Error("expected 1 after update")
+	}
+}
+
+func newBuiltIndex(t *testing.T, objects, max int) *Index {
+	t.Helper()
+	store, err := metadata.NewStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.CreateBucket("b"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < objects; i++ {
+		if err := store.PutObjectMeta(metadata.ObjectMeta{
+			Bucket: "b", Key: fmt.Sprintf("docs/file-%04d.txt", i), Size: 1, ContentType: "text/plain",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A delete marker is not an object.
+	if err := store.PutObjectMeta(metadata.ObjectMeta{Bucket: "b", Key: "gone", DeleteMarker: true}); err != nil {
+		t.Fatal(err)
+	}
+	idx := NewIndex(store, max)
+	if err := idx.Build(); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return idx
+}
+
+func TestIndex_BuildFromStore(t *testing.T) {
+	idx := newBuiltIndex(t, 25, 100)
+	if idx.Count() != 25 {
+		t.Fatalf("Count = %d, want 25", idx.Count())
+	}
+	if idx.Truncated() {
+		t.Fatal("index under the cap reported truncated")
+	}
+	if got := idx.Search("file-0007", "b", 10); len(got) != 1 || got[0].Key != "docs/file-0007.txt" {
+		t.Fatalf("Search = %+v", got)
+	}
+	if got := idx.Search("gone", "", 10); len(got) != 0 {
+		t.Fatalf("delete marker was indexed: %+v", got)
+	}
+}
+
+func TestIndex_BuildStopsAtTheCap(t *testing.T) {
+	idx := newBuiltIndex(t, 25, 10)
+	if idx.Count() != 10 {
+		t.Fatalf("Count = %d, want the cap 10", idx.Count())
+	}
+	if !idx.Truncated() {
+		t.Fatal("an index that stopped scanning during Build must report truncated")
+	}
+	// The scan stops once full, so the index holds the first ten keys in store
+	// order rather than the last ten.
+	if got := idx.Search("file-0009", "", 10); len(got) != 1 {
+		t.Fatalf("file-0009 (inside the cap) not indexed: %+v", got)
+	}
+	if got := idx.Search("file-0010", "", 10); len(got) != 0 {
+		t.Fatalf("file-0010 (past the cap) was indexed: %+v", got)
 	}
 }
