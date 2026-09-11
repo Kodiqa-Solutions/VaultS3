@@ -50,7 +50,7 @@ Object storage has several good open-source options, and which one fits depends 
 
 | | VaultS3 | MinIO | Silo | RustFS | SeaweedFS | Garage |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| GitHub stars | 1.3k | 61k¹ | 2.5k | 31k | 34k | 4.4k |
+| GitHub stars³ | 1.6k | 61k¹ | 2.7k | 31k | 34k | 4.4k |
 | License | AGPL-3.0 | AGPL-3.0 | AGPL-3.0 | Apache-2.0 | Apache-2.0 | AGPL-3.0 |
 | Maintained in the open | **Yes** | Archived¹ | Yes | Yes | Yes | Yes |
 | RAM, idle² | **17 MiB** | 184 MiB | 101 MiB | 70 MiB | 98 MiB | 23 MiB |
@@ -58,6 +58,8 @@ Object storage has several good open-source options, and which one fits depends 
 
 > ¹ MinIO removed the admin console from its Community Edition in 2025 and archived the open-source repository in February 2026, so its star count reflects a project that is no longer developed in the open. Full management now requires the paid AIStor product.
 > ² Measured August 2026 on one host, all six idle with no traffic, Docker working set after a 110 second settle, second reading taken to confirm the figures had stopped moving. **Memory under load is higher for every one of them**: VaultS3 peaks around 185 MiB writing 64 MiB objects at concurrency 16. Reproduce it with `docker stats --no-stream`.
+
+> ³ Star counts read from each project's repository on 11 September 2026. Garage is developed on its own Forgejo instance, so its figure comes from the official GitHub mirror at `deuxfleurs-org/garage`.
 
 ### When to pick something else
 

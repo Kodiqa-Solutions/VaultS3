@@ -4,6 +4,15 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [Unreleased]
+### Changed
+- Documented the dashboard search syntax. The `type:`, `tag:` and `etag:` filters
+  had never been written down anywhere, so `etag:` in particular was
+  undiscoverable, and the difference between the whole-bucket Search page, which
+  is capped by `memory.max_search_entries`, and the Files page filter, which
+  walks the store and is always complete, was not explained. Also records the new
+  folder filter in the dashboard feature list.
+
 ## [4.4.74] - 2026-09-11
 ### Fixed
 - **Cold start no longer stalls for minutes on spinning disks.** Building the
