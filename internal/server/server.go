@@ -950,10 +950,28 @@ func New(cfg *config.Config) (*Server, error) {
 		s3h.SetReplicationFunc(replicationFunc)
 	}
 
-	// Build search index
+	// Build the search index. It is a full scan of the objects bucket, which on
+	// a cold page cache is a random read per bolt leaf page: a 600 MB store on a
+	// spinning disk once held startup for over five minutes here. Reading the
+	// file through sequentially first turns that into a bandwidth-bound read of
+	// a few seconds, after which the scan itself is quick. This warms the local
+	// vaults3.db only: in a sharded cluster Build walks the per-shard meta.db
+	// files, which are not prewarmed, so there the scan stays cold.
+	prewarmStart := time.Now()
+	if n, err := store.Prewarm(); err != nil {
+		slog.Warn("metadata prewarm failed", "error", err)
+	} else {
+		slog.Info("metadata prewarmed", "bytes", n, "duration", time.Since(prewarmStart).Round(time.Millisecond))
+	}
 	searchIdx := search.NewIndex(metaStore, cfg.Memory.MaxSearchEntries)
+	buildStart := time.Now()
 	if err := searchIdx.Build(); err != nil {
 		slog.Warn("search index build failed", "error", err)
+	}
+	slog.Info("search index ready", "objects", searchIdx.Count(), "duration", time.Since(buildStart).Round(time.Millisecond))
+	if searchIdx.Truncated() {
+		slog.Warn("search index truncated: more objects exist than memory.max_search_entries allows, so search results are incomplete",
+			"max_search_entries", cfg.Memory.MaxSearchEntries)
 	}
 
 	// Optional vector / semantic-search add-on
@@ -1517,8 +1535,6 @@ func (s *Server) Run() error {
 		defer backupCancel()
 		go s.backupSched.Run(backupCtx)
 	}
-
-	slog.Info("search index ready", "objects", s.searchIndex.Count())
 
 	// Pre-create the buckets listed in storage.default_buckets /
 	// VAULTS3_DEFAULT_BUCKETS (issue #45). Deliberately ahead of every listener:

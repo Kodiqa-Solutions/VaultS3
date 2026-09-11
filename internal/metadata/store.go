@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -1247,8 +1250,28 @@ func (s *Store) SetObjectTier(bucket, key, tier string) error {
 	})
 }
 
+// Prewarm reads the database file once, sequentially, so that the pages bolt
+// mmaps are already in the OS page cache. Bolt walks a bucket in key order,
+// which on a cold cache is one random 4K read per leaf page: a 600 MB store on a
+// spinning disk took over five minutes to scan at startup, while the same scan
+// against a warm cache takes seconds. A sequential read of the whole file is
+// bounded by disk bandwidth instead of seek time. Read-only; the returned size
+// is what was read.
+func (s *Store) Prewarm() (int64, error) {
+	f, err := os.Open(s.db.Path())
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return io.CopyBuffer(io.Discard, f, make([]byte, 1<<20))
+}
+
 // IterateAllObjects scans all object metadata entries.
 // The callback receives bucket, key, and metadata. Return false to stop iteration.
+// ErrStopIteration is what IterateAllObjects returns when the callback asked it
+// to stop. Callers test for it with errors.Is; it is not a failure.
+var ErrStopIteration = errors.New("iteration stopped by callback")
+
 func (s *Store) IterateAllObjects(fn func(bucket, key string, meta ObjectMeta) bool) error {
 	return s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectsBucket)
@@ -1262,7 +1285,7 @@ func (s *Store) IterateAllObjects(fn func(bucket, key string, meta ObjectMeta) b
 				return nil
 			}
 			if !fn(parts[0], parts[1], meta) {
-				return fmt.Errorf("stop") // stop iteration
+				return ErrStopIteration
 			}
 			return nil
 		})

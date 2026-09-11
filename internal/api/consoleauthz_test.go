@@ -18,6 +18,7 @@ func TestEveryBucketRouteMapsToAnAction(t *testing.T) {
 		{http.MethodGet, "b", "s3:ListBucket", "arn:aws:s3:::b"},
 		{http.MethodDelete, "b", "s3:DeleteBucket", "arn:aws:s3:::b"},
 		{http.MethodGet, "b/objects", "s3:ListBucket", "arn:aws:s3:::b"},
+		{http.MethodGet, "b/search", "s3:ListBucket", "arn:aws:s3:::b"},
 		{http.MethodDelete, "b/objects/k.txt", "s3:DeleteObject", "arn:aws:s3:::b/k.txt"},
 		{http.MethodGet, "b/download/k.txt", "s3:GetObject", "arn:aws:s3:::b/k.txt"},
 		{http.MethodPost, "b/upload", "s3:PutObject", "arn:aws:s3:::b/*"},

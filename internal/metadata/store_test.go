@@ -1,10 +1,62 @@
 package metadata
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// A callback returning false ends the walk with ErrStopIteration, which callers
+// distinguish from a real error with errors.Is.
+func TestStore_IterateAllObjectsStops(t *testing.T) {
+	s := newTestStore(t)
+	s.CreateBucket("bucket")
+	for _, k := range []string{"a", "b", "c"} {
+		if err := s.PutObjectMeta(ObjectMeta{Bucket: "bucket", Key: k, Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := 0
+	err := s.IterateAllObjects(func(bucket, key string, meta ObjectMeta) bool {
+		seen++
+		return seen < 2
+	})
+	if !errors.Is(err, ErrStopIteration) {
+		t.Fatalf("err = %v, want ErrStopIteration", err)
+	}
+	if seen != 2 {
+		t.Fatalf("callback ran %d times, want 2", seen)
+	}
+	if err := s.IterateAllObjects(func(string, string, ObjectMeta) bool { return true }); err != nil {
+		t.Fatalf("a full walk must return nil, got %v", err)
+	}
+}
+
+// Prewarm is a plain sequential read of the whole database file — it must read
+// exactly the file and leave the store usable.
+func TestStore_Prewarm(t *testing.T) {
+	s := newTestStore(t)
+	s.CreateBucket("bucket")
+	if err := s.PutObjectMeta(ObjectMeta{Bucket: "bucket", Key: "k", Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.Prewarm()
+	if err != nil {
+		t.Fatalf("Prewarm: %v", err)
+	}
+	info, err := os.Stat(s.db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != info.Size() {
+		t.Fatalf("Prewarm read %d bytes, file is %d", n, info.Size())
+	}
+	if _, err := s.GetObjectMeta("bucket", "k"); err != nil {
+		t.Fatalf("store unusable after Prewarm: %v", err)
+	}
+}
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()

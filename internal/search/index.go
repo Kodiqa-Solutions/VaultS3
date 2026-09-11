@@ -2,9 +2,9 @@ package search
 
 import (
 	"container/list"
+	"errors"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
@@ -40,6 +40,7 @@ type Index struct {
 	lruElems   map[string]*list.Element
 	store      metadata.StoreAPI
 	maxEntries int
+	truncated  bool // the cap dropped objects (Build stopped early or Update evicted): incomplete
 }
 
 const defaultMaxSearchEntries = 50000
@@ -58,7 +59,14 @@ func NewIndex(store metadata.StoreAPI, maxEntries int) *Index {
 	}
 }
 
-// Build populates the index by scanning all object metadata from BoltDB.
+// Build populates the index by scanning object metadata from BoltDB. The scan
+// stops as soon as the index is full: an index that keeps whichever maxEntries
+// objects it saw first is no less arbitrary than one that keeps whichever it saw
+// last, and stopping avoids decoding and evicting every object past the cap —
+// at 250k objects and a 50k cap that is four fifths of the scan. The store
+// iterates in bucket/key order, so on a capped store the buckets that sort last
+// are the ones left out; raise memory.max_search_entries above the object
+// count for a complete index.
 func (idx *Index) Build() error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -66,29 +74,23 @@ func (idx *Index) Build() error {
 	idx.entries = make(map[string]*entry, idx.maxEntries)
 	idx.lru = list.New()
 	idx.lruElems = make(map[string]*list.Element, idx.maxEntries)
+	idx.truncated = false
 
 	err := idx.store.IterateAllObjects(func(bucket, key string, meta metadata.ObjectMeta) bool {
 		if meta.DeleteMarker {
 			return true // skip delete markers
 		}
-		mk := bucket + "/" + key
-		e := newEntry(bucket, key, meta)
-		idx.entries[mk] = e
-		elem := idx.lru.PushFront(mk)
-		idx.lruElems[mk] = elem
-
-		// Evict oldest if over cap
-		for len(idx.entries) > idx.maxEntries {
-			oldest := idx.lru.Back()
-			if oldest == nil {
-				break
-			}
-			idx.evictLocked(oldest.Value.(string))
+		if len(idx.entries) >= idx.maxEntries {
+			idx.truncated = true
+			return false // full: stop scanning
 		}
+		mk := bucket + "/" + key
+		idx.entries[mk] = newEntry(bucket, key, meta)
+		idx.lruElems[mk] = idx.lru.PushFront(mk)
 		return true
 	})
 
-	if err != nil && err.Error() == "stop" {
+	if errors.Is(err, metadata.ErrStopIteration) {
 		return nil
 	}
 	return err
@@ -120,6 +122,7 @@ func (idx *Index) Update(bucket, key string, meta metadata.ObjectMeta) {
 		if oldest == nil {
 			break
 		}
+		idx.truncated = true
 		idx.evictLocked(oldest.Value.(string))
 	}
 }
@@ -148,29 +151,9 @@ func (idx *Index) Search(query, bucket string, limit int) []Result {
 		limit = 50
 	}
 
-	query = strings.TrimSpace(query)
-	if query == "" {
+	q := ParseQuery(query)
+	if q.IsEmpty() {
 		return nil
-	}
-
-	var tagFilters []tagFilter
-	var typeFilter string
-	var textTerms []string
-
-	for _, part := range strings.Fields(query) {
-		lower := strings.ToLower(part)
-		if strings.HasPrefix(lower, "tag:") {
-			tf := parseTagFilter(strings.TrimPrefix(part, "tag:"))
-			if tf.key != "" {
-				tagFilters = append(tagFilters, tf)
-				continue
-			}
-		}
-		if strings.HasPrefix(lower, "type:") {
-			typeFilter = strings.ToLower(strings.TrimPrefix(part, "type:"))
-			continue
-		}
-		textTerms = append(textTerms, strings.ToLower(part))
 	}
 
 	var results []Result
@@ -178,26 +161,8 @@ func (idx *Index) Search(query, bucket string, limit int) []Result {
 		if bucket != "" && e.bucket != bucket {
 			continue
 		}
-
-		if !matchTagFilters(e.tags, tagFilters) {
+		if !q.Match(e.text, e.contentType, e.etag, e.tags) {
 			continue
-		}
-
-		if typeFilter != "" && !strings.Contains(strings.ToLower(e.contentType), typeFilter) {
-			continue
-		}
-
-		if len(textTerms) > 0 {
-			allMatch := true
-			for _, term := range textTerms {
-				if !strings.Contains(e.text, term) {
-					allMatch = false
-					break
-				}
-			}
-			if !allMatch {
-				continue
-			}
 		}
 
 		results = append(results, Result{
@@ -223,6 +188,82 @@ func (idx *Index) Count() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return len(idx.entries)
+}
+
+// Truncated reports whether the index has dropped objects — because Build
+// stopped at the entry cap, or because a later Update evicted the least recently
+// touched entry to stay under it — so that searches may miss objects.
+func (idx *Index) Truncated() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.truncated
+}
+
+// Query is a parsed search string. The grammar is shared by the global search
+// and the per-folder filter in the file browser so both answer the same way:
+// whitespace-separated terms, all of which must match (AND); a term is a
+// case-insensitive substring unless it is a "tag:key" / "tag:key=value" filter
+// or a "type:<content-type substring>" filter.
+type Query struct {
+	tagFilters []tagFilter
+	typeFilter string
+	etagFilter string // lower-cased prefix of the ETag, quotes stripped
+	textTerms  []string
+}
+
+// ParseQuery splits a raw query into text terms and tag:/type:/etag: filters.
+// Text terms are substrings of the object's bucket, key, content type and tags;
+// the ETag is only reachable through etag: so that a short numeric or hex term
+// cannot collide with the 32 hex digits of every MD5.
+func ParseQuery(query string) Query {
+	var q Query
+	for _, part := range strings.Fields(strings.TrimSpace(query)) {
+		lower := strings.ToLower(part)
+		if strings.HasPrefix(lower, "tag:") {
+			tf := parseTagFilter(strings.TrimPrefix(lower, "tag:"))
+			if tf.key != "" {
+				q.tagFilters = append(q.tagFilters, tf)
+				continue
+			}
+		}
+		if strings.HasPrefix(lower, "type:") {
+			q.typeFilter = strings.TrimPrefix(lower, "type:")
+			continue
+		}
+		if strings.HasPrefix(lower, "etag:") {
+			q.etagFilter = normalizeETag(strings.TrimPrefix(lower, "etag:"))
+			continue
+		}
+		q.textTerms = append(q.textTerms, lower)
+	}
+	return q
+}
+
+// IsEmpty reports whether the query has no terms and no filters at all.
+func (q Query) IsEmpty() bool {
+	return len(q.textTerms) == 0 && len(q.tagFilters) == 0 && q.typeFilter == "" && q.etagFilter == ""
+}
+
+// Match reports whether an object described by text (already lower-cased; the
+// haystack the text terms are searched in), its content type, ETag and tags
+// satisfies every term and filter of the query. An etag: filter matches a
+// prefix of the ETag, so a user can paste the first few characters.
+func (q Query) Match(text, contentType, etag string, tags map[string]string) bool {
+	if !matchTagFilters(tags, q.tagFilters) {
+		return false
+	}
+	if q.typeFilter != "" && !strings.Contains(strings.ToLower(contentType), q.typeFilter) {
+		return false
+	}
+	if q.etagFilter != "" && !strings.HasPrefix(normalizeETag(etag), q.etagFilter) {
+		return false
+	}
+	for _, term := range q.textTerms {
+		if !strings.Contains(text, term) {
+			return false
+		}
+	}
+	return true
 }
 
 func newEntry(bucket, key string, meta metadata.ObjectMeta) *entry {
@@ -252,9 +293,12 @@ func parseTagFilter(s string) tagFilter {
 	return tf
 }
 
+// matchTagFilters is case-insensitive on keys as well as values, like every
+// other part of the query: the whole query is lower-cased before matching, so
+// a tag: filter must not be the one place that demands exact case.
 func matchTagFilters(tags map[string]string, filters []tagFilter) bool {
 	for _, f := range filters {
-		v, ok := tags[f.key]
+		v, ok := lookupTagFold(tags, f.key)
 		if !ok {
 			return false
 		}
@@ -265,24 +309,47 @@ func matchTagFilters(tags map[string]string, filters []tagFilter) bool {
 	return true
 }
 
+func lookupTagFold(tags map[string]string, key string) (string, bool) {
+	for k, v := range tags {
+		if strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// normalizeETag lower-cases an ETag and strips the quotes S3 wraps it in.
+func normalizeETag(etag string) string {
+	return strings.Trim(strings.ToLower(etag), `"`)
+}
+
 func buildSearchText(bucket, key string, meta metadata.ObjectMeta) string {
+	return SearchText(bucket, key, meta.ContentType, meta.Tags)
+}
+
+// SearchText is the lower-cased haystack plain query terms are matched against:
+// bucket, key (or, for the folder filter, the child's name), content type and
+// tags as k=v. The global index and the folder filter both build it here so a
+// term means the same thing in both. The ETag and the modification date are
+// deliberately left out — they are hex digits and numbers that random short
+// terms match by accident (any four hex digits hit roughly one MD5 in 2,000).
+// The ETag is reachable through the etag: filter instead.
+func SearchText(bucket, key, contentType string, tags map[string]string) string {
 	var b strings.Builder
-	b.WriteString(strings.ToLower(bucket))
-	b.WriteByte(' ')
-	b.WriteString(strings.ToLower(key))
-	b.WriteByte(' ')
-	b.WriteString(strings.ToLower(meta.ContentType))
-	b.WriteByte(' ')
-	b.WriteString(strings.ToLower(meta.ETag))
-	for k, v := range meta.Tags {
+	for _, part := range []string{bucket, key, contentType} {
+		if part == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strings.ToLower(part))
+	}
+	for k, v := range tags {
 		b.WriteByte(' ')
 		b.WriteString(strings.ToLower(k))
 		b.WriteByte('=')
 		b.WriteString(strings.ToLower(v))
-	}
-	if meta.LastModified > 0 {
-		b.WriteByte(' ')
-		b.WriteString(time.Unix(meta.LastModified, 0).Format("2006-01-02"))
 	}
 	return b.String()
 }

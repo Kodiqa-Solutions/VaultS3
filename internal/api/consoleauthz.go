@@ -80,6 +80,9 @@ func consoleActionFor(method, rest string) (consoleAction, bool) {
 			return consoleAction{action: "s3:DeleteObject", bucket: bucket, key: key}, true
 		}
 		return consoleAction{action: "s3:GetObject", bucket: bucket, key: key}, true
+	case "search":
+		// Filtering a folder reveals the same key names a listing does.
+		return consoleAction{action: "s3:ListBucket", bucket: bucket}, true
 	case "download":
 		return consoleAction{action: "s3:GetObject", bucket: bucket, key: key}, true
 	case "download-zip":

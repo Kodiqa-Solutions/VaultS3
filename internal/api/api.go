@@ -639,6 +639,13 @@ func (h *APIHandler) routeBucket(w http.ResponseWriter, r *http.Request, rest st
 				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			}
 		}
+	case "search":
+		// /buckets/{name}/search?prefix=&q= — filter one folder level
+		if r.Method == http.MethodGet {
+			h.handleSearchObjects(w, r, name)
+		} else {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
 	case "download":
 		if keyRest != "" && r.Method == http.MethodGet {
 			h.handleDownload(w, r, name, keyRest)
