@@ -5,37 +5,17 @@ import (
 	"compress/gzip"
 	"crypto/md5"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
 
 // zstdEncoder is reused across objects — EncodeAll is safe for concurrent use.
 var zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
-
-// zstdWriters pools streaming encoders. Unlike EncodeAll, a streaming writer is
-// stateful and cannot be shared, and building one per object allocates its whole
-// compression window — exactly the per-request cost the streaming path exists to
-// avoid.
-var zstdWriters = sync.Pool{
-	New: func() any {
-		w, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
-		return w
-	},
-}
-
-func acquireZstdWriter() *zstd.Encoder { return zstdWriters.Get().(*zstd.Encoder) }
-
-// releaseZstdWriter returns an encoder to the pool with its reference to the
-// previous destination dropped, so a finished upload's pipe is not pinned alive.
-func releaseZstdWriter(e *zstd.Encoder) {
-	e.Reset(nil)
-	zstdWriters.Put(e)
-}
 
 // excludedExtensions lists file extensions that should NOT be compressed
 // because they are already compressed or would not benefit from compression.
@@ -150,27 +130,29 @@ func (c *CompressedEngine) ObjectPath(bucket, key string) string {
 	return c.inner.ObjectPath(bucket, key)
 }
 
-// maxCompressedSize is the maximum object size for in-memory compression (1GB).
+// maxCompressedSize is the maximum plaintext size accepted for compression (1GB).
 const maxCompressedSize int64 = 1 * 1024 * 1024 * 1024
 
-// compressAndPut reads all data, compresses it, computes ETag of original, writes compressed.
-func (c *CompressedEngine) compressAndPut(reader io.Reader, size int64, putFn func(io.Reader, int64) (int64, string, error)) (int64, string, error) {
-	if size >= 0 && size <= maxCompressedSize {
-		return c.streamCompressAndPut(reader, size, putFn)
-	}
-	return c.bufferCompressAndPut(reader, putFn)
-}
-
-// streamCompressAndPut compresses as the object flows through, so a large upload
-// costs a window rather than two or three full copies of itself. Buffering here
-// (plaintext + compressed + the handler's own copy) was a large part of the peak
-// memory that OOM-killed nodes under concurrent 64 MiB uploads (issue #46).
+// compressAndPut compresses reader as it flows through, computes the ETag of the
+// plaintext, and writes the compressed blob to putFn.
 //
-// size must be the real plaintext length: it is written into the zstd frame
-// header as the content size, which is what lets reads stream instead of
-// materialising the whole object to learn how big it is (issue #38). Dropping it
-// would quietly undo that fix, so an unknown length uses the buffered path.
-func (c *CompressedEngine) streamCompressAndPut(reader io.Reader, size int64, putFn func(io.Reader, int64) (int64, string, error)) (int64, string, error) {
+// Compressing as the object flows through means a large upload costs a frame
+// rather than two or three full copies of itself. Buffering here (plaintext +
+// compressed + the handler's own copy) was a large part of the peak memory that
+// OOM-killed nodes under concurrent 64 MiB uploads (issue #46).
+//
+// The blob is written in the seekable zstd format (see seekzstd.go), whose seek
+// table records every frame's decompressed size. Reads take the object length
+// from the table, so, unlike the single-frame format this replaces, the length
+// no longer has to be known before the first byte is written and an upload of
+// unknown length (chunked, size -1) streams exactly like one with a
+// Content-Length. The size cap is enforced as the plaintext is counted, so an
+// oversized upload fails partway through and the inner engine abandons its
+// partial write instead of a gigabyte being buffered first.
+func (c *CompressedEngine) compressAndPut(reader io.Reader, size int64, putFn func(io.Reader, int64) (int64, string, error)) (int64, string, error) {
+	if size > maxCompressedSize {
+		return 0, "", fmt.Errorf("object too large for compression (max %dMB)", maxCompressedSize/(1024*1024))
+	}
 	h := md5.New()
 	pr, pw := io.Pipe()
 
@@ -181,14 +163,11 @@ func (c *CompressedEngine) streamCompressAndPut(reader io.Reader, size int64, pu
 	done := make(chan encResult, 1)
 
 	go func() {
-		enc := acquireZstdWriter()
-		// ResetContentSize records the frame content size the reader relies on.
-		enc.ResetContentSize(pw, size)
-		n, err := io.Copy(enc, io.TeeReader(reader, h))
-		if cerr := enc.Close(); err == nil {
-			err = cerr
+		limited := io.LimitReader(io.TeeReader(reader, h), maxCompressedSize+1)
+		n, err := writeSeekableZstd(pw, limited, defaultCompressFrame)
+		if err == nil && n > maxCompressedSize {
+			err = fmt.Errorf("object too large for compression (max %dMB)", maxCompressedSize/(1024*1024))
 		}
-		releaseZstdWriter(enc)
 		// Closing the pipe with the error propagates a failed read or encode to
 		// the inner engine, which then abandons its partial write.
 		pw.CloseWithError(err)
@@ -207,48 +186,12 @@ func (c *CompressedEngine) streamCompressAndPut(reader io.Reader, size int64, pu
 	if putErr != nil {
 		return 0, "", putErr
 	}
-	if res.n > maxCompressedSize {
-		return 0, "", fmt.Errorf("object too large for compression (max %dMB)", maxCompressedSize/(1024*1024))
-	}
 	return res.n, fmt.Sprintf("\"%x\"", h.Sum(nil)), nil
 }
 
-// bufferCompressAndPut is the fallback for an upload whose length is not known
-// in advance, where the frame content size can only be learned by reading it all.
-func (c *CompressedEngine) bufferCompressAndPut(reader io.Reader, putFn func(io.Reader, int64) (int64, string, error)) (int64, string, error) {
-	plaintext, err := io.ReadAll(io.LimitReader(reader, maxCompressedSize+1))
-	if err != nil {
-		return 0, "", fmt.Errorf("read plaintext: %w", err)
-	}
-	if int64(len(plaintext)) > maxCompressedSize {
-		return 0, "", fmt.Errorf("object too large for compression (max %dMB)", maxCompressedSize/(1024*1024))
-	}
-
-	// Compute ETag of original data
-	h := md5.Sum(plaintext)
-	etag := fmt.Sprintf("\"%x\"", h)
-
-	// Compress with zstd. EncodeAll on the shared encoder is concurrent-safe and
-	// avoids per-object allocations.
-	compressed := zstdEncoder.EncodeAll(plaintext, nil)
-
-	if _, _, err = putFn(bytes.NewReader(compressed), int64(len(compressed))); err != nil {
-		return 0, "", err
-	}
-
-	// Return original plaintext size and ETag
-	return int64(len(plaintext)), etag, nil
-}
-
-// getAndDecompress reads compressed data from inner engine, decompresses it.
 // getAndDecompress returns the object's plaintext as a STREAMING reader whose
-// time-to-first-byte does not depend on object size (issue #38). zstd and gzip are
-// both streaming codecs, and both record the decompressed size in the container (zstd
-// frame header, gzip trailing ISIZE), so we can report Content-Length without first
-// materializing the object. Only Range/partNumber reads (which Seek) fall back to
-// buffering, since the codecs are not seekable. If the stored blob matches neither
-// magic (written while compression was off) it is streamed through untouched, and if
-// the size cannot be read cheaply we fall back to the old buffered decode.
+// time-to-first-byte does not depend on object size (issue #38) and whose memory
+// does not depend on it either. See decompressIfCompressed for the formats.
 func (c *CompressedEngine) getAndDecompress(getFn func() (ReadSeekCloser, int64, error)) (ReadSeekCloser, int64, error) {
 	src, storedSize, err := getFn()
 	if err != nil {
@@ -261,8 +204,23 @@ func (c *CompressedEngine) getAndDecompress(getFn func() (ReadSeekCloser, int64,
 // magic and streams it through untouched when it does not. Split out of the
 // engine method so the encryption layer can use it to unwrap the legacy
 // compress-outside-encrypt layering (see openSealed).
+//
+// Three compressed layouts are on disk and each gets the cheapest reader it
+// allows:
+//
+//   - Seekable zstd (new writes): the blob starts with the zstd magic and ends
+//     with the seekable footer magic. The seek table gives the plaintext size
+//     and a Range read decompresses one frame. Memory is O(frame).
+//   - Single-frame zstd (written before the seekable format) and gzip (written
+//     before zstd): both stream from the front, with the size read from the
+//     container (zstd frame header, gzip trailing ISIZE). Neither codec can be
+//     entered in the middle, so a Seek restarts the decoder and discards up to
+//     the offset. That is CPU proportional to the offset but memory O(decoder
+//     window), where it used to materialise the whole object per reader.
+//   - No magic (written while compression was off): streamed through untouched.
+//
+// Only a source that cannot seek at all still decodes into memory.
 func decompressIfCompressed(src ReadSeekCloser, storedSize int64) (ReadSeekCloser, int64, error) {
-
 	magic := make([]byte, 4)
 	n, _ := io.ReadFull(src, magic)
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
@@ -272,25 +230,43 @@ func decompressIfCompressed(src ReadSeekCloser, storedSize int64) (ReadSeekClose
 
 	switch {
 	case n >= 4 && magic[0] == 0x28 && magic[1] == 0xB5 && magic[2] == 0x2F && magic[3] == 0xFD:
-		size, ok := zstdContentSize(src)
-		if !ok || size > maxCompressedSize {
-			return bufferedDecompress(src)
+		table, err := readSeekTable(src)
+		if err == nil {
+			r := newSeekableReader(src, table)
+			return r, r.size, nil
 		}
-		return &decompressStream{src: src, size: size, newDec: func(r io.Reader) (io.ReadCloser, error) {
+		if !errors.Is(err, errNotSeekable) {
+			src.Close()
+			return nil, 0, err
+		}
+		newDec := func(r io.Reader) (io.ReadCloser, error) {
 			d, err := zstd.NewReader(r)
 			if err != nil {
 				return nil, err
 			}
 			return zstdReadCloser{d}, nil
-		}}, size, nil
-	case n >= 2 && magic[0] == 0x1F && magic[1] == 0x8B:
-		size, ok := gzipISize(src)
-		if !ok || size > maxCompressedSize {
-			return bufferedDecompress(src)
 		}
-		return &decompressStream{src: src, size: size, newDec: func(r io.Reader) (io.ReadCloser, error) {
-			return gzip.NewReader(r)
-		}}, size, nil
+		size, ok := zstdContentSize(src)
+		if !ok {
+			// EncodeAll always recorded the content size, so this is rare; count
+			// the plaintext with one pass through the decoder rather than hold it.
+			if size, err = decodedSize(src, newDec); err != nil {
+				src.Close()
+				return nil, 0, err
+			}
+		}
+		return &decompressStream{src: src, size: size, newDec: newDec}, size, nil
+	case n >= 2 && magic[0] == 0x1F && magic[1] == 0x8B:
+		newDec := func(r io.Reader) (io.ReadCloser, error) { return gzip.NewReader(r) }
+		size, ok := gzipISize(src)
+		if !ok {
+			var err error
+			if size, err = decodedSize(src, newDec); err != nil {
+				src.Close()
+				return nil, 0, err
+			}
+		}
+		return &decompressStream{src: src, size: size, newDec: newDec}, size, nil
 	default:
 		// Not a compressed blob (e.g. written while compression was disabled) — the
 		// inner reader already streams the plaintext.
@@ -298,9 +274,31 @@ func decompressIfCompressed(src ReadSeekCloser, storedSize int64) (ReadSeekClose
 	}
 }
 
-// bufferedDecompress is the fallback path: read the whole blob, decompress in memory,
-// serve from a bytes reader. Used when the source is not seekable or the decompressed
-// size cannot be read from the header.
+// decodedSize learns the plaintext length of a blob whose container does not
+// record it by decoding it once into io.Discard, then rewinds src. Memory is the
+// decoder's window; the old fallback held the whole plaintext instead.
+func decodedSize(src ReadSeekCloser, newDec func(io.Reader) (io.ReadCloser, error)) (int64, error) {
+	dec, err := newDec(src)
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(io.Discard, io.LimitReader(dec, maxCompressedSize+1))
+	dec.Close()
+	if err != nil {
+		return 0, fmt.Errorf("decompress: %w", err)
+	}
+	if n > maxCompressedSize {
+		return 0, fmt.Errorf("decompressed data exceeds size limit")
+	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// bufferedDecompress is the last-resort path for a source that cannot seek:
+// read the whole blob, decompress in memory, serve from a bytes reader. Every
+// engine hands out seekable readers, so this is not reached in practice.
 func bufferedDecompress(src ReadSeekCloser) (ReadSeekCloser, int64, error) {
 	defer src.Close()
 	compressed, err := io.ReadAll(io.LimitReader(src, maxCompressedSize+1))
@@ -356,56 +354,83 @@ type zstdReadCloser struct{ *zstd.Decoder }
 
 func (z zstdReadCloser) Close() error { z.Decoder.Close(); return nil }
 
-// decompressStream streams decompression so GET time-to-first-byte is independent of
-// object size (issue #38). Read pulls from a streaming decoder over the compressed
-// source. Seek (Range/partNumber only) materializes once, since the codecs are not
-// seekable.
+// decompressStream streams a single-frame zstd or gzip object so GET
+// time-to-first-byte is independent of object size (issue #38). Read pulls from
+// a streaming decoder over the compressed source.
+//
+// These codecs cannot be entered in the middle, so Seek (Range/partNumber) is a
+// forward seek by discard: the decoder is positioned at the target by decoding
+// and dropping everything before it, restarting from the front when the target
+// is behind the current position. It used to materialise the whole plaintext
+// once per reader, which with N concurrent Range requests was N copies of the
+// object; discarding costs CPU proportional to the offset but holds only the
+// decoder window. New writes use the seekable format and do not pay even that.
 type decompressStream struct {
 	src    ReadSeekCloser
 	newDec func(io.Reader) (io.ReadCloser, error)
 	dec    io.ReadCloser
-	buf    *bytes.Reader
 	size   int64
+	pos    int64 // plaintext offset the decoder will yield next
+	target int64 // plaintext offset the caller asked for; equals pos once positioned
 }
 
-func (d *decompressStream) Read(p []byte) (int, error) {
-	if d.buf != nil {
-		return d.buf.Read(p)
+// ensure positions the decoder at d.target, opening or restarting it as needed.
+func (d *decompressStream) ensure() error {
+	if d.dec != nil && d.target < d.pos {
+		d.dec.Close()
+		d.dec = nil
 	}
 	if d.dec == nil {
 		if _, err := d.src.Seek(0, io.SeekStart); err != nil {
-			return 0, err
+			return err
 		}
 		dec, err := d.newDec(d.src)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		d.dec = dec
+		d.pos = 0
 	}
-	return d.dec.Read(p)
+	if d.target > d.pos {
+		n, err := io.CopyN(io.Discard, d.dec, d.target-d.pos)
+		d.pos += n
+		if err != nil && err != io.EOF {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *decompressStream) Read(p []byte) (int, error) {
+	if d.target >= d.size {
+		return 0, io.EOF
+	}
+	if err := d.ensure(); err != nil {
+		return 0, err
+	}
+	n, err := d.dec.Read(p)
+	d.pos += int64(n)
+	d.target = d.pos
+	return n, err
 }
 
 func (d *decompressStream) Seek(offset int64, whence int) (int64, error) {
-	if d.buf == nil {
-		if d.dec != nil {
-			d.dec.Close()
-			d.dec = nil
-		}
-		if _, err := d.src.Seek(0, io.SeekStart); err != nil {
-			return 0, err
-		}
-		dec, err := d.newDec(d.src)
-		if err != nil {
-			return 0, err
-		}
-		data, err := io.ReadAll(io.LimitReader(dec, maxCompressedSize+1))
-		dec.Close()
-		if err != nil {
-			return 0, err
-		}
-		d.buf = bytes.NewReader(data)
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = d.target + offset
+	case io.SeekEnd:
+		abs = d.size + offset
+	default:
+		return 0, fmt.Errorf("storage: invalid whence %d", whence)
 	}
-	return d.buf.Seek(offset, whence)
+	if abs < 0 {
+		return 0, fmt.Errorf("storage: negative seek position %d", abs)
+	}
+	d.target = abs
+	return abs, nil
 }
 
 func (d *decompressStream) Close() error {
@@ -419,6 +444,8 @@ func (d *decompressStream) Close() error {
 // number so both new (zstd) and legacy (gzip) objects read correctly. Data that
 // matches neither magic (e.g. written while compression was disabled) is returned
 // unchanged. The LimitReader caps output to guard against decompression bombs.
+// The zstd decoder decodes concatenated frames and skips the seek table's
+// skippable frame, so a seekable blob decodes here too.
 func decompressBlock(data []byte) ([]byte, error) {
 	switch {
 	case len(data) >= 4 && data[0] == 0x28 && data[1] == 0xB5 && data[2] == 0x2F && data[3] == 0xFD:
