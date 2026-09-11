@@ -46,7 +46,7 @@ export default function TopBar({ onMenuToggle }: Props) {
           onChange={(e) => setLocale(e.target.value)}
           title={t('topbar.language')}
           aria-label={t('topbar.language')}
-          className="text-sm bg-transparent text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-gray-700 rounded-lg px-2 py-1 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          className="min-w-[7rem] text-sm bg-transparent text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-gray-700 rounded-lg px-2 py-1 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500"
         >
           {LOCALES.map((l) => (
             <option key={l.code} value={l.code} className="bg-white dark:bg-gray-800">
