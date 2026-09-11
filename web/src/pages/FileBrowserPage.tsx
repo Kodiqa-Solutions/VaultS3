@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
 import { useParams, useSearchParams, Link } from 'react-router-dom'
-import { listObjects, deleteObject, bulkDeleteObjects, getDownloadUrl, getDownloadZipUrl, type ObjectItem } from '../api/objects'
+import { listObjects, searchObjectsInPrefix, deleteObject, bulkDeleteObjects, getDownloadUrl, getDownloadZipUrl, type ObjectItem } from '../api/objects'
 import { getBucketVersioning } from '../api/buckets'
 import { listVersions, getVersionTags, createVersionTag, deleteVersionTag, rollbackVersion, type Version, type VersionTag } from '../api/versions'
 import UploadDropzone from '../components/UploadDropzone'
@@ -24,6 +24,14 @@ export default function FileBrowserPage() {
   const { name: bucket } = useParams<{ name: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
   const prefix = searchParams.get('prefix') || ''
+  // Folder filter. The applied query lives in the URL (shareable, survives a
+  // reload); the input box is local state submitted into it with Enter or the
+  // button.
+  const q = searchParams.get('q') || ''
+  const [filterText, setFilterText] = useState(q)
+  // The box follows the applied ?q= when it changes from outside — a Back or
+  // Forward step, or a deep link — so a filtered list never shows an empty box.
+  useEffect(() => { setFilterText(q) }, [q])
 
   const [objects, setObjects] = useState<ObjectItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -143,7 +151,9 @@ export default function FileBrowserPage() {
     setLoading(true)
     setError('')
     try {
-      const data = await listObjects(bucket, prefix, FETCH_SIZE)
+      const data = q
+        ? await searchObjectsInPrefix(bucket, prefix, q, FETCH_SIZE)
+        : await listObjects(bucket, prefix, FETCH_SIZE)
       setObjects(data.objects || [])
       setTruncated(data.truncated)
       setNextCursor(data.nextStartAfter || '')
@@ -154,7 +164,7 @@ export default function FileBrowserPage() {
     } finally {
       setLoading(false)
     }
-  }, [bucket, prefix])
+  }, [bucket, prefix, q])
 
   // Pull the next page from the server and append it, de-duplicating folder
   // roll-ups that can recur when a folder's objects span a page boundary.
@@ -163,7 +173,9 @@ export default function FileBrowserPage() {
     setLoadingMore(true)
     setError('')
     try {
-      const data = await listObjects(bucket, prefix, FETCH_SIZE, nextCursor)
+      const data = q
+        ? await searchObjectsInPrefix(bucket, prefix, q, FETCH_SIZE, nextCursor)
+        : await listObjects(bucket, prefix, FETCH_SIZE, nextCursor)
       setObjects(prev => {
         const seen = new Set(prev.map(o => o.key))
         return [...prev, ...(data.objects || []).filter(o => !seen.has(o.key))]
@@ -175,7 +187,7 @@ export default function FileBrowserPage() {
     } finally {
       setLoadingMore(false)
     }
-  }, [bucket, prefix, truncated, nextCursor, loadingMore])
+  }, [bucket, prefix, q, truncated, nextCursor, loadingMore])
 
   useEffect(() => { fetchObjects() }, [fetchObjects])
 
@@ -218,12 +230,29 @@ export default function FileBrowserPage() {
     }
   }
 
+  // Entering a folder drops the filter: it was about the folder we are leaving.
+  // Other params stay; only prefix and q are ours.
   const navigatePrefix = (p: string) => {
-    if (p) {
-      setSearchParams({ prefix: p })
-    } else {
-      setSearchParams({})
-    }
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev)
+      if (p) next.set('prefix', p); else next.delete('prefix')
+      next.delete('q')
+      return next
+    })
+  }
+
+  const applyFilter = (text: string) => {
+    const trimmed = text.trim()
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev)
+      if (trimmed) next.set('q', trimmed); else next.delete('q')
+      return next
+    }, { replace: true })
+  }
+
+  const clearFilter = () => {
+    setFilterText('')
+    applyFilter('')
   }
 
   // Sort logic
@@ -397,7 +426,44 @@ export default function FileBrowserPage() {
           <h2 className="text-xl font-semibold text-gray-900 dark:text-white">{t('files.title')}</h2>
         </div>
 
-        <div className="flex items-center justify-end mb-3">
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <form
+            className="flex items-center gap-2 flex-1 max-w-lg"
+            onSubmit={e => { e.preventDefault(); applyFilter(filterText) }}
+          >
+          <div className="relative flex-1">
+            <svg className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+            </svg>
+            <input
+              type="text"
+              value={filterText}
+              onChange={e => setFilterText(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Escape') clearFilter() }}
+              placeholder={t('search.keywordPlaceholder')}
+              aria-label={t('search.keywordPlaceholder')}
+              className="w-full pl-9 pr-8 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm placeholder:text-gray-400"
+            />
+            {filterText && (
+              <button
+                onClick={clearFilter}
+                title={t('files.filterClear')}
+                aria-label={t('files.filterClear')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            )}
+          </div>
+          <button
+            type="submit"
+            className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium transition-colors"
+          >
+            {t('search.search')}
+          </button>
+          </form>
           <div className="inline-flex rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
             <button
               onClick={() => setView('table')}
@@ -527,6 +593,19 @@ export default function FileBrowserPage() {
           <div className="flex items-center justify-center h-64">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600" />
           </div>
+        ) : objects.length === 0 && q ? (
+          <div className="text-center py-16 bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700">
+            <p className="text-gray-500 dark:text-gray-400 text-sm">{t('files.filterEmpty', { q })}</p>
+            {truncated && (
+              <button
+                onClick={loadMore}
+                disabled={loadingMore}
+                className="mt-3 px-3 py-1.5 rounded-lg border border-indigo-300 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 disabled:opacity-40 text-sm transition-colors"
+              >
+                {loadingMore ? t('common.loading') : t('files.loadMore', { n: FETCH_SIZE })}
+              </button>
+            )}
+          </div>
         ) : objects.length === 0 ? (
           <div className="text-center py-16 bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700">
             <svg className="w-12 h-12 mx-auto text-gray-400 dark:text-gray-500 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -537,6 +616,11 @@ export default function FileBrowserPage() {
           </div>
         ) : (
           <>
+            {q && (
+              <p className="mb-2 text-sm text-gray-500 dark:text-gray-400">
+                {t('files.filterResults', { n: `${sortedObjects.length}${truncated ? '+' : ''}`, q })}
+              </p>
+            )}
             {viewMode === 'table' ? (
             <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
               <table className="w-full text-sm">

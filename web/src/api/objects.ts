@@ -53,6 +53,20 @@ export function listObjects(bucket: string, prefix = '', maxKeys = 200, startAft
   return apiFetch<ObjectListResponse>(`/buckets/${bucket}/objects${qs ? '?' + qs : ''}`)
 }
 
+// searchObjectsInPrefix filters ONE folder level — the direct children of
+// `prefix`, files and sub-folders — by name, with the same query grammar as the
+// global search (case-insensitive substrings, AND of terms, tag:k=v, type:x).
+// The response has the listing's shape so the browser renders it unchanged;
+// `truncated` + `nextStartAfter` continue a scan the server stopped early.
+export function searchObjectsInPrefix(bucket: string, prefix: string, q: string, maxKeys = 200, startAfter = ''): Promise<ObjectListResponse> {
+  const params = new URLSearchParams()
+  params.set('q', q)
+  if (prefix) params.set('prefix', prefix)
+  if (maxKeys !== 200) params.set('maxKeys', String(maxKeys))
+  if (startAfter) params.set('startAfter', startAfter)
+  return apiFetch<ObjectListResponse>(`/buckets/${bucket}/search?${params.toString()}`)
+}
+
 export function deleteObject(bucket: string, key: string): Promise<void> {
   return apiFetch<void>(`/buckets/${bucket}/objects/${key}`, { method: 'DELETE' })
 }

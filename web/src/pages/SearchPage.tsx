@@ -17,6 +17,13 @@ function formatSize(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
 }
 
+// Land in the folder that holds the hit, not at the bucket root.
+function browseUrl(bucket: string, key: string): string {
+  const dir = key.slice(0, key.lastIndexOf('/') + 1)
+  const base = `/buckets/${encodeURIComponent(bucket)}/files`
+  return dir ? `${base}?prefix=${encodeURIComponent(dir)}` : base
+}
+
 export default function SearchPage() {
   const { t } = useI18n()
   const navigate = useNavigate()
@@ -185,7 +192,7 @@ export default function SearchPage() {
               <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
                 {semanticResults.map((r, i) => (
                   <tr key={i}
-                    onClick={() => navigate(`/buckets/${r.bucket}/files`)}
+                    onClick={() => navigate(browseUrl(r.bucket, r.key))}
                     className="hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors cursor-pointer">
                     <td className="px-4 py-3 font-medium text-gray-900 dark:text-white">{r.bucket}</td>
                     <td className="px-4 py-3 text-gray-700 dark:text-gray-300 font-mono text-xs max-w-md truncate">{r.key}</td>
@@ -229,7 +236,7 @@ export default function SearchPage() {
                 <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
                   {pagedResults.map((r, i) => (
                     <tr key={i}
-                      onClick={() => navigate(`/buckets/${r.bucket}/files`)}
+                      onClick={() => navigate(browseUrl(r.bucket, r.key))}
                       className="hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors cursor-pointer">
                       <td className="px-4 py-3 font-medium text-gray-900 dark:text-white">{r.bucket}</td>
                       <td className="px-4 py-3 text-gray-700 dark:text-gray-300 font-mono text-xs max-w-xs truncate">{r.key}</td>
