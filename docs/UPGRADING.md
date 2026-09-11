@@ -59,6 +59,24 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 4.4.74
+
+**Worth taking if you run on spinning disks or have a large object count.**
+Nothing to change, no configuration or on-disk format changes.
+
+Startup no longer stalls while the search index is built. On a reporter's HDD
+with 250,000 objects that was 5 minutes 26 seconds of the container sitting
+unhealthy, and is now under 8 seconds. The server also warns at startup when the
+index is truncated, which happens whenever you hold more objects than
+`memory.max_search_entries` allows, so search results were already incomplete and
+are now saying so.
+
+Two search behaviours changed, both on the dashboard search box and the
+`/api/v1/search` endpoint. Plain terms no longer match an object's ETag, since a
+short hex term matched unrelated objects by coincidence, and ETag lookup moved to
+an `etag:` prefix filter. A bare `type:` or `etag:` with no value now behaves as
+an empty query rather than matching everything.
+
 ## Upgrading to 4.4.73
 
 **Upgrade now if you run a cluster and use SSE-C.** Nothing to change, no

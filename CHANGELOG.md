@@ -4,7 +4,45 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
-## [Unreleased]
+## [4.4.74] - 2026-09-11
+### Fixed
+- **Cold start no longer stalls for minutes on spinning disks.** Building the
+  search index walks the objects bucket in key order, which on an HDD is one
+  random read per B+tree leaf page. A reporter with 250,000 objects sat
+  unhealthy for 5 minutes 26 seconds on every restart, because nothing listens
+  until that finishes. Two changes: the metadata file is now read through
+  sequentially once before the build, so the pages are already in the OS cache,
+  and the build stops once it reaches `memory.max_search_entries` instead of
+  indexing every object and evicting back down to the cap. On the reporter's
+  hardware that is 5m26s down to 4.8s of prewarm plus 2.8s of build. Startup now
+  logs both durations, and **warns when the index is truncated** rather than
+  silently returning incomplete search results. Reported and fixed by
+  [@zhyc9de](https://github.com/zhyc9de) in #57 and #59.
+- **Plain search terms no longer match an object's ETag or date.** Any four hex
+  digits appear in roughly one MD5 in 2,000, so searching for something like
+  `4435` returned dozens of unrelated objects. The searched text is now the
+  bucket, key, content type and tags. ETag lookup moves to an `etag:` prefix
+  filter alongside `tag:` and `type:`, matching on a prefix so a few pasted
+  characters are enough, and `tag:` keys are now case-insensitive like the rest
+  of the query. A bare `type:` or `etag:` with no value is now treated as an
+  empty query rather than matching everything.
+
+### Added
+- **Filter within the current folder on the Files page.** A filter box that
+  searches the direct children of the prefix you are in, so in `a/` the term
+  `aa` finds `a/aa-1` but not `a/bb-1/aa.pdf`. Backed by a new
+  `GET /buckets/{name}/search` which walks the store with the listing cursor
+  rather than the in-memory index, so results are complete regardless of
+  `memory.max_search_entries`, and which is authorised as `s3:ListBucket` on the
+  bucket. Contributed by [@zhyc9de](https://github.com/zhyc9de) in #59.
+
+### Changed
+- The dashboard `<select>` controls now share one chevron aligned to each
+  control's own padding, replacing the native arrow that hugged the right edge.
+  Applies to all seven selects across the top bar, IAM, audit, migration and
+  bucket detail pages. Contributed by [@zhyc9de](https://github.com/zhyc9de)
+  in #58.
+
 ### Security
 - Updated the dashboard test runner `vitest` from 4.1.9 to 4.1.11 for
   GHSA-82fw-gwwq-j7x9 (CVE-2026-84373), clearing Dependabot alerts #24 and #25.
@@ -2563,7 +2601,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.73...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.74...HEAD
+[4.4.74]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.73...v4.4.74
 [4.4.73]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.72...v4.4.73
 [4.4.72]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.71...v4.4.72
 [4.4.71]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.70...v4.4.71
