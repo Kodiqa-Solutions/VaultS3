@@ -10,3 +10,26 @@
 .animate-slide-in {
   animation: slide-in 0.2s ease-out;
 }
+
+/* Unified <select> chevron: replace the native arrow (which hugs the right edge)
+   with a custom one. The image is positioned against the content box, so its gap
+   from the right border equals the select's own padding-right (px-2, px-3, ...)
+   and lines up with the text inset on the left without per-class overrides. */
+@layer base {
+  select {
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%236b7280' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 8l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-origin: content-box;
+    background-position: right center;
+    background-size: 1rem 1rem;
+  }
+  .dark select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%239ca3af' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 8l4 4 4-4'/%3E%3C/svg%3E");
+  }
+  select::-ms-expand {
+    display: none;
+  }
+}
