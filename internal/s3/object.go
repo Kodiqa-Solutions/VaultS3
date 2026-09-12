@@ -76,6 +76,9 @@ type ObjectHandler struct {
 	multipartPeers    func(bucket string) []metadata.MultipartUpload
 	engine            storage.Engine
 	encryptionEnabled bool
+	// perBucketMode is encryption.per_bucket: only then is encryption a
+	// per-bucket question rather than a server-wide one.
+	perBucketMode bool
 	// keyMgr is the per-bucket key manager, non-nil only in per-bucket mode. It
 	// answers whether a given bucket actually opted into encryption.
 	keyMgr *bucketcrypto.Manager
@@ -116,6 +119,21 @@ type ObjectHandler struct {
 	accessUpdater      *metadata.AccessUpdater
 }
 
+// writePutError turns a failed object write into a response. A bucket key that
+// has not reached this node yet is transient, not an internal fault: the entry
+// is moments away and every S3 SDK retries a 503 on its own, so the caller's own
+// retry lands after it arrives. Refusing beats the alternative, which was
+// storing the object in the clear in a bucket that asked for encryption.
+func writePutError(w http.ResponseWriter, err error) {
+	if errors.Is(err, storage.ErrBucketKeyUnavailable) {
+		slog.Warn("refusing a write until this node has the bucket encryption key")
+		writeS3Error(w, "SlowDown", "Bucket encryption key is still replicating, please retry", http.StatusServiceUnavailable)
+		return
+	}
+	slog.Error("internal error", "error", err)
+	writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+}
+
 // sseHeaderApplies reports whether this object really is encrypted at rest, and
 // so whether the response may claim `x-amz-server-side-encryption: AES256`.
 //
@@ -128,8 +146,20 @@ func (h *ObjectHandler) sseHeaderApplies(bucket string) bool {
 	if !h.encryptionEnabled {
 		return false
 	}
+	// Only per-bucket mode makes this a per-bucket question. A server-wide key
+	// and SSE-KMS both encrypt every object, so the answer is simply yes.
+	//
+	// Asking the key manager instead of the mode was wrong: the manager is built
+	// whenever a valid `encryption.key` is set, and SSE-KMS requires one even
+	// though it never uses it. In KMS mode it therefore answered "this bucket has
+	// no per-bucket key", meaning "not encrypted", for objects the KMS engine had
+	// encrypted. That understated the SSE response header and, once the clustered
+	// read used this to decide whether to compare content, made every SSE-KMS
+	// object on a cluster fail that comparison and answer 503.
+	if !h.perBucketMode {
+		return true
+	}
 	if h.keyMgr == nil {
-		// Not per-bucket mode: one server-wide key covers every object.
 		return true
 	}
 	return h.keyMgr.IsEncrypted(bucket)
@@ -186,14 +216,22 @@ const staleVerifyMaxSize = 64 << 20
 // catches that, and hashing every read would undo the streaming work from issue
 // #38, so it is limited to objects that were written moments ago: exactly the
 // window in which replication can still be in flight.
-func (h *ObjectHandler) localCopyNeedsContentCheck(meta *metadata.ObjectMeta, opened int64) bool {
+func (h *ObjectHandler) localCopyNeedsContentCheck(bucket string, meta *metadata.ObjectMeta, opened int64) bool {
 	if h.dataHolderFallback == nil || meta == nil || meta.DeleteMarker {
 		return false
 	}
-	// An SSE-C object's ETag is the MD5 of the stored ciphertext and the reader
-	// by now yields plaintext, so the two can never agree; the size check alone
-	// has to do.
-	if meta.SSECustomerKeyMD5 != "" {
+	// An encrypted object's ETag is the MD5 of the stored CIPHERTEXT while the
+	// reader by now yields plaintext, so the two can never agree and the check
+	// would call every such copy corrupt. The size check alone has to do.
+	//
+	// This was written for SSE-C alone, where the customer key makes it obvious.
+	// Server-side encryption has exactly the same shape and was missed: on a
+	// cluster every read of a per-bucket encrypted object failed its content
+	// check, found no holder that could pass it either, and answered 503
+	// SlowDown. A bucket with encryption switched on was effectively unreadable
+	// for the first minute after each write, which is the whole window this
+	// check covers.
+	if meta.SSECustomerKeyMD5 != "" || h.sseHeaderApplies(bucket) {
 		return false
 	}
 	if opened <= 0 || opened > staleVerifyMaxSize {
@@ -567,8 +605,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 
 		written, etag, err := h.engine.PutObjectVersion(bucket, key, versionID, digests, r.ContentLength)
 		if err != nil {
-			slog.Error("internal error", "error", err)
-			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+			writePutError(w, err)
 			return
 		}
 		sums, ok := h.settleUpload(w, r, bucket, key, versionID, digests)
@@ -650,8 +687,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		// Suspended versioning: overwrite the "null" version
 		written, etag, err := h.engine.PutObjectVersion(bucket, key, "null", digests, r.ContentLength)
 		if err != nil {
-			slog.Error("internal error", "error", err)
-			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+			writePutError(w, err)
 			return
 		}
 		sums, ok := h.settleUpload(w, r, bucket, key, "null", digests)
@@ -744,8 +780,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		written, etag, err = h.engine.PutObject(bucket, key, digests, r.ContentLength)
 	}
 	if err != nil {
-		slog.Error("internal error", "error", err)
-		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		writePutError(w, err)
 		return
 	}
 	sums, ok := h.settleUpload(w, r, bucket, key, "", digests)
@@ -897,7 +932,7 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 				return
 			}
 		}
-		if err == nil && !h.localCopyIsStale(meta, size) && h.localCopyNeedsContentCheck(meta, size) &&
+		if err == nil && !h.localCopyIsStale(meta, size) && h.localCopyNeedsContentCheck(bucket, meta, size) &&
 			!h.localCopyContentMatches(reader, meta) {
 			// Same byte count, different bytes: an overwrite that kept the size
 			// landed on another holder and has not replicated here yet.

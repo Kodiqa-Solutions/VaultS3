@@ -84,6 +84,11 @@ func (k *KEK) unwrap(wrapped []byte) ([]byte, error) {
 // an in-memory implementation.
 type KeyStore interface {
 	Current(bucket string) (version int, wrapped []byte, ok bool)
+	// EncryptionPending reports that the bucket is configured to encrypt but no
+	// usable key is visible here. It separates "this bucket stores plaintext by
+	// choice" from "this node has not caught up yet", which look identical to
+	// Current and must not: the second one silently wrote objects in the clear.
+	EncryptionPending(bucket string) bool
 	Get(bucket string, version int) (wrapped []byte, ok bool)
 	SetCurrent(bucket string, version int, wrapped []byte) error
 	Delete(bucket string) error // shred all versions for a bucket
@@ -116,6 +121,10 @@ func (s *MemKeyStore) Get(bucket string, version int) ([]byte, bool) {
 	w, ok := s.versions[bucket][version]
 	return w, ok
 }
+
+// EncryptionPending is always false here: this store holds keys only, with no
+// bucket configuration that could be ahead of them.
+func (s *MemKeyStore) EncryptionPending(string) bool { return false }
 
 func (s *MemKeyStore) SetCurrent(bucket string, version int, wrapped []byte) error {
 	s.mu.Lock()
@@ -175,6 +184,13 @@ func (m *Manager) cacheEvict(bucket string) {
 }
 
 // IsEncrypted reports whether a bucket has a key (i.e. opted in).
+// EncryptionPending reports that this bucket is meant to be encrypted but the
+// key is not visible on this node yet, so writing here would store plaintext in
+// a bucket that asked for encryption. Callers must fail rather than fall back.
+func (m *Manager) EncryptionPending(bucket string) bool {
+	return m.keys.EncryptionPending(bucket)
+}
+
 func (m *Manager) IsEncrypted(bucket string) bool {
 	_, _, ok := m.keys.Current(bucket)
 	return ok

@@ -4,7 +4,91 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
-## [Unreleased]
+## [4.4.75] - 2026-09-12
+### Fixed
+- **Per-bucket encryption was broken on a cluster: most reads answered 503 and
+  one replica was written in the clear.** Both reproduce on 4.4.74 and both are
+  fixed here. A bucket with `ServerSideEncryption` switched on is worth checking
+  after upgrading, see `docs/UPGRADING.md`.
+
+  An encrypted object stores the MD5 of its **ciphertext** as the ETag, while the
+  read path hands back plaintext. The clustered read compares the two to catch a
+  copy that has not replicated yet, so it condemned every encrypted object as
+  corrupt, asked another holder, was refused there for the same reason, and
+  answered `503 SlowDown`. That check knew about SSE-C, where the customer key
+  makes it obvious, and never about server-side encryption. Measured on a real
+  three-node cluster: 1 of 8 reads succeeded before, 8 of 8 after, and 60 of 60
+  objects now read back byte-identical through every node.
+
+  Separately, a node decides whether to encrypt an object from its own copy of
+  the bucket's config, and enabling encryption writes the config and the key as
+  two Raft entries. A node holding only the first could not tell that state apart
+  from a bucket that had opted out, so it took the plaintext branch: the first
+  object written to a new encrypted bucket kept one replica readable on disk,
+  permanently, in a bucket whose whole purpose is that it is not. Enabling
+  encryption now waits for the cluster to apply the change before reporting
+  success, and a node that still cannot see the key refuses the write with a
+  `503` instead of storing it in the clear, which the client's own retry then
+  satisfies. 2 plaintext replicas per 8 buckets before, 0 in 192 copies across 12
+  buckets after.
+
+### Added
+- **SSE-KMS objects were unreadable on a cluster, and a per-bucket server
+  accepted `aws:kms` and then stored everything in the clear.** Both are fixed
+  and both were present in 4.4.74.
+
+  The server decided whether an object was encrypted by asking the per-bucket key
+  manager, which exists whenever `encryption.key` is set. SSE-KMS requires that
+  key even though it never uses it, so the answer for every KMS bucket was "not
+  encrypted": the response header understated it, and the clustered read used the
+  same answer to decide whether to compare content, so every SSE-KMS object on a
+  cluster failed that comparison and returned 503. The question is now the
+  server's encryption mode rather than the presence of a key manager. Measured on
+  a three-node cluster: reads went from failing on the proxying node to 10 of 10
+  byte-identical through every node.
+
+  Separately, a server running per-bucket encryption accepted a bucket configured
+  with `SSEAlgorithm: aws:kms`, reported it back as KMS encrypted, and encrypted
+  nothing, because only a per-bucket AES256 key encrypts anything in that mode.
+  Every object and every replica in such a bucket was written in the clear. That
+  configuration is now refused with `InvalidArgument` rather than accepted and
+  ignored. Buckets already in that state hold plaintext, see `docs/UPGRADING.md`.
+
+  SSE-KMS also no longer demands a static `encryption.key` it never uses, so the
+  documented KMS configuration starts as written instead of refusing until an
+  operator invents a key. `docs/CONFIGURATION.md` now says plainly that the three
+  encryption modes are server-wide and do not combine.
+
+- **Replica repair: a cluster now restores a bucket's replica count after a node
+  is lost for good.** Copies were placed when an object was written and nothing
+  ever re-made them, so a node that died took its copies with it and every object
+  that had one there stayed a copy short, silently and indefinitely. Rebalance did
+  not close that gap because it answers a different question: it moves an object
+  when the ring says another node owns it, and skips one whose owner never
+  changed no matter how few copies survive. The recovery runbook in
+  `docs/SCALING.md` claimed rebalance restored `replica_count` after a node
+  replacement. It did not, and now something does.
+
+  A background scan reads metadata rather than the local disk, because metadata
+  still lists an object whose bytes this node has lost, which is the case worth
+  repairing and the one a disk walk cannot see. Each object is handled by the node
+  that owns it, so the work is not duplicated across the cluster. Erasure-coded
+  buckets are left to the erasure healer, which rebuilds them from parity.
+
+  An unreachable node is never counted as a node that lost its copy. Only a clean
+  "not found" from a peer is treated as a missing copy: a timeout, a refused
+  connection or an error is an answer the scan declines to draw a conclusion from,
+  so a brief partition cannot start a cluster-wide copy storm at the worst
+  possible moment. An object no node still holds is reported as unrecoverable and
+  nothing is deleted, since metadata still describes it and removing it would turn
+  a recoverable operator problem into real data loss.
+
+  On by default whenever a bucket keeps more than one copy, every
+  `cluster.repair.interval_secs` (600 by default, negative disables it), throttled
+  by `repair.max_bandwidth_mbps`. Run a pass now with `vaults3-cli cluster repair`
+  and see what the last one found with `vaults3-cli cluster repair --status`.
+  Helm exposes `cluster.repairIntervalSecs`.
+
 ### Changed
 - Documented the dashboard search syntax. The `type:`, `tag:` and `etag:` filters
   had never been written down anywhere, so `etag:` in particular was

@@ -3,6 +3,7 @@ package storage
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -141,6 +142,12 @@ func peekPerBucketHeader(r io.ReadSeeker) (bool, error) {
 
 // put writes reader through the bucket's key, streaming when the bucket is
 // encrypted and delegating untouched when it is opted out.
+// ErrBucketKeyUnavailable means the bucket is configured to encrypt but this
+// node cannot see its key yet, so the write must not proceed. It is transient:
+// the key arrives with the next Raft entry, and the S3 layer turns it into a
+// 503 so the client's own retry succeeds.
+var ErrBucketKeyUnavailable = errors.New("bucket encryption key has not reached this node yet")
+
 func (e *PerBucketEngine) put(bucket string, reader io.Reader, size int64,
 	inner func(io.Reader, int64) (int64, string, error),
 ) (int64, string, error) {
@@ -153,6 +160,15 @@ func (e *PerBucketEngine) put(bucket string, reader io.Reader, size int64,
 		return 0, "", fmt.Errorf("bucket key: %w", err)
 	}
 	if !ok {
+		// There is no key. Either the bucket opted out, which means plaintext by
+		// choice, or this node has the bucket's encryption config but not yet its
+		// key and is simply behind. Those two look identical here and must not be
+		// treated the same: taking the plaintext branch in the second case writes
+		// an object in the clear into a bucket that asked for encryption, and
+		// nothing ever goes back to fix it.
+		if m.EncryptionPending(bucket) {
+			return 0, "", ErrBucketKeyUnavailable
+		}
 		// Opted out: stored as plaintext, exactly as before.
 		return inner(reader, size)
 	}

@@ -21,6 +21,7 @@ Subcommands:
   drain [nodeId]               Stop a node accepting writes (defaults to the node served)
   undrain [nodeId]             Resume writes on a node
   rebalance                    Move objects to their correct owner after membership changes
+  repair [--status]            Restore replica counts after a node was lost for good
   decommission <nodeId>        Drain + rebalance a node so it can be safely replaced`)
 		os.Exit(1)
 	}
@@ -48,6 +49,12 @@ Subcommands:
 		clusterDrain(argOrEmpty(args, 1), false)
 	case "rebalance":
 		clusterRebalance()
+	case "repair":
+		if argOrEmpty(args, 1) == "--status" {
+			clusterRepairStatus()
+			return
+		}
+		clusterRepair()
 	case "decommission":
 		if len(args) < 2 {
 			fatal("usage: vaults3-cli cluster decommission <nodeId>")
@@ -74,6 +81,22 @@ func clusterPost(path string, body any) map[string]any {
 		rdr = bytes.NewReader(b)
 	}
 	resp, err := apiRequest("POST", path, rdr)
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fatal(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(raw)))
+	}
+	var out map[string]any
+	json.Unmarshal(raw, &out)
+	return out
+}
+
+// clusterGet reads a cluster admin endpoint that answers with a JSON object.
+func clusterGet(path string) map[string]any {
+	resp, err := apiRequest("GET", path, nil)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -279,6 +302,36 @@ func clusterRebalance() {
 	out := clusterPost("/cluster/rebalance", nil)
 	running := out["running"] == true
 	fmt.Printf("Rebalance triggered (running=%v). Objects are moving to their correct owner in the background.\n", running)
+}
+
+func clusterRepair() {
+	clusterPost("/cluster/repair", nil)
+	fmt.Println("Replica repair triggered. Objects holding fewer copies than their bucket asks")
+	fmt.Println("for are being topped up in the background, on the node that owns each one.")
+	fmt.Println("Run `vaults3-cli cluster repair --status` to see what the last scan found.")
+}
+
+func clusterRepairStatus() {
+	out := clusterGet("/cluster/repair")
+	num := func(k string) int64 {
+		if f, ok := out[k].(float64); ok {
+			return int64(f)
+		}
+		return 0
+	}
+	lastRun, ok := out["lastRun"].(string)
+	if !ok || lastRun == "" {
+		lastRun = "never (no scan has finished on this node yet)"
+	}
+	fmt.Printf("Last scan:     %s\n", lastRun)
+	fmt.Printf("Scanned:       %d objects owned by this node\n", num("scanned"))
+	fmt.Printf("Repaired:      %d (%d bytes copied)\n", num("repaired"), num("bytesCopied"))
+	fmt.Printf("Undecidable:   %d (a holder could not be reached, so nothing was concluded)\n", num("undecidable"))
+	fmt.Printf("Unrecoverable: %d (no node still has the data)\n", num("unrecoverable"))
+	if num("unrecoverable") > 0 {
+		fmt.Println("\nUnrecoverable objects are still listed in metadata and nothing was deleted.")
+		fmt.Println("Check the server log for the affected keys.")
+	}
 }
 
 func clusterDecommission(nodeID string) {

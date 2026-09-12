@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"sync/atomic"
+	"time"
 )
 
 // ClusterController is the subset of cluster.Node the admin API needs for
@@ -328,6 +331,165 @@ func (h *APIHandler) ClusterObjectDeleteBatchHandler(secret string) http.Handler
 // (no metadata write — that arrives via Raft — and no re-fan-out). The primary
 // broadcasts here to keep replica copies so a node loss doesn't make an object
 // unavailable (issue #37, replica_count > 1). Cluster-secret authed.
+// ClusterReplicaPullHandler makes this node fetch a missing copy of an object
+// from another cluster member.
+//
+// The source arrives as a node ID and is resolved against this node's own
+// membership, never used as a URL. A repairing peer therefore cannot aim this
+// node at an arbitrary host, which a caller-supplied address would allow.
+func (h *APIHandler) ClusterReplicaPullHandler(secret string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !clusterAuthOK(r, secret) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		bucket := r.URL.Query().Get("bucket")
+		key := r.URL.Query().Get("key")
+		from := r.URL.Query().Get("from")
+		if bucket == "" || key == "" || from == "" || h.engine == nil || h.peerAddr == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		addr := h.peerAddr(from)
+		if addr == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		u := h.peerScheme + "://" + addr + "/cluster/replica-get?bucket=" +
+			url.QueryEscape(bucket) + "&key=" + url.QueryEscape(key)
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if secret != "" {
+			req.Header.Set("X-Cluster-Secret", secret)
+		}
+		resp, err := replicaPullClient.Do(req)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if !h.bucketCryptoReady(bucket, resp.Header.Get(BucketEncryptedHeader) == "1") {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		if _, _, err := h.engine.PutObject(bucket, key, resp.Body, resp.ContentLength); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+var replicaPullClient = &http.Client{Timeout: 5 * time.Minute}
+
+// SetPeerResolver wires cluster membership so replica pull can turn a node ID
+// into an address without trusting one from the caller.
+func (h *APIHandler) SetPeerResolver(scheme string, fn func(nodeID string) string) {
+	h.peerScheme = scheme
+	h.peerAddr = fn
+}
+
+// BucketEncryptedHeader carries the SENDING node's view of whether a bucket is
+// encrypted at rest, so the receiving node can store its copy the same way.
+//
+// A node decides how to store an object by reading the bucket's encryption
+// config out of its own metadata, and on a cluster that config arrives by Raft.
+// A node that has not applied it yet answers "not encrypted" and writes the copy
+// in the clear: the bucket's first write is the one that races, and one replica
+// of it stays readable on disk forever in a bucket whose whole point is that it
+// is not. The sender has just written the object and knows the answer, so it
+// says so, and the receiver catches up before deciding rather than guessing.
+const BucketEncryptedHeader = "X-Vaults3-Bucket-Encrypted"
+
+// SetBucketCryptoGuard wires the bucket encryption lookup and the metadata read
+// barrier that replica writes use to avoid storing a copy in the clear.
+func (h *APIHandler) SetBucketCryptoGuard(isEncrypted func(bucket string) bool, barrier func() error) {
+	h.bucketEncrypted = isEncrypted
+	h.metaBarrier = barrier
+}
+
+// bucketCryptoReady reports whether this node can store a copy of an object the
+// same way the sender stored it. When the sender says the bucket is encrypted
+// and this node does not know that yet, it waits for its metadata to catch up
+// and asks again. Saying no is safe: the copy is simply not written, and replica
+// repair places it later, by which time the config has certainly arrived.
+func (h *APIHandler) bucketCryptoReady(bucket string, senderEncrypted bool) bool {
+	if !senderEncrypted || h.bucketEncrypted == nil {
+		return true
+	}
+	if h.bucketEncrypted(bucket) {
+		return true
+	}
+	if h.metaBarrier != nil {
+		_ = h.metaBarrier()
+	}
+	return h.bucketEncrypted(bucket)
+}
+
+// ClusterReplicaGetHandler answers a peer asking about one object's local copy.
+// HEAD reports whether this node holds it and how big it is, GET streams it.
+//
+// Replica repair needs both halves: it probes every node that should hold an
+// object, and when the node that found the gap has no copy of its own it pulls
+// one from a node that does. The 404 matters as much as the 200. A repairer
+// treats "not found" as a missing copy and nothing else as an answer at all,
+// so an unreachable peer is never mistaken for one that lost its data.
+func (h *APIHandler) ClusterReplicaGetHandler(secret string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !clusterAuthOK(r, secret) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodHead && r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		bucket := r.URL.Query().Get("bucket")
+		key := r.URL.Query().Get("key")
+		if bucket == "" || key == "" || h.engine == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !h.engine.ObjectExists(bucket, key) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if h.bucketEncrypted != nil && h.bucketEncrypted(bucket) {
+			w.Header().Set(BucketEncryptedHeader, "1")
+		}
+		if r.Method == http.MethodHead {
+			size, err := h.engine.ObjectSize(bucket, key)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		reader, size, err := h.engine.GetObject(bucket, key)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		defer reader.Close()
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, reader)
+	}
+}
+
 func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !clusterAuthOK(r, secret) {
@@ -338,6 +500,12 @@ func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 		key := r.URL.Query().Get("key")
 		if bucket == "" || key == "" || h.engine == nil {
 			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !h.bucketCryptoReady(bucket, r.Header.Get(BucketEncryptedHeader) == "1") {
+			// Writing now would store this copy in the clear. Refuse instead, and
+			// let replica repair place it once the config has arrived.
+			w.WriteHeader(http.StatusConflict)
 			return
 		}
 		if _, _, err := h.engine.PutObject(bucket, key, r.Body, r.ContentLength); err != nil {
@@ -362,6 +530,33 @@ func (h *APIHandler) handleClusterRebalance(w http.ResponseWriter, _ *http.Reque
 		running = h.rebalanceRunning()
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "triggered", "running": running})
+}
+
+// SetReplicaRepair wires the replica repair trigger and its status reader.
+func (h *APIHandler) SetReplicaRepair(trigger func(), status func() any) {
+	h.triggerRepair = trigger
+	h.repairStatus = status
+}
+
+// handleClusterRepair handles POST /api/v1/cluster/repair: run a replica repair
+// pass now rather than waiting for the next scheduled scan.
+func (h *APIHandler) handleClusterRepair(w http.ResponseWriter, _ *http.Request) {
+	if h.triggerRepair == nil {
+		writeError(w, http.StatusBadRequest, "replica repair is unavailable (node not clustered)")
+		return
+	}
+	h.triggerRepair()
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "triggered"})
+}
+
+// handleClusterRepairStatus handles GET /api/v1/cluster/repair: report what the
+// last completed scan found.
+func (h *APIHandler) handleClusterRepairStatus(w http.ResponseWriter, _ *http.Request) {
+	if h.repairStatus == nil {
+		writeError(w, http.StatusBadRequest, "replica repair is unavailable (node not clustered)")
+		return
+	}
+	writeJSON(w, http.StatusOK, h.repairStatus())
 }
 
 // clusterAuthOK authorizes an inter-node request, and fails CLOSED.

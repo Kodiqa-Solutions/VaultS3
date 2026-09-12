@@ -133,6 +133,12 @@ cluster:
   #     be created, so replicaCount must be >= metadataReplicas.
   metadataShards: 1
   metadataReplicas: 3
+  # Replica repair restores a bucket's replica count after a pod is lost for
+  # good. Copies are placed when an object is written and nothing re-made them
+  # before this existed, so a pod that never came back left every object that
+  # had a copy on it one copy short. Only does anything when a bucket keeps more
+  # than one copy. 0 takes the server default (600s), negative disables the scan.
+  repairIntervalSecs: 0
 
 ingress:
   enabled: false

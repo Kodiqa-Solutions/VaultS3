@@ -370,6 +370,22 @@ cluster:
   rebalance:
     max_bandwidth_mbps: 50
     batch_size: 100
+  # Replica repair restores a bucket's replica count after a node is lost for
+  # good. Copies are placed when an object is written, and until this existed
+  # nothing re-made them: a node that died took its copies with it and every
+  # object that had one there stayed a copy short, silently. Rebalance does not
+  # cover this, it moves an object when the ring says a new node owns it and
+  # skips one whose owner never changed however few copies survive.
+  #
+  # Only does anything when a bucket keeps more than one copy. Erasure-coded
+  # buckets are repaired from parity by erasure.heal_interval_secs instead.
+  #
+  # A node that cannot be reached is never counted as a node that lost its copy,
+  # so a brief partition does not start a cluster-wide copy storm.
+  repair:
+    interval_secs: 600         # gap between scans, 0 takes this default, negative disables the scan
+    max_bandwidth_mbps: 50     # repair runs right after a node loss, when the network can least spare it
+    batch_size: 100
 
 # S3 Inventory reports (optional)
 # inventory:

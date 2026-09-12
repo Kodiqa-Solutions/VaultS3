@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/bucketcrypto"
 	"io"
 	"net/http"
 	"testing"
@@ -102,26 +103,72 @@ func TestLocalCopyNeedsContentCheckOnlyForRecentSmallObjects(t *testing.T) {
 	now := time.Now().Unix()
 	recent := &metadata.ObjectMeta{Size: 10, ETag: `"d41d8cd98f00b204e9800998ecf8427e"`, LastModified: now}
 
-	if !h.localCopyNeedsContentCheck(recent, 10) {
+	if !h.localCopyNeedsContentCheck("b", recent, 10) {
 		t.Fatal("an object written moments ago is exactly the one that can still be replicating")
 	}
 	old := *recent
 	old.LastModified = now - int64(staleVerifyWindow.Seconds()) - 60
-	if h.localCopyNeedsContentCheck(&old, 10) {
+	if h.localCopyNeedsContentCheck("b", &old, 10) {
 		t.Fatal("replication has long settled, verifying every read would cost the hash for nothing")
 	}
 	big := *recent
-	if h.localCopyNeedsContentCheck(&big, staleVerifyMaxSize+1) {
+	if h.localCopyNeedsContentCheck("b", &big, staleVerifyMaxSize+1) {
 		t.Fatal("hashing an object this large on read is worse than the problem it solves")
 	}
 	multipart := *recent
 	multipart.ETag = `"d41d8cd98f00b204e9800998ecf8427e-4"`
-	if h.localCopyNeedsContentCheck(&multipart, 10) {
+	if h.localCopyNeedsContentCheck("b", &multipart, 10) {
 		t.Fatal("a multipart ETag is not the MD5 of the object, so it cannot be recomputed here")
 	}
 	single := &ObjectHandler{}
-	if single.localCopyNeedsContentCheck(recent, 10) {
+	if single.localCopyNeedsContentCheck("b", recent, 10) {
 		t.Fatal("a single-node server has no peer to fall back to")
+	}
+}
+
+// An object encrypted at rest stores the MD5 of its CIPHERTEXT as the ETag while
+// the read path hands back plaintext, so the content check can never pass and
+// would condemn a perfectly good copy. On a cluster that answered 503 SlowDown
+// for every read of a per-bucket encrypted object inside the replication window,
+// on every holder, so the bucket simply did not work.
+func TestLocalCopyNeedsContentCheckSkipsEncryptedObjects(t *testing.T) {
+	now := time.Now().Unix()
+	recent := &metadata.ObjectMeta{Size: 10, ETag: `"d41d8cd98f00b204e9800998ecf8427e"`, LastModified: now}
+	fallback := func(http.ResponseWriter, *http.Request, string, string) (bool, bool) { return false, false }
+
+	// SSE-C: the customer key makes it obvious, and this case was already handled.
+	ssec := *recent
+	ssec.SSECustomerKeyMD5 = "abc"
+	h := &ObjectHandler{dataHolderFallback: fallback}
+	if h.localCopyNeedsContentCheck("b", &ssec, 10) {
+		t.Fatal("an SSE-C ETag is the ciphertext MD5, the check can never pass")
+	}
+
+	// Server-side encryption has the same shape and was the one that was missed.
+	enc := &ObjectHandler{dataHolderFallback: fallback, encryptionEnabled: true}
+	if enc.localCopyNeedsContentCheck("b", recent, 10) {
+		t.Fatal("a server-side encrypted object's ETag is the ciphertext MD5 too")
+	}
+
+	// SSE-KMS encrypts every object without any per-bucket key, and it requires
+	// an `encryption.key` it never uses, which builds a key manager. Asking that
+	// manager whether the bucket is encrypted answers no for every KMS bucket, so
+	// the check ran and every SSE-KMS object on a cluster failed it.
+	kms := &ObjectHandler{
+		dataHolderFallback: fallback,
+		encryptionEnabled:  true,
+		perBucketMode:      false,
+		keyMgr:             kmsLikeManager(t),
+	}
+	if kms.localCopyNeedsContentCheck("b", recent, 10) {
+		t.Fatal("SSE-KMS encrypts every object, its ETag is the ciphertext MD5 too")
+	}
+
+	// With encryption off the check must still run: it is what catches a
+	// same-size overwrite that has not replicated yet.
+	plain := &ObjectHandler{dataHolderFallback: fallback}
+	if !plain.localCopyNeedsContentCheck("b", recent, 10) {
+		t.Fatal("an unencrypted object must still be verified by content")
 	}
 }
 
@@ -163,3 +210,18 @@ type seekReader struct{ *bytes.Reader }
 func (seekReader) Close() error { return nil }
 
 func newSeekReader(b []byte) seekReader { return seekReader{bytes.NewReader(b)} }
+
+// kmsLikeManager builds the key manager a server has in SSE-KMS mode: present,
+// because a static key is configured, but holding no per-bucket keys.
+func kmsLikeManager(t *testing.T) *bucketcrypto.Manager {
+	t.Helper()
+	mk := make([]byte, 32)
+	for i := range mk {
+		mk[i] = byte(i)
+	}
+	kek, err := bucketcrypto.NewKEK(mk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bucketcrypto.NewManager(kek, bucketcrypto.NewMemKeyStore())
+}

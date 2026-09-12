@@ -59,6 +59,95 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 4.4.75
+
+**Take this one if you run a cluster, especially with per-bucket encryption.** No
+configuration or on-disk format changes, and single-node installs are unaffected.
+
+### Per-bucket encryption on a cluster
+
+Two bugs, both present in 4.4.74 and earlier, both fixed here.
+
+**Reads mostly failed.** A clustered read of an encrypted object answered `503
+SlowDown` on every holder, so a bucket with encryption enabled was effectively
+unreadable. Nothing was lost and no data needs repairing, the objects were always
+intact and are readable again as soon as you upgrade.
+
+**One replica of each bucket's first object was written unencrypted.** This one
+leaves something behind, because the object on disk stays as it was written. It
+affects the first object written to a bucket after encryption was enabled, and
+only one of its copies. To find them, search the data directory of each node for
+a known plaintext string, or simply rewrite the affected objects:
+
+```bash
+# rewrite an object in place so every copy is stored encrypted
+aws s3 cp s3://<bucket>/<key> s3://<bucket>/<key> --metadata-directive REPLACE
+```
+
+If a bucket holds anything you would rather not have had readable on a disk,
+rewrite the affected objects as above. Rotating the bucket key does not help on
+its own: a copy that was written in the clear was never sealed with that key, so
+rotation leaves it exactly as readable as it was. Rewriting is what fixes it.
+
+### SSE-KMS
+
+Two more encryption problems are fixed in this release.
+
+**SSE-KMS objects returned 503 on a cluster**, for the same reason encrypted
+reads did above. Nothing was lost, and they read correctly once you upgrade.
+
+**A server running per-bucket encryption accepted `SSEAlgorithm: aws:kms` and
+encrypted nothing.** Only a per-bucket AES256 key encrypts anything in that mode,
+so such a bucket reported itself as KMS encrypted while every object and every
+replica sat on disk in the clear. That configuration is now refused outright.
+
+If you have a bucket in that state, everything in it is plaintext, not just the
+first object. Check with:
+
+```sh
+aws s3api get-bucket-encryption --bucket <bucket>
+```
+
+If it reports `aws:kms` on a server running `encryption.per_bucket: true`, that
+bucket was never encrypted. Decide whether you want it encrypted, and if so
+re-create it with `AES256` and copy the objects across, then treat the originals
+as exposed. To use real SSE-KMS instead, set `encryption.kms` in the server
+config, which is a server-wide mode and not a per-bucket one.
+
+**Two behaviour changes come with the fix.** Enabling encryption on a bucket now
+waits for the rest of the cluster to apply the change before returning, which
+adds roughly 100 ms to that one call. And a node that does not yet hold a
+bucket's encryption key now answers a write with `503 SlowDown` rather than
+storing the object unencrypted. Every S3 SDK retries that on its own, and the
+retry lands once the key arrives.
+
+Clusters now repair replica counts on their own. Copies were only ever placed
+when an object was written, so a node lost for good left every object that had a
+copy on it one copy short, quietly, with nothing to put it back. Rebalance did
+not cover this, it moves objects whose owner changed rather than objects that are
+short of copies, and the lost-server runbook in `docs/SCALING.md` used to say
+otherwise.
+
+**If you have replaced or lost a cluster node on an earlier version, run one pass
+after upgrading** and let it settle, because the copies missing from that event
+are still missing:
+
+```bash
+vaults3-cli cluster repair
+vaults3-cli cluster repair --status    # repeat until `repaired` stays at 0
+```
+
+`--status` reports `undecidable` when a holder could not be reached, which means
+nothing was concluded and nothing was copied. That is expected while a node is
+down and should fall to 0 once the cluster is whole. It reports `unrecoverable`
+when no node still has the data, and names those keys in the server log. Nothing
+is ever deleted in either case.
+
+The scan runs every `cluster.repair.interval_secs` (600 by default), throttled by
+`cluster.repair.max_bandwidth_mbps` (50). Set the interval negative to turn it
+off. Erasure-coded buckets are untouched by it, they are still repaired from
+parity by `erasure.heal_interval_secs`.
+
 ## Upgrading to 4.4.74
 
 **Worth taking if you run on spinning disks or have a large object count.**

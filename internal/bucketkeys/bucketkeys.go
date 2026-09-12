@@ -30,6 +30,20 @@ func (s storeKeyStore) Current(bucket string) (int, []byte, bool) {
 	return cfg.KeyVersion, cfg.WrappedDEKs[cfg.KeyVersion], true
 }
 
+// EncryptionPending reports a bucket whose config asks for encryption while no
+// key version has reached this node. Enabling encryption writes the algorithm
+// and the key as two separate Raft entries, so a node can hold the first without
+// the second, and until this existed that state was indistinguishable from a
+// bucket that had opted out: the write path took the plaintext branch and the
+// object stayed readable on disk in a bucket that had just been told to encrypt.
+func (s storeKeyStore) EncryptionPending(bucket string) bool {
+	cfg := s.load(bucket)
+	// Only the per-bucket AES256 path provisions a key here. SSE-KMS keeps its
+	// key in the KMS and never sets a version, so treating it as pending would
+	// refuse every write to a KMS bucket for as long as it existed.
+	return cfg.SSEAlgorithm == "AES256" && cfg.KeyVersion == 0
+}
+
 func (s storeKeyStore) Get(bucket string, version int) ([]byte, bool) {
 	cfg := s.load(bucket)
 	w, ok := cfg.WrappedDEKs[version]

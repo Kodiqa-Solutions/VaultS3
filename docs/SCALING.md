@@ -148,6 +148,10 @@ cluster:
   rebalance:
     max_bandwidth_mbps: 50       # throttle data movement on membership change
     batch_size: 100
+  repair:
+    interval_secs: 600           # restore replica counts after a node is lost for good
+    max_bandwidth_mbps: 50
+    batch_size: 100
 ```
 
 **Node 2 / Node 3 (joiners):**
@@ -455,8 +459,10 @@ that disk are *degraded* but still readable (as long as failures ≤ `parity_sha
 
 **Case A, node comes back (transient outage):**
 1. Restart the VaultS3 process on the node with its **original `node_id`** and config
-   (`bootstrap: false`). It rejoins, catches up via Raft, and the rebalancer re-syncs any
-   data it missed (throttled by `rebalance.max_bandwidth_mbps`).
+   (`bootstrap: false`). It rejoins and catches up via Raft. Object copies it is missing are
+   restored by **replica repair** on its next scan (`cluster.repair.interval_secs`, default
+   600), throttled by `repair.max_bandwidth_mbps`. Run `vaults3-cli cluster repair` to start
+   a pass immediately, and `vaults3-cli cluster repair --status` to watch it.
 2. Verify with `GET /cluster/status`, the node returns to `Voter`/healthy.
 
 **Case B, node is permanently dead (replacement):**
@@ -471,8 +477,25 @@ that disk are *degraded* but still readable (as long as failures ≤ `parity_sha
    curl -X POST http://<leader>:9000/cluster/join \
      -d '{"node_id":"node-3b","addr":"<new-host>:9001"}'
    ```
-4. The rebalancer redistributes the lost node's share of objects onto the new member to
-   restore `replica_count`. Watch `/metrics` and `/cluster/status` until balanced.
+4. **Rebalance** moves objects whose owner changed onto the new member, and **replica repair**
+   restores the copies that died with the old node:
+   ```bash
+   vaults3-cli cluster rebalance
+   vaults3-cli cluster repair
+   vaults3-cli cluster repair --status   # repeat until repaired settles at 0
+   ```
+   The two do different jobs and you want both. Rebalance asks who should own an object and
+   moves it there. Repair asks how many copies an object actually has and makes another when
+   it is short, which is the only one that answers a node dying.
+
+   > Before 4.4.75 nothing performed that second job, so a permanently lost node left every
+   > object that had a copy on it one copy short indefinitely. If you have replaced a node on
+   > an earlier version, run a repair pass after upgrading.
+
+   `repair --status` reports three outcomes. `repaired` is copies re-made. `undecidable` means
+   a holder could not be reached, so nothing was concluded and nothing was copied: expected
+   while a node is down, and it should fall to 0 once the cluster is whole. `unrecoverable`
+   means no node still has the data, and those keys are named in the server log.
 
 **Case C, quorum lost (majority of nodes down at once):**
 - Writes are rejected and no leader can be elected until a majority is restored. **Recover/restart

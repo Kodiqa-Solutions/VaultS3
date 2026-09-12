@@ -116,9 +116,9 @@ Windows, an SPDX SBOM per platform, and a Sigstore provenance bundle you can
 verify offline:
 
 ```bash
-sudo apt install ./vaults3_4.4.74_amd64.deb
+sudo apt install ./vaults3_4.4.75_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_4.4.74_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_4.4.75_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart or a single
@@ -136,7 +136,7 @@ The short version. Each row links to the guide that covers it, and the
 | **Web dashboard** | File browser, drag-and-drop upload, stats, IAM, audit, search, backups, in English, German, French and Chinese. [Guide](docs/DASHBOARD.md) |
 | **Access control** | IAM users, groups and policies, OIDC/JWT SSO, STS, external authorization webhook, per-bucket CORS, IP allowlists, audit trail. [Guide](docs/ACCESS-CONTROL.md) |
 | **Encryption** | AES-256-GCM at rest, SSE-S3, SSE-KMS, SSE-C, and per-bucket keys with rotation and crypto-shredding. [Guide](docs/CONFIGURATION.md#encryption-at-rest) |
-| **Durability** | Reed-Solomon erasure coding with a background healer, per-bucket replica counts, orphan reclaim. [Guide](docs/SCALING.md) |
+| **Durability** | Reed-Solomon erasure coding with a background healer, per-bucket replica counts with automatic repair after a node is lost, orphan reclaim. [Guide](docs/SCALING.md) |
 | **Clustering** | Raft-replicated metadata, consistent-hash placement, failover routing, optional metadata sharding. [Guide](docs/SCALING.md) |
 | **Replication** | One-way async and bidirectional active-active with vector-clock conflict resolution. [Guide](docs/INTEGRATIONS.md#async-replication) |
 | **Data management** | Versioning with diff and rollback, object lock, lifecycle, compression, tiering, scheduled backups. [Guide](docs/DATA-MANAGEMENT.md) |

@@ -150,6 +150,23 @@ func (h *Handler) SetPlacementReplicator(fn func(bucket, key string)) {
 }
 
 // SetKeyManager wires the per-bucket encryption key manager (may be nil).
+// SetClusterConverge wires a wait that blocks until the rest of the cluster has
+// applied everything this node has. Enabling bucket encryption uses it: a node
+// that has not applied that config yet stores the bucket's objects in the clear,
+// so the change waits for the cluster rather than leaving every later write to
+// defend against a stale view. The wait returns the peers that did not confirm.
+func (h *Handler) SetClusterConverge(fn func() []string) {
+	h.buckets.clusterConverge = fn
+}
+
+// SetPerBucketMode records that encryption is configured per bucket rather than
+// server-wide, which is the only mode in which a bucket can be unencrypted while
+// the server has encryption on.
+func (h *Handler) SetPerBucketMode(on bool) {
+	h.objects.perBucketMode = on
+	h.buckets.perBucketMode = on
+}
+
 func (h *Handler) SetKeyManager(m *bucketcrypto.Manager) {
 	h.buckets.keyMgr = m
 	// The object handler needs it too, to answer whether a bucket really is

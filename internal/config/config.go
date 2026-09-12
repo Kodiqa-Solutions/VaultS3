@@ -100,6 +100,7 @@ type ClusterConfig struct {
 	Placement        PlacementConfig `yaml:"placement"`
 	Detector         DetectorConfig  `yaml:"detector"`
 	Rebalance        RebalanceConfig `yaml:"rebalance"`
+	Repair           RepairConfig    `yaml:"repair"`
 }
 
 type PlacementConfig struct {
@@ -117,6 +118,21 @@ type DetectorConfig struct {
 }
 
 type RebalanceConfig struct {
+	MaxBandwidthMBps int `yaml:"max_bandwidth_mbps"`
+	BatchSize        int `yaml:"batch_size"`
+}
+
+// RepairConfig controls replica repair: the background scan that restores a
+// bucket's replica count after a node is lost for good. Rebalance moves an
+// object when the ring says a different node now owns it, which is a different
+// job: it never notices that an object simply has fewer copies than it should.
+//
+// Only meaningful when a bucket keeps more than one copy. Erasure-coded buckets
+// are repaired by the erasure healer instead, so this scan skips them.
+type RepairConfig struct {
+	// IntervalSecs is the gap between scans. 0 takes the default, negative
+	// disables the scan entirely (matching erasure's heal_interval_secs).
+	IntervalSecs     int `yaml:"interval_secs"`
 	MaxBandwidthMBps int `yaml:"max_bandwidth_mbps"`
 	BatchSize        int `yaml:"batch_size"`
 }
@@ -578,8 +594,11 @@ func parse(data []byte) (*Config, error) {
 	// and "a, b" — normalise the startup bucket list from whichever source it came.
 	cfg.Storage.DefaultBuckets = splitList(strings.Join(cfg.Storage.DefaultBuckets, ","))
 
-	// Validate encryption config
-	if cfg.Encryption.Enabled {
+	// Validate encryption config. SSE-KMS gets its keys from the KMS, so it needs
+	// no static key: requiring one anyway meant the documented KMS example refused
+	// to start until an operator invented a 64-character key the server then never
+	// used.
+	if cfg.Encryption.Enabled && !cfg.Encryption.KMS.Enabled {
 		if _, err := cfg.Encryption.KeyBytes(); err != nil {
 			return nil, fmt.Errorf("invalid encryption config: %w", err)
 		}
@@ -690,6 +709,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("VAULTS3_CLUSTER_METADATA_REPLICAS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Cluster.MetadataReplicas = n
+		}
+	}
+	if v := os.Getenv("VAULTS3_CLUSTER_REPAIR_INTERVAL_SECS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Cluster.Repair.IntervalSecs = n
 		}
 	}
 	// Per-pod cluster wiring (the Helm StatefulSet derives these from the pod

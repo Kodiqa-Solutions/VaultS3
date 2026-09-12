@@ -55,6 +55,8 @@ vaults3-cli cluster status                     # members, leader, drain state
 vaults3-cli cluster join node-3 10.0.0.4:7000  # add a member (against the leader)
 vaults3-cli cluster drain node-2               # stop a node accepting writes (reads continue)
 vaults3-cli cluster rebalance                  # move objects to their correct owner
+vaults3-cli cluster repair                     # restore replica counts after a node was lost
+vaults3-cli cluster repair --status            # what the last repair scan found
 vaults3-cli cluster decommission node-2        # guided drain + rebalance before replacing a node
 vaults3-cli cluster shards                     # how object metadata is distributed across the cluster
 ```

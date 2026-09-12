@@ -176,6 +176,7 @@ type Server struct {
 	failoverProxy        *cluster.FailoverProxy
 	failureDetector      *cluster.FailureDetector
 	rebalancer           *cluster.Rebalancer
+	replicaRepairer      *cluster.ReplicaRepairer
 	ecHealer             *erasure.Healer
 	s3Auth               *s3.Authenticator
 	writable             *atomic.Bool // node-local write gate shared by the S3 + admin handlers (drain)
@@ -496,7 +497,14 @@ func New(cfg *config.Config) (*Server, error) {
 	// Initialize failure detector and failover proxy if cluster is enabled
 	var failureDetector *cluster.FailureDetector
 	var failoverProxy *cluster.FailoverProxy
+	// Resolved lazily: the replication closures below are built before the key
+	// manager exists, but only ever run after it does.
+	var bucketIsEncrypted func(bucket string) bool
+	encryptedNow := func(bucket string) bool {
+		return bucketIsEncrypted != nil && bucketIsEncrypted(bucket)
+	}
 	var rebalancer *cluster.Rebalancer
+	var replicaRepairer *cluster.ReplicaRepairer
 	if clusterNode != nil && clusterProxy != nil {
 		// Failure detector
 		failureDetector = cluster.NewFailureDetector(cfg.Cluster.NodeID, cfg.Cluster.Detector)
@@ -509,6 +517,22 @@ func New(cfg *config.Config) (*Server, error) {
 
 		// Wire callbacks: node down/recover → failover + rebalance
 		rebalancer = cluster.NewRebalancer(metaStore, engine, clusterProxy.Ring(), clusterProxy, cfg.Cluster.NodeID, cfg.Cluster.Rebalance)
+
+		// Restores a bucket's replica count after a node is lost. Rebalance only
+		// moves objects whose owner changed, so without this an object that
+		// simply lost a copy stayed short of its replica count forever.
+		repairScheme := "http"
+		if cfg.Server.TLS.Enabled {
+			repairScheme = "https"
+		}
+		replicaRepairer = cluster.NewReplicaRepairer(
+			metaStore, engine, clusterProxy.Ring(), clusterProxy,
+			cfg.Cluster.NodeID, cfg.Cluster.Secret, repairScheme, cfg.Cluster.Repair,
+		)
+		replicaRepairer.SetRebalanceGuard(rebalancer.IsRunning)
+		replicaRepairer.SetBucketEncrypted(encryptedNow)
+		replicaRepairer.SetShardedMetadata(cfg.Cluster.MetadataShards > 1)
+
 		failureDetector.SetCallbacks(
 			func(nodeID string) {
 				failoverProxy.OnNodeDown(nodeID)
@@ -517,6 +541,9 @@ func New(cfg *config.Config) (*Server, error) {
 			func(nodeID string) {
 				failoverProxy.OnNodeRecover(nodeID)
 				rebalancer.Trigger()
+				// A node that just came back is the likeliest place for a copy
+				// to be missing, so top up rather than wait for the next tick.
+				replicaRepairer.Trigger()
 			},
 		)
 	}
@@ -591,6 +618,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// Initialize S3 handler
 	s3h := s3.NewHandler(metaStore, engine, auth, cfg.Encryption.Enabled, cfg.Server.Domain, mc)
+	s3h.SetPerBucketMode(cfg.Encryption.PerBucket)
 
 	// Node write gate (drain): shared by the S3 handler (rejects object writes when
 	// draining) and the admin API (toggles it). Starts writable.
@@ -700,6 +728,12 @@ func New(cfg *config.Config) (*Server, error) {
 		if failoverProxy != nil {
 			failoverProxy.SetReplicaPolicy(replicasFor)
 		}
+		if replicaRepairer != nil {
+			replicaRepairer.SetReplicaPolicy(replicasFor)
+			replicaRepairer.SetErasurePolicy(func(bucket string) bool {
+				return metaStore.BucketDurability(bucket, cfg.Erasure.Enabled, defaultReplicas).ErasureEnabled
+			})
+		}
 
 		// After a write, stream the object's data to the other nodes in its replica
 		// set so a node loss doesn't make it unavailable (issue #37). Best-effort +
@@ -741,6 +775,12 @@ func New(cfg *config.Config) (*Server, error) {
 						if repSecret != "" {
 							req.Header.Set("X-Cluster-Secret", repSecret)
 						}
+						// Say whether this bucket is encrypted, so a node that has
+						// not applied that config yet does not store the copy in
+						// the clear.
+						if encryptedNow(bucket) {
+							req.Header.Set(api.BucketEncryptedHeader, "1")
+						}
 						if resp, err := replClient.Do(req); err == nil {
 							resp.Body.Close()
 						}
@@ -757,6 +797,7 @@ func New(cfg *config.Config) (*Server, error) {
 	if mk, err := cfg.Encryption.KeyBytes(); err == nil && len(mk) == 32 {
 		if km, kerr := bucketkeys.NewManager(metaStore, mk); kerr == nil {
 			keyMgr = km
+			bucketIsEncrypted = keyMgr.IsEncrypted
 			s3h.SetKeyManager(keyMgr)
 			if perBucketEngine != nil {
 				perBucketEngine.SetManager(keyMgr) // activate per-bucket crypto in the data path
@@ -1095,6 +1136,7 @@ func New(cfg *config.Config) (*Server, error) {
 		failoverProxy:        failoverProxy,
 		failureDetector:      failureDetector,
 		rebalancer:           rebalancer,
+		replicaRepairer:      replicaRepairer,
 		writable:             writable,
 		ecHealer:             ecHealer,
 		s3Auth:               auth,
@@ -1192,6 +1234,47 @@ func (s *Server) Run() error {
 	}
 	if s.tieringMgr != nil {
 		apiHandler.SetTieringManager(s.tieringMgr)
+	}
+	if s.clusterProxy != nil {
+		scheme := "http"
+		if s.cfg.Server.TLS.Enabled {
+			scheme = "https"
+		}
+		// Resolve a peer ID against our own membership so replica pull never
+		// takes an address from the caller.
+		apiHandler.SetPeerResolver(scheme, func(nodeID string) string {
+			return s.clusterProxy.NodeAddrs()[nodeID]
+		})
+		// A replica must be stored the way its source stored it. This node's own
+		// view of a bucket's encryption config arrives by Raft and can still be
+		// behind, so the write paths consult it and, when the sender disagrees,
+		// wait for it to catch up rather than storing the copy in the clear.
+		if s.clusterNode != nil {
+			node := s.clusterNode
+			s.s3h.SetClusterConverge(func() []string {
+				start := time.Now()
+				lagging := node.WaitForClusterApply(10 * time.Second)
+				slog.Info("waited for the cluster to apply a bucket encryption change",
+					"waited", time.Since(start).Round(time.Millisecond),
+					"unconfirmed", lagging)
+				return lagging
+			})
+		}
+		apiHandler.SetBucketCryptoGuard(
+			func(bucket string) bool { return s.keyMgr != nil && s.keyMgr.IsEncrypted(bucket) },
+			func() error {
+				if s.clusterNode == nil {
+					return nil
+				}
+				return s.clusterNode.ReadBarrier(5 * time.Second)
+			},
+		)
+	}
+	if s.replicaRepairer != nil {
+		apiHandler.SetReplicaRepair(
+			s.replicaRepairer.Trigger,
+			func() any { return s.replicaRepairer.Status() },
+		)
 	}
 	if s.ecHealer != nil {
 		apiHandler.SetHealer(s.ecHealer)
@@ -1349,6 +1432,8 @@ func (s *Server) Run() error {
 		mux.HandleFunc("/cluster/object-delete", apiHandler.ClusterObjectDeleteHandler(s.cfg.Cluster.Secret))
 		mux.HandleFunc("/cluster/object-delete-batch", apiHandler.ClusterObjectDeleteBatchHandler(s.cfg.Cluster.Secret))
 		mux.HandleFunc("/cluster/replica-put", apiHandler.ClusterReplicaPutHandler(s.cfg.Cluster.Secret))
+		mux.HandleFunc("/cluster/replica-get", apiHandler.ClusterReplicaGetHandler(s.cfg.Cluster.Secret))
+		mux.HandleFunc("/cluster/replica-pull", apiHandler.ClusterReplicaPullHandler(s.cfg.Cluster.Secret))
 		mux.HandleFunc("/cluster/join", s.clusterNode.JoinHandler())
 		mux.HandleFunc("/cluster/leave", s.clusterNode.LeaveHandler())
 		mux.HandleFunc("/cluster/apply", s.clusterNode.ApplyHandler())
@@ -1490,6 +1575,13 @@ func (s *Server) Run() error {
 		go s.failureDetector.Run(detCtx)
 	}
 
+	// Start replica repair if clustering is enabled
+	if s.replicaRepairer != nil {
+		repCtx, repCancel := context.WithCancel(context.Background())
+		defer repCancel()
+		go s.replicaRepairer.Run(repCtx)
+	}
+
 	// Start erasure healer if enabled
 	if s.ecHealer != nil {
 		ecCtx, ecCancel := context.WithCancel(context.Background())
@@ -1562,6 +1654,8 @@ func (s *Server) Run() error {
 		interNodeMux.HandleFunc("/cluster/object-delete", apiHandler.ClusterObjectDeleteHandler(s.cfg.Cluster.Secret))
 		interNodeMux.HandleFunc("/cluster/object-delete-batch", apiHandler.ClusterObjectDeleteBatchHandler(s.cfg.Cluster.Secret))
 		interNodeMux.HandleFunc("/cluster/replica-put", apiHandler.ClusterReplicaPutHandler(s.cfg.Cluster.Secret))
+		interNodeMux.HandleFunc("/cluster/replica-get", apiHandler.ClusterReplicaGetHandler(s.cfg.Cluster.Secret))
+		interNodeMux.HandleFunc("/cluster/replica-pull", apiHandler.ClusterReplicaPullHandler(s.cfg.Cluster.Secret))
 		interNodeMux.HandleFunc("/cluster/join", s.clusterNode.JoinHandler())
 		interNodeMux.HandleFunc("/cluster/leave", s.clusterNode.LeaveHandler())
 		interNodeMux.HandleFunc("/cluster/apply", s.clusterNode.ApplyHandler())

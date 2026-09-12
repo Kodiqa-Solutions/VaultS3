@@ -290,6 +290,84 @@ func (n *Node) WaitForApply(index uint64, timeout time.Duration) error {
 	return nil
 }
 
+// WaitForClusterApply blocks until every reachable peer has applied at least as
+// much of the Raft log as this node has.
+//
+// It exists because some settings are unsafe to act on until the whole cluster
+// knows them. Turning on bucket encryption is the example: a node decides how to
+// store an object from its own copy of that config, so a node that has not
+// applied the change yet writes the object in the clear, permanently, in a
+// bucket that was just told to encrypt. Making the change wait for the cluster
+// closes that window once, at the moment it is made, instead of asking every
+// later write to defend against it.
+//
+// A peer that cannot be reached is not waited for. It is serving nothing while
+// it is away, and it replays the log before it serves anything on return, so it
+// cannot act on a stale view. The caller is told which peers did not confirm.
+func (n *Node) WaitForClusterApply(timeout time.Duration) []string {
+	target := n.fsm.AppliedIndex()
+	servers, err := n.Servers()
+	if err != nil {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	var lagging []string
+	for _, srv := range servers {
+		if string(srv.ID) == n.cfg.NodeID {
+			continue
+		}
+		addr := n.cfg.PeerAPIs[string(srv.ID)]
+		if addr == "" {
+			addr = apiAddrFromRaft(string(srv.Address), n.cfg.APIPort)
+		}
+		if !n.peerReachedIndex(addr, target, deadline) {
+			lagging = append(lagging, string(srv.ID))
+		}
+	}
+	return lagging
+}
+
+// peerReachedIndex polls one peer's applied index until it catches up to target
+// or the deadline passes. An unreachable peer is reported as not caught up.
+func (n *Node) peerReachedIndex(addr string, target uint64, deadline time.Time) bool {
+	for {
+		idx, err := n.peerAppliedIndex(addr)
+		if err == nil && idx >= target {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// peerAppliedIndex reads one peer's FSM applied index over the cluster channel.
+func (n *Node) peerAppliedIndex(addr string) (uint64, error) {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/cluster/readindex", addr), nil)
+	if err != nil {
+		return 0, err
+	}
+	if n.cfg.Secret != "" {
+		req.Header.Set(clusterSecretHeader, n.cfg.Secret)
+	}
+	resp, err := InterNodeClient(2 * time.Second).Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("cluster: readindex returned %d", resp.StatusCode)
+	}
+	var out struct {
+		Index uint64 `json:"index"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256)).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.Index, nil
+}
+
 // IsLeader returns true if this node is the current Raft leader.
 func (n *Node) IsLeader() bool {
 	return n.raft.State() == raft.Leader

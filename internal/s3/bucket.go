@@ -52,6 +52,12 @@ type BucketHandler struct {
 	store  metadata.StoreAPI
 	engine storage.Engine
 	keyMgr *bucketcrypto.Manager // per-bucket encryption keys (nil if unconfigured)
+	// perBucketMode is encryption.per_bucket, the only mode in which this server
+	// encrypts per bucket rather than server-wide.
+	perBucketMode bool
+	// clusterConverge blocks until the cluster has applied this node's writes and
+	// returns the peers that did not confirm. Nil on a single node.
+	clusterConverge func() []string
 	// Server-wide durability defaults, reported for buckets that set no override
 	// of their own (issue #39).
 	defaultErasure  bool
@@ -905,6 +911,18 @@ func (h *BucketHandler) PutBucketEncryption(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	rule := req.Rules[0]
+	// Refuse an algorithm this server cannot honour. In per-bucket mode the only
+	// thing that encrypts an object is a per-bucket AES256 key, and asking for
+	// SSE-KMS used to be accepted and then quietly ignored: the bucket reported
+	// aws:kms while every object in it, and every replica, was written in the
+	// clear. Saying no is the only answer that does not lie about the data.
+	if h.perBucketMode && rule.DefaultEncryption.SSEAlgorithm != "AES256" {
+		writeS3Error(w, "InvalidArgument",
+			"this server manages encryption keys per bucket, which supports SSEAlgorithm AES256 only. "+
+				"Set encryption.kms in the server config to use SSE-KMS.",
+			http.StatusBadRequest)
+		return
+	}
 	if err := h.store.PutEncryptionConfig(bucket, metadata.BucketEncryptionConfig{
 		SSEAlgorithm: rule.DefaultEncryption.SSEAlgorithm,
 		KMSKeyID:     rule.DefaultEncryption.KMSKeyID,
@@ -920,6 +938,20 @@ func (h *BucketHandler) PutBucketEncryption(w http.ResponseWriter, r *http.Reque
 			slog.Error("provision per-bucket key", "bucket", bucket, "error", err)
 			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 			return
+		}
+	}
+	// Do not report success until the rest of the cluster knows. Every node picks
+	// how to store an object from its own copy of this config, so a node that has
+	// not applied it yet writes the bucket's objects in the clear and they stay
+	// that way. The first object written after this call is the one that raced,
+	// and it only takes one unencrypted replica to undo the point of the setting.
+	if h.clusterConverge != nil {
+		if lagging := h.clusterConverge(); len(lagging) > 0 {
+			// These nodes never confirmed. They are serving nothing while they are
+			// out of contact and replay the log before they serve anything again,
+			// so this is reported rather than failed.
+			slog.Warn("bucket encryption enabled before every node confirmed it",
+				"bucket", bucket, "unconfirmed", lagging)
 		}
 	}
 	w.WriteHeader(http.StatusOK)

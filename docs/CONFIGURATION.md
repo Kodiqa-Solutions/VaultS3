@@ -46,7 +46,7 @@ auth:
 encryption:
   enabled: false
   key: ""  # 64-character hex string (32 bytes) for SSE-S3
-  kms:     # SSE-KMS (optional, overrides static key when enabled)
+  kms:     # SSE-KMS: a mode of its own, needs no static key
     enabled: false
     provider: "vault"          # "vault" or "local"
     vault_addr: ""
@@ -97,6 +97,10 @@ cluster:
   rebalance:
     max_bandwidth_mbps: 50
     batch_size: 100
+  repair:
+    interval_secs: 600       # restore replica counts after a node is lost, negative disables
+    max_bandwidth_mbps: 50
+    batch_size: 100
 
 # Erasure coding (optional, works with or without clustering)
 erasure:
@@ -135,7 +139,10 @@ server:
 
 ## Encryption at Rest
 
-VaultS3 supports two encryption modes:
+VaultS3 has three encryption modes. **Pick one.** They are server-wide settings
+and they do not combine: whichever is configured decides how every object on the
+server is sealed. A bucket cannot ask for a mode the server is not running.
+
 
 **SSE-S3 (Static Key)**, Simple setup with a hex-encoded 32-byte key:
 
@@ -159,7 +166,22 @@ encryption:
     local_key: ""              # hex-encoded fallback key (when provider: "local")
 ```
 
-SSE-KMS fetches data encryption keys from HashiCorp Vault's Transit engine, caches them in memory, and supports key rotation.
+SSE-KMS fetches data encryption keys from HashiCorp Vault's Transit engine, caches them in memory, and supports key rotation. It needs no `key` of its own, the keys come from the KMS.
+
+**Per-bucket keys**, each bucket sealed with its own data key, wrapped by a master key, so a bucket can be rotated or crypto-shredded on its own:
+
+```yaml
+encryption:
+  enabled: true
+  key: ""          # 64-char hex master key that wraps each bucket's data key
+  per_bucket: true
+```
+
+In this mode a bucket stores plaintext until it opts in, with
+`PutBucketEncryption` and `SSEAlgorithm: AES256`. That is the only algorithm this
+mode can honour, and asking for `aws:kms` here is refused rather than accepted
+and ignored. To use SSE-KMS instead, configure `encryption.kms` above and leave
+`per_bucket` off. See [the design note](design/per-bucket-encryption.md).
 
 **How objects are sealed.** From 4.4.53 an object is encrypted in 1 MiB chunks, each its own AES-256-GCM message with a nonce derived from a per-object random prefix, the chunk's index, and a flag marking the last chunk. That binding is what makes chunks impossible to reorder or move between objects and makes a truncated object fail to read rather than come back short. Each chunk is authenticated before any of its bytes are served, so a client never receives unverified plaintext.
 

@@ -46,6 +46,10 @@ type APIHandler struct {
 	scanner          *scanner.Scanner
 	tieringMgr       *tiering.Manager
 	ecHealer         *erasure.Healer
+	peerScheme       string
+	peerAddr         func(nodeID string) string
+	bucketEncrypted  func(bucket string) bool
+	metaBarrier      func() error
 	backupSched      *backup.Scheduler
 	rateLimiter      *ratelimit.Limiter
 	oidc             *OIDCValidator
@@ -65,6 +69,8 @@ type APIHandler struct {
 	usageOnce        sync.Once                               // guards building usage
 	writable         *atomic.Bool                            // node-local write gate (drain); nil ⇒ always writable
 	triggerRebalance func()                                  // kick a background rebalance pass (nil if single-node)
+	triggerRepair    func()                                  // kick a background replica repair pass (nil if single-node)
+	repairStatus     func() any                              // last repair scan outcome
 	rebalanceRunning func() bool                             // whether a rebalance is in progress
 	// localStore is the node-local metadata store, which differs from store only
 	// in a cluster (store is then Raft-backed). In-progress multipart state is kept
@@ -483,6 +489,10 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleClusterDrain(w, r, false)
 	case path == "/cluster/rebalance" && r.Method == http.MethodPost:
 		h.handleClusterRebalance(w, r)
+	case path == "/cluster/repair" && r.Method == http.MethodPost:
+		h.handleClusterRepair(w, r)
+	case path == "/cluster/repair" && r.Method == http.MethodGet:
+		h.handleClusterRepairStatus(w, r)
 
 	// Cost estimator (TCO vs managed clouds)
 	case path == "/tco" && r.Method == http.MethodGet:

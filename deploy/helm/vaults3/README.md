@@ -102,6 +102,7 @@ for the redundancy trade-offs.
 | `cluster.raftPort` | `9001` | Port for inter-node Raft traffic. |
 | `cluster.metadataShards` | `1` | Split object metadata across this many independent Raft groups. |
 | `cluster.metadataReplicas` | `3` | Pods holding each metadata shard. |
+| `cluster.repairIntervalSecs` | `0` | Gap between replica repair scans, which restore a bucket's replica count after a pod is lost for good. `0` takes the server default (600s), negative disables the scan. |
 
 **With `metadataShards: 1`, adding pods adds capacity for object data, not for
 metadata.** Object data is sharded across the pods by consistent hash, metadata is

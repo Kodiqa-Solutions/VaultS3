@@ -19,9 +19,19 @@ func TestSSEHeaderReflectsTheBucketNotTheGlobalFlag(t *testing.T) {
 	})
 
 	t.Run("server-wide key covers every bucket", func(t *testing.T) {
-		h := &ObjectHandler{encryptionEnabled: true} // keyMgr nil: not per-bucket mode
+		h := &ObjectHandler{encryptionEnabled: true} // not per-bucket mode
 		if !h.sseHeaderApplies("any") {
 			t.Fatal("one server-wide key encrypts every object, the header is correct")
+		}
+	})
+
+	// SSE-KMS requires an `encryption.key` it never uses, so a key manager exists
+	// even though no bucket has a per-bucket key. Reading the answer off that
+	// manager reported every KMS bucket as unencrypted.
+	t.Run("SSE-KMS covers every bucket despite a key manager", func(t *testing.T) {
+		h := &ObjectHandler{encryptionEnabled: true, keyMgr: newSSEHeaderMgr(t)}
+		if !h.sseHeaderApplies("any") {
+			t.Fatal("SSE-KMS encrypts every object, the header must say so")
 		}
 	})
 }
@@ -29,7 +39,8 @@ func TestSSEHeaderReflectsTheBucketNotTheGlobalFlag(t *testing.T) {
 // The per-bucket case needs a real manager, since opt-in is its state.
 func TestSSEHeaderPerBucket(t *testing.T) {
 	mgr := newSSEHeaderMgr(t)
-	h := &ObjectHandler{encryptionEnabled: true, keyMgr: mgr}
+	// perBucketMode is what makes encryption a per-bucket question at all.
+	h := &ObjectHandler{encryptionEnabled: true, perBucketMode: true, keyMgr: mgr}
 
 	if h.sseHeaderApplies("optedout") {
 		t.Fatal("a bucket that never opted in stores plaintext, claiming AES256 is a false claim")
