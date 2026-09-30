@@ -256,12 +256,30 @@ type BackupRecord struct {
 	Error       string `json:"error,omitempty"`
 }
 
+// MultipartUpload is the record of an upload in progress. It has to carry every
+// header CreateMultipartUpload accepted, because CompleteMultipartUpload builds
+// the object's metadata from this record and the original request is long gone by
+// then. A field missing here is a header silently dropped on any object large
+// enough to be uploaded in parts.
+//
+// The record is stored as JSON, so a field added here reads back as its zero value
+// on an upload created by an older build, and an older build ignores one it does
+// not know. An upload in flight across an upgrade therefore behaves exactly as it
+// did before rather than failing.
 type MultipartUpload struct {
 	UploadID    string `json:"upload_id"`
 	Bucket      string `json:"bucket"`
 	Key         string `json:"key"`
 	ContentType string `json:"content_type"`
 	CreatedAt   int64  `json:"created_at"`
+
+	Tags               map[string]string `json:"tags,omitempty"`
+	UserMetadata       map[string]string `json:"user_metadata,omitempty"`
+	ContentEncoding    string            `json:"content_encoding,omitempty"`
+	ContentDisposition string            `json:"content_disposition,omitempty"`
+	CacheControl       string            `json:"cache_control,omitempty"`
+	ContentLanguage    string            `json:"content_language,omitempty"`
+	WebsiteRedirect    string            `json:"website_redirect,omitempty"`
 }
 
 type PartInfo struct {

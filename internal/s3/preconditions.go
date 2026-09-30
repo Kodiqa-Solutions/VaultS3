@@ -3,7 +3,10 @@ package s3
 import (
 	"crypto/md5"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -240,21 +243,74 @@ func applyResponseOverrides(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// parseInlineTags parses the x-amz-tagging header (URL-encoded key=value pairs).
-func parseInlineTags(r *http.Request) map[string]string {
+// maxObjectTags is the number of tags S3 allows on one object. PutObjectTagging
+// enforces it on the XML body, so the header path has to agree.
+const maxObjectTags = 10
+
+// parseInlineTags parses the x-amz-tagging header, whose tag set is encoded as
+// URL query parameters, so both keys and values arrive percent-encoded and a '+'
+// stands for a space. Decoding is not optional: a value the client had to encode
+// (a space, '&', '=', anything non-ASCII) is stored in the object's metadata and
+// handed back by GetObjectTagging, so skipping it corrupts the tag permanently
+// rather than only for the one response (issue #61).
+//
+// A tag set that cannot be decoded is rejected rather than half-applied, since a
+// silently wrong tag gives the client nothing to notice.
+func parseInlineTags(r *http.Request) (map[string]string, error) {
 	tagging := r.Header.Get("X-Amz-Tagging")
 	if tagging == "" {
-		return nil
+		return nil, nil
 	}
-	tags := make(map[string]string)
-	for _, pair := range strings.Split(tagging, "&") {
-		kv := strings.SplitN(pair, "=", 2)
-		if len(kv) == 2 {
-			tags[kv[0]] = kv[1]
+	// ParseQuery also refuses a ';' as a pair separator, which is not a character
+	// S3 allows in a tag anyway, so say which of the two it was rather than
+	// blaming the encoding for a rejection the encoding did not cause.
+	values, err := url.ParseQuery(tagging)
+	if err != nil {
+		if strings.Contains(tagging, ";") {
+			return nil, &tagError{
+				code: "InvalidTag",
+				msg:  "The x-amz-tagging header cannot contain a ';'. Separate tags with '&' and percent-encode a ';' inside a value as %3B.",
+			}
+		}
+		return nil, &tagError{
+			code: "InvalidArgument",
+			msg:  fmt.Sprintf("The x-amz-tagging header is not a valid URL-encoded tag set: %v", err),
 		}
 	}
-	if len(tags) == 0 {
-		return nil
+	if len(values) > maxObjectTags {
+		return nil, &tagError{
+			code: "BadRequest",
+			msg:  fmt.Sprintf("Object tags cannot be greater than %d", maxObjectTags),
+		}
 	}
-	return tags
+	if len(values) == 0 {
+		return nil, nil
+	}
+	tags := make(map[string]string, len(values))
+	for k, v := range values {
+		// On a repeated key PutObjectTagging keeps the last one, because it fills the
+		// same map from the XML tag list in order. Agree with it: the two paths must
+		// not disagree about what the same tag set means.
+		tags[k] = v[len(v)-1]
+	}
+	return tags, nil
+}
+
+// tagError carries the S3 error code a bad tag set should answer with, so the
+// header path reports the same code for the same mistake as PutObjectTagging.
+type tagError struct {
+	code string
+	msg  string
+}
+
+func (e *tagError) Error() string { return e.msg }
+
+// writeTagError answers a tag set the server refused to store.
+func writeTagError(w http.ResponseWriter, err error) {
+	var te *tagError
+	if errors.As(err, &te) {
+		writeS3Error(w, te.code, te.msg, http.StatusBadRequest)
+		return
+	}
+	writeS3Error(w, "InvalidArgument", err.Error(), http.StatusBadRequest)
 }

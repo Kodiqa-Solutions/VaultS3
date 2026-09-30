@@ -59,6 +59,84 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 4.4.77
+
+**Take this one if you set object tags through the `x-amz-tagging` header.** No
+configuration or on-disk format changes.
+
+### Tags written before this release keep their encoded value
+
+`x-amz-tagging` carries the tag set encoded as URL query parameters. Before this
+release the server stored what it received without decoding it, so a value that
+had to be encoded was saved in its encoded form. Sending
+`x-amz-tagging: Tag1=Tag%201%20value` stored the value `Tag%201%20value`, and
+`GetObjectTagging` handed that back.
+
+The fix decodes the header on the way in, so new writes are correct. It does not
+rewrite what is already stored, because the server cannot tell a value that was
+wrongly encoded from one where the `%20` was always meant literally.
+
+To find affected objects, list the tags you set through that header and look for
+`%` followed by two hexadecimal digits, or a `+` where you expect a space. Re-apply
+the tags on the ones you find, either by sending `PutObjectTagging` with the value
+you want, or by repeating the original `PutObject` now that the header is decoded.
+
+Objects tagged through `PutObjectTagging` with an XML body were never affected and
+need nothing.
+
+### A copy no longer loses the tags it was not asked to change
+
+`CopyObject` treated the tag set as part of the metadata, so two ordinary copies
+behaved wrongly.
+
+- Replacing the metadata without mentioning tags **dropped the source's tags**.
+  That is what `aws s3 cp --metadata-directive REPLACE` sends, so any copy of that
+  shape silently lost every tag on the object.
+- Asking to replace only the tags, with `x-amz-tagging-directive: REPLACE` and no
+  metadata directive, was ignored and kept the source's tags instead.
+
+Both now follow S3: the tagging directive governs the tags, the metadata directive
+governs everything else, and they are independent. Nothing to configure.
+
+If you have been copying objects with `--metadata-directive REPLACE`, the copies
+made before this release have no tags. The originals are untouched, so check the
+source object for the tag set the copy should have had.
+
+### Multipart uploads now keep the headers they were given
+
+An object assembled from parts used to keep only its content type. Its tags, its
+`x-amz-meta-*` user metadata, `Content-Encoding`, `Content-Disposition`,
+`Cache-Control`, `Content-Language` and `x-amz-website-redirect-location` were all
+dropped at completion. aws-cli and the SDKs switch to multipart by themselves above
+a few megabytes, so any large upload was affected whether or not you asked for
+multipart.
+
+Objects already stored are not rewritten. If you rely on metadata or tags that a
+large upload was supposed to carry, re-send them with `PutObjectTagging` or
+re-upload the object.
+
+An upload that is in progress when you upgrade completes normally, and keeps the
+old behaviour for that one object, because its record was written before the
+change. On a cluster, finish the rolling upgrade before relying on the new
+behaviour: an upload completed by a node still running the older build drops those
+fields as it did before.
+
+### Three stricter answers on the same header
+
+These refuse requests an older server accepted. In each case what it accepted was
+a tag it could not store correctly.
+
+- A malformed percent-encoding, for example `k=%ZZ`, is refused with
+  `InvalidArgument` rather than stored half-decoded.
+- More than 10 tags is refused with `BadRequest`, the limit `PutObjectTagging`
+  already enforced on the XML body.
+- A literal `;` is refused with `InvalidTag`. It is not a character S3 permits in
+  a tag, and it cannot be told apart from a pair separator. Percent-encode it as
+  `%3B` inside a value, and separate tags with `&`.
+
+A repeated key keeps the last occurrence, which is what `PutObjectTagging` has
+always done with a repeated key in the XML body.
+
 ## Upgrading to 4.4.75
 
 **Take this one if you run a cluster, especially with per-bucket encryption.** No

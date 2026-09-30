@@ -30,6 +30,14 @@ func (h *ObjectHandler) CreateMultipartUpload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Refuse a bad tag set here rather than at completion, so the client learns
+	// about it before uploading the parts.
+	tags, tagErr := parseInlineTags(r)
+	if tagErr != nil {
+		writeTagError(w, tagErr)
+		return
+	}
+
 	uploadID := generateUploadID()
 
 	ct := r.Header.Get("Content-Type")
@@ -37,12 +45,21 @@ func (h *ObjectHandler) CreateMultipartUpload(w http.ResponseWriter, r *http.Req
 		ct = "application/octet-stream"
 	}
 
+	// Everything the object should end up with has to be recorded now: completion
+	// runs from this record, not from the request that started the upload.
 	upload := metadata.MultipartUpload{
-		UploadID:    uploadID,
-		Bucket:      bucket,
-		Key:         key,
-		ContentType: ct,
-		CreatedAt:   time.Now().UTC().Unix(),
+		UploadID:           uploadID,
+		Bucket:             bucket,
+		Key:                key,
+		ContentType:        ct,
+		CreatedAt:          time.Now().UTC().Unix(),
+		Tags:               tags,
+		UserMetadata:       parseUserMetadata(r),
+		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		CacheControl:       r.Header.Get("Cache-Control"),
+		ContentLanguage:    r.Header.Get("Content-Language"),
+		WebsiteRedirect:    r.Header.Get("X-Amz-Website-Redirect-Location"),
 	}
 
 	if err := h.multipartStore().CreateMultipartUpload(upload); err != nil {
@@ -334,14 +351,21 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	now := time.Now().UTC()
 
 	if err := h.store.PutObjectMeta(metadata.ObjectMeta{
-		Bucket:         bucket,
-		Key:            key,
-		ContentType:    upload.ContentType,
-		ETag:           etag,
-		Size:           totalSize,
-		LastModified:   now.Unix(),
-		PartsCount:     len(req.Parts),
-		PartBoundaries: partBoundaries,
+		Bucket:             bucket,
+		Key:                key,
+		ContentType:        upload.ContentType,
+		ETag:               etag,
+		Size:               totalSize,
+		LastModified:       now.Unix(),
+		PartsCount:         len(req.Parts),
+		PartBoundaries:     partBoundaries,
+		Tags:               upload.Tags,
+		UserMetadata:       upload.UserMetadata,
+		ContentEncoding:    upload.ContentEncoding,
+		ContentDisposition: upload.ContentDisposition,
+		CacheControl:       upload.CacheControl,
+		ContentLanguage:    upload.ContentLanguage,
+		WebsiteRedirect:    upload.WebsiteRedirect,
 	}); err != nil {
 		// The parts are assembled but the object is not recorded. Failing here
 		// leaves the upload completable on retry, which is far better than

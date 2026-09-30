@@ -4,6 +4,57 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.77] - 2026-09-30
+### Fixed
+- **Object tags sent on the `x-amz-tagging` header were stored without being
+  URL-decoded** (issue #61, reported by
+  [@ETCDema](https://github.com/ETCDema)). That header carries the tag set encoded
+  as URL query parameters, so a value containing a space, `&`, `=` or any
+  non-ASCII character arrives percent-encoded. The server stored it verbatim, so
+  `Tag1=Tag%201%20value` came back from `GetObjectTagging` as
+  `Tag%201%20value` instead of `Tag 1 value`. `PutObject` and the `REPLACE` form
+  of `CopyObject` were both affected. The tag set posted as XML to
+  `PutObjectTagging` was never affected.
+
+  The wrong value was written into the object's metadata, so **tags stored before
+  this release are not repaired by upgrading**. Re-apply the tags on affected
+  objects, see `docs/UPGRADING.md`.
+
+  Smaller gaps in the same header closed with it. A malformed percent-encoding is
+  refused with `InvalidArgument` rather than stored half-decoded, more than 10 tags
+  is refused with `BadRequest` as `PutObjectTagging` already did on the XML body,
+  and a literal `;` is refused with `InvalidTag` since S3 does not permit it in a
+  tag and it cannot be told apart from a pair separator. A repeated key now keeps
+  the last occurrence, matching what the XML body has always done.
+
+- **`CopyObject` ignored `x-amz-tagging-directive`, and replacing an object's
+  metadata silently destroyed its tags.** The tag set is governed by its own
+  directive, independently of `x-amz-metadata-directive`, and VaultS3 decided tags
+  inside the metadata branch. That got it wrong both ways. A copy asking to replace
+  the metadata and saying nothing about tags dropped the source's tags instead of
+  keeping them, which is what `aws s3 cp --metadata-directive REPLACE` sends, so an
+  ordinary copy quietly lost every tag on the object. And a tagging directive of
+  `REPLACE` did nothing at all unless the metadata directive happened to say
+  `REPLACE` too, so a copy asking only for new tags kept the old ones. All four
+  combinations of the two directives now behave as S3 defines them, pinned by a test
+  per combination.
+
+- **A multipart upload dropped almost everything the request asked for.**
+  `CompleteMultipartUpload` builds the object's metadata from the upload record,
+  and that record only ever held the content type, so an object assembled from
+  parts lost its tags, its user metadata (`x-amz-meta-*`), `Content-Encoding`,
+  `Content-Disposition`, `Cache-Control`, `Content-Language` and
+  `x-amz-website-redirect-location`. Seven of the eight fields a single-shot `PUT`
+  keeps. aws-cli and the SDKs switch to multipart on their own above a few
+  megabytes, so this hit ordinary uploads of large files with nothing opted into.
+  All seven are now recorded when the upload is created and applied when it
+  completes, and a test pins the multipart result to a single-shot `PUT` of the same
+  headers so the two paths cannot drift apart again.
+
+  An upload already in progress when you upgrade completes normally. Its record
+  predates the change, so that object keeps the old behaviour and loses those
+  fields, the same as it would have before.
+
 ## [4.4.76] - 2026-09-22
 ### Added
 - **The dashboard now ships a Russian translation** (PR #60, contributed by

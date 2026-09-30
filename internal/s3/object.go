@@ -578,7 +578,11 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 
 	// Parse extended metadata from headers
 	userMeta := parseUserMetadata(r)
-	tags := parseInlineTags(r)
+	tags, tagErr := parseInlineTags(r)
+	if tagErr != nil {
+		writeTagError(w, tagErr)
+		return
+	}
 
 	// SSE-C (customer-provided keys). Supported on the non-versioned path for now.
 	ssecKey, ssecErr := parseSSECHeaders(r)
@@ -1629,11 +1633,29 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 		LastModified: now.Unix(),
 	}
 
+	// The tag set is governed by its own directive, independently of the metadata
+	// one: S3 lets a copy replace the metadata while keeping the source's tags, and
+	// the other way round. Deciding tags inside the metadata branch got both halves
+	// wrong. "Replace the metadata" with no tagging header silently DISCARDED the
+	// source's tags, which is data loss on an ordinary copy, and a tagging directive
+	// of REPLACE did nothing at all unless the metadata directive happened to say
+	// REPLACE too.
+	var copyTags map[string]string
+	if strings.EqualFold(r.Header.Get("X-Amz-Tagging-Directive"), "REPLACE") {
+		headerTags, tagErr := parseInlineTags(r)
+		if tagErr != nil {
+			writeTagError(w, tagErr)
+			return
+		}
+		copyTags = headerTags
+	} else if srcMeta != nil {
+		copyTags = srcMeta.Tags
+	}
+
 	if strings.EqualFold(metadataDirective, "REPLACE") {
 		// Use metadata from request headers
 		meta.ContentType = detectContentType(r, key)
 		meta.UserMetadata = parseUserMetadata(r)
-		meta.Tags = parseInlineTags(r)
 		meta.ContentEncoding = r.Header.Get("Content-Encoding")
 		meta.ContentDisposition = r.Header.Get("Content-Disposition")
 		meta.CacheControl = r.Header.Get("Cache-Control")
@@ -1643,7 +1665,6 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 		// COPY (default): copy metadata from source
 		meta.ContentType = srcMeta.ContentType
 		meta.UserMetadata = srcMeta.UserMetadata
-		meta.Tags = srcMeta.Tags
 		meta.ContentEncoding = srcMeta.ContentEncoding
 		meta.ContentDisposition = srcMeta.ContentDisposition
 		meta.CacheControl = srcMeta.CacheControl
@@ -1656,6 +1677,8 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 	} else {
 		meta.ContentType = "application/octet-stream"
 	}
+
+	meta.Tags = copyTags
 
 	if err := h.store.PutObjectMeta(meta); err != nil {
 		metaWriteFailed(w, err, "PutObjectMeta (copy)", bucket, key)
