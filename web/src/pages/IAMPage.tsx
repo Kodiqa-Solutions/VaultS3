@@ -470,6 +470,7 @@ export default function IAMPage() {
             <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Delete {tab.slice(0, -1)}</h3>
             <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
               {t('buckets.deleteConfirm')} <strong>{deleteTarget}</strong>?
+              {tab === 'users' && <><br />{t('iam.deleteUserDeletesKeys')}</>}
             </p>
             <div className="flex gap-2 justify-end">
               <button onClick={() => setDeleteTarget(null)}

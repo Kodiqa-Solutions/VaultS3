@@ -191,7 +191,13 @@ func apiRequest(method, path string, body io.Reader) (*http.Response, error) {
 func printTable(headers []string, rows [][]string) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, strings.Join(headers, "\t"))
-	fmt.Fprintln(w, strings.Repeat("-\t", len(headers)))
+	// Underline each header in full. A single "-" per column read as a row of
+	// empty values, the same "-" a table prints for an empty field.
+	rules := make([]string, len(headers))
+	for i, h := range headers {
+		rules[i] = strings.Repeat("-", len(h))
+	}
+	fmt.Fprintln(w, strings.Join(rules, "\t"))
 	for _, row := range rows {
 		fmt.Fprintln(w, strings.Join(row, "\t"))
 	}

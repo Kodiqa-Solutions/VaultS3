@@ -20,6 +20,9 @@ RUN go mod download
 COPY . .
 COPY --from=frontend /app/web/dist ./internal/dashboard/dist
 RUN CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o /vaults3 ./cmd/vaults3
+# The CLI ships in the image, built from the same commit as the server, so the
+# two cannot drift apart: `docker exec <container> vaults3-cli ...`.
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o /vaults3-cli ./cmd/vaults3-cli
 
 # Stage 3: Runtime
 FROM alpine:3.21
@@ -30,6 +33,7 @@ RUN apk add --no-cache ca-certificates && \
     chown -R vaults3:vaults3 /data /metadata /etc/vaults3 /home/vaults3
 
 COPY --from=builder /vaults3 /usr/local/bin/vaults3
+COPY --from=builder /vaults3-cli /usr/local/bin/vaults3-cli
 COPY configs/vaults3.yaml /etc/vaults3/vaults3.yaml
 
 # A working directory the runtime user can write to. Without one every relative

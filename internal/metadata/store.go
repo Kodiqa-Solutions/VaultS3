@@ -119,6 +119,9 @@ type AccessKey struct {
 	SourceUserID string    `json:"source_user_id,omitempty"` // user who created this STS key
 	Description  string    `json:"description,omitempty"`
 	Status       string    `json:"status,omitempty"` // "Active" or "Inactive", default Active
+	// PolicyName is the policy this key was issued with. It belongs to the key,
+	// not to its user, so two keys for one user can reach different buckets.
+	PolicyName string `json:"policy_name,omitempty"`
 }
 
 type IAMUser struct {
@@ -127,6 +130,10 @@ type IAMUser struct {
 	PolicyARNs   []string  `json:"policy_arns,omitempty"`
 	Groups       []string  `json:"groups,omitempty"`
 	AllowedCIDRs []string  `json:"allowed_cidrs,omitempty"`
+	// KeyManaged marks a user that exists only because an access key was issued
+	// for it, so it is removed with its last key. A user created on purpose is
+	// never removed that way.
+	KeyManaged bool `json:"key_managed,omitempty"`
 }
 
 type IAMGroup struct {

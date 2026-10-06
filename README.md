@@ -110,15 +110,23 @@ No config file is needed. VaultS3 starts on its built-in defaults, creates the
 directories it needs, and generates an admin secret that it prints once on first
 start. Set `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY` to use your own.
 
+The image also carries `vaults3-cli`, built from the same commit as the server,
+so day-2 work needs nothing else installed:
+
+```bash
+docker exec vaults3 vaults3-cli user create alice
+docker exec vaults3 vaults3-cli key create alice --bucket my-bucket   # prints the key pair once
+```
+
 Prefer a package or a plain binary? Every [release](https://github.com/Kodiqa-Solutions/VaultS3/releases)
 ships `.deb`, `.rpm` and `.apk` packages, static binaries for Linux, macOS and
 Windows, an SPDX SBOM per platform, and a Sigstore provenance bundle you can
 verify offline:
 
 ```bash
-sudo apt install ./vaults3_4.4.78_amd64.deb
+sudo apt install ./vaults3_4.4.79_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_4.4.78_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_4.4.79_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart or a single

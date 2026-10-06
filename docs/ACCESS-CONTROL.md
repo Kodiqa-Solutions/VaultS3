@@ -23,9 +23,10 @@ requests.post(f"{API}/iam/users", headers=headers, json={"name": "alice"})
 requests.post(f"{API}/iam/users/alice/policies", headers=headers,
     json={"policyName": "ReadOnlyAccess"})
 
-# Create an access key for the user
+# Create an access key for the user. alice has a policy, so with nothing else
+# named the key can do exactly what her policies allow.
 resp = requests.post(f"{API}/keys", headers=headers, json={"userId": "alice"})
-key = resp.json()  # {"accessKey": "...", "secretKey": "..."}
+key = resp.json()  # {"accessKey": "...", "secretKey": "...", "access": "user"}
 
 # Create groups and attach policies
 requests.post(f"{API}/iam/groups", headers=headers, json={"name": "developers"})
@@ -49,7 +50,30 @@ requests.post(f"{API}/iam/policies", headers=headers,
     json={"name": "MyBucketReadOnly", "document": custom_policy})
 ```
 
-Policy evaluation follows AWS IAM semantics: default deny, explicit Allow required, explicit Deny always wins. Admin keys and legacy keys (without a user) retain full access.
+Policy evaluation follows AWS IAM semantics: default deny, explicit Allow required, explicit Deny always wins. The admin key has full access. Any other key is denied everything until a policy allows it, including a key with no user.
+
+### What an access key can reach
+
+`POST /api/v1/keys` takes the user and at most one of three choices, and answers
+with `access` saying which one applied:
+
+| Request | `access` | The key can reach |
+|---|---|---|
+| `"buckets": ["photos"]` | `buckets` | Those buckets, on top of the user's own policies |
+| `"allBuckets": true` | `all` | Every bucket |
+| `"userPoliciesOnly": true` | `user` | Exactly the user's own policies. Refused if the user has none |
+| none of them | `user` or `all` | The user's own policies if it has any, every bucket if it has none |
+
+The user is created if it does not exist. Each key keeps its own grant, so issuing
+another key for the same user never changes what an earlier one can reach, and a
+key's grant is not attached to the user. Deleting a user's last key removes the
+user only when the key is what created it. The grant is stored as a policy named
+`access-key-<access key>`, removed with the key and refused by policy delete while
+the key exists. Deleting a user deletes its keys and any session tokens issued
+from it.
+
+The same choices are in `vaults3-cli key create`, as `--bucket`, `--all-buckets` and
+`--user-policies`, where one of them is required.
 
 ## Anonymous (public) Access
 

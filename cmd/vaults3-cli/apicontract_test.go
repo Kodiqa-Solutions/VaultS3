@@ -104,6 +104,8 @@ func runUserOrReplication(args []string) {
 		runReplication(args[1:])
 	case "bucket":
 		runBucket(args[1:])
+	case "key":
+		runKey(args[1:])
 	default:
 		panic("test helper does not route " + args[0])
 	}

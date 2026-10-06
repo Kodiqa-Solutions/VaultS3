@@ -59,6 +59,60 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 4.4.79
+
+Access keys now each keep their own grant. Nothing to run, existing keys keep
+exactly the access they have, but three things behave differently and one is worth
+checking.
+
+### Check: keys issued for users that had policies of their own
+
+Before this release a key issued with no buckets selected got `s3:*` on every
+bucket, and that grant was attached to the user. A user you had given
+`ReadOnlyAccess` and then issued a key for could therefore write to every bucket,
+through every one of its keys. **Upgrading does not narrow those keys**, because
+removing access a working client may rely on is a decision for you, not for an
+upgrade.
+
+To find them, open **IAM > Users** in the dashboard and look for a user that has a
+`key-policy-<user>` policy next to policies of its own, and check that policy's
+resource under **IAM > Policies**. Once a new key has been issued for such a user,
+the shared policy has been split into one `access-key-<access key>` copy per key:
+a copy whose resource is `*` belongs to a key that reaches every bucket, and the
+Access Keys page shows which user it belongs to. Delete those keys and issue new
+ones. With nothing selected, a new key for that user gets exactly the user's
+policies.
+
+### What changed
+
+- **A second key no longer changes the first.** Keys issued before 4.4.79 share one
+  policy, `key-policy-<user>`. The first time a key is issued for that user after
+  upgrading, every existing key gets its own copy of it, named
+  `access-key-<access key>`, and the shared one is removed. Each old key keeps
+  exactly the access it had.
+- **A key for a user with policies of its own gets those policies, not every
+  bucket**, when no buckets are selected. A user with no policies still gets every
+  bucket, as before. Scripts calling `POST /api/v1/keys` can say which they want
+  with `allBuckets` or `userPoliciesOnly`, and the response now reports `access`.
+- **Deleting a user's last key keeps the user** unless issuing a key is what
+  created it. Users created before 4.4.79 are recognised by the only shape key
+  issuance gave them, the `key-policy-<user>` policy and nothing else.
+- **Deleting a user deletes its access keys** and any session tokens issued from
+  it. They used to stay behind and work again for a new user created with the
+  same name. A script that deletes a user and expects its keys to survive needs
+  to change, there is no way to keep them.
+- A key's own policy cannot be deleted on its own, delete the key.
+- **STS sessions.** A session token issued for a user without an inline policy
+  inherits the user's policies. A user that exists only for its keys has none
+  once those keys hold their own grants (every key issued from 4.4.79, and older
+  keys once they are converted), so such a session can reach nothing. Attach
+  a policy to the user, or pass an inline policy when issuing the session.
+
+`vaults3-cli` gained `key create`, `key list` and `key delete`. `key create`
+refuses a server older than 4.4.79, so upgrade the server before using it. The Docker
+image now carries `vaults3-cli`, so `docker exec <container> vaults3-cli ...` works
+with the container's own credentials.
+
 ## Upgrading to 4.4.78
 
 **Only `vaults3-cli` changed.** The server is the same as 4.4.77, so there is

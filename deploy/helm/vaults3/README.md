@@ -128,8 +128,10 @@ removed metadata cluster-wide but freed the data file only on the pod serving th
 request, stranding `(N-1)/N` of every bulk-deleted byte with no way to reach it
 again. `/data` therefore grows well past the logical size and no S3 call shrinks it.
 
-The container image carries the server only, so drive this from outside the
-cluster with the `vaults3-cli` release binary (or call the API directly):
+Drive it with `vaults3-cli`. From 4.4.79 the image carries it, so
+`kubectl exec -n vaults3 vaults3-0 -- vaults3-cli storage reclaim` works with the
+pod's own credentials. On an older image, use the release binary from outside the
+cluster (or call the API directly):
 
 ```bash
 kubectl port-forward -n vaults3 svc/vaults3 9000:9000 &

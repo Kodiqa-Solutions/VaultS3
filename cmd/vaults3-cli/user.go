@@ -131,7 +131,7 @@ func userCreate(args []string) {
 	for _, arg := range args[1:] {
 		if strings.HasPrefix(arg, "--access-key") || strings.HasPrefix(arg, "--secret-key") {
 			fatal("user create cannot set an access key or secret key: the server generates them. " +
-				"Issue a key for this user from the dashboard, under Access Keys")
+				"Issue a key for this user with: vaults3-cli key create " + name + " --bucket <bucket>")
 		}
 		fatal("unknown argument for user create: " + arg)
 	}
@@ -148,6 +148,7 @@ func userCreate(args []string) {
 		fatal(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
 	}
 	fmt.Printf("User '%s' created.\n", name)
+	fmt.Printf("It has no credentials yet. Issue some with: vaults3-cli key create %s --bucket <bucket>\n", name)
 }
 
 // userDelete deletes an IAM user. The API answers 204 whether or not the user

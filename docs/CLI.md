@@ -39,12 +39,19 @@ vaults3-cli object verify my-bucket --repair          # remove orphaned metadata
 vaults3-cli storage reclaim                    # report data files no metadata refers to (dry run)
 vaults3-cli storage reclaim --apply            # delete them and free the space
 
-# IAM user operations. A new user has no credentials yet: the server generates
-# access keys itself, so issue one for the user in the dashboard under Access Keys.
+# IAM user operations. A new user has no credentials yet, issue them with key create.
 vaults3-cli user list
 vaults3-cli user create alice
 vaults3-cli user attach-policy alice ReadWriteAccess   # built in: ReadOnlyAccess, ReadWriteAccess, FullAccess
-vaults3-cli user delete alice                          # errors if the user does not exist
+vaults3-cli user delete alice                          # also deletes her access keys, errors if she does not exist
+
+# Access keys. The server generates the pair and the secret is printed once.
+# Say what the key can reach, there is no default:
+vaults3-cli key create alice --bucket photos --bucket backups  # these buckets, plus alice's own policies
+vaults3-cli key create alice --user-policies                   # exactly alice's own policies
+vaults3-cli key create alice --all-buckets                     # every bucket
+vaults3-cli key list
+vaults3-cli key delete <access-key>
 
 # Replication monitoring
 vaults3-cli replication status
@@ -63,6 +70,40 @@ vaults3-cli cluster shards                     # how object metadata is distribu
 ```
 
 Build both binaries with `make build` or just the CLI with `make cli`.
+
+The Docker image carries `vaults3-cli` too, built from the same commit as the
+server, so the two always match. Inside the container it reads the
+`VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY` the container was started with and
+talks to `http://localhost:9000`:
+
+```bash
+docker exec vaults3 vaults3-cli key create alice --bucket photos
+kubectl exec -n vaults3 vaults3-0 -- vaults3-cli cluster status
+```
+
+If the container generated its own admin secret instead, pass it with
+`--access-key` and `--secret-key`.
+
+### What a key can reach
+
+A key belongs to one IAM user, and from 4.4.79 each key keeps its own grant:
+
+- `--bucket` gives the key full S3 access to those buckets, **on top of** whatever
+  the user's own policies allow. It does not narrow them.
+- `--user-policies` gives the key nothing of its own, so it can do exactly what the
+  user's policies (direct or through groups) allow. It is refused for a user with
+  no policies, because the key would reach nothing.
+- `--all-buckets` gives the key every bucket.
+
+Issuing another key for the same user never changes what an existing key can
+reach. Deleting a user's last key removes the user only if the user was created by
+issuing that key, a user created with `user create` stays. Deleting a user
+deletes its keys.
+
+`key create` needs a 4.4.79 or later server and refuses an older one before
+issuing anything: there, a key can get more access than asked for, and a new key
+changes what the user's other keys can reach. The other commands work with older
+servers.
 
 
 ## Server subcommands

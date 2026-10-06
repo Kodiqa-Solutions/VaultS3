@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -106,6 +107,29 @@ func (h *APIHandler) handleGetIAMUser(w http.ResponseWriter, _ *http.Request, na
 }
 
 func (h *APIHandler) handleDeleteIAMUser(w http.ResponseWriter, _ *http.Request, name string) {
+	// A user's access keys go with it. Left behind, they were refused only while
+	// no user had the name: a new user created with it later brought them back,
+	// each with the grant it was issued with. Sessions issued from the user go
+	// too. Keys are removed first, so a failure part way leaves the user in place
+	// to delete again rather than keys without a user.
+	keys, err := h.store.ListAccessKeys()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list the user's access keys")
+		return
+	}
+	for _, k := range keys {
+		if k.UserID != name && k.SourceUserID != name {
+			continue
+		}
+		if err := h.store.DeleteAccessKey(k.AccessKey); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to delete the user's access key "+k.AccessKey)
+			return
+		}
+		if k.PolicyName != "" {
+			_ = h.store.DeleteIAMPolicy(k.PolicyName)
+		}
+	}
+	_ = h.store.DeleteIAMPolicy(legacyKeyPolicyName(name))
 	if err := h.store.DeleteIAMUser(name); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete user")
 		return
@@ -410,6 +434,18 @@ func (h *APIHandler) handleCreateIAMPolicy(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *APIHandler) handleDeleteIAMPolicy(w http.ResponseWriter, _ *http.Request, name string) {
+	// An access key's own policy is removed with the key. Deleting it on its own
+	// would leave the key listed and working for signing while it can reach
+	// nothing, with no sign of why.
+	if keys, err := h.store.ListAccessKeys(); err == nil {
+		for _, k := range keys {
+			if k.PolicyName == name {
+				writeError(w, http.StatusConflict,
+					fmt.Sprintf("policy %q belongs to access key %s, delete the key instead", name, k.AccessKey))
+				return
+			}
+		}
+	}
 	if err := h.store.DeleteIAMPolicy(name); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete policy")
 		return

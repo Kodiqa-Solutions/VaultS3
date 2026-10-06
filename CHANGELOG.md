@@ -4,6 +4,75 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.79] - 2026-10-06
+### Fixed
+- **Issuing a second access key for a user changed what the first key could
+  reach.** Every key of a user shared one policy, `key-policy-<user>`, attached to
+  the user and rewritten each time a key was issued, from the dashboard's Access
+  Keys page or `POST /api/v1/keys`. A key scoped to one bucket lost that bucket when
+  the next key was scoped to another, and **was widened to every bucket when the
+  next key was issued with full access**. Each key now keeps its own grant, a policy
+  named `access-key-<access key>` that is not attached to the user. Keys issued
+  earlier are converted the first time another key is issued for their user, and
+  each keeps exactly the access it had.
+
+- **A key issued for a user with policies of its own could reach every bucket.**
+  With no buckets selected a key got `s3:*` on every bucket, attached to the user,
+  so the flow `docs/ACCESS-CONTROL.md` showed (create a user, attach
+  `ReadOnlyAccess`, issue a key) gave a read-only user write access everywhere.
+  Such a key now gets exactly the user's own policies. A user with no policies
+  still gets every bucket, as the dashboard says. **Keys already issued this way
+  are not narrowed by upgrading**, `docs/UPGRADING.md` says how to find them.
+
+- **Deleting a user's last access key deleted the user**, including one created on
+  purpose with policies attached. The user is now removed with its last key only
+  when issuing a key is what created it.
+
+- **Deleting a user now deletes its access keys**, and any session tokens issued
+  from it. The keys used to stay behind, refused only because their user was
+  gone, and came back to life for a new user created later with the same name.
+  The dashboard's delete confirmation now says the keys go too.
+
+- An access key's own policy can no longer be deleted apart from the key, which
+  left the key listed while it could reach nothing. The delete answers 409.
+
+- `docs/ACCESS-CONTROL.md` said a key without a user had full access. It is denied
+  everything until a policy allows it, and the doc now says so.
+
+- CLI tables printed a row of single dashes under the header, which read as a
+  record with every field empty. Headers are now underlined in full.
+
+### Added
+- **`vaults3-cli key create`, `key list` and `key delete`** (issue #62, from
+  [@nounfve-deploy](https://github.com/nounfve-deploy), who could create a user
+  from the CLI but had no way to get credentials for it). `key create` prints the
+  pair the server generated, once. It requires `--bucket` (repeatable),
+  `--all-buckets` or `--user-policies`, so nobody issues a key that reaches every
+  bucket by accident, and reports what the server actually granted. It refuses a
+  server older than 4.4.79 before issuing anything, since there a key can get
+  more access than asked for. `user create` now says how to issue credentials for
+  the new user.
+
+- **The Docker image carries `vaults3-cli`**, built from the same commit as the
+  server, also suggested by @nounfve-deploy. `docker exec <container> vaults3-cli
+  ...` and `kubectl exec` use the container's own credentials, and the CLI can no
+  longer drift from the server it manages.
+
+- `POST /api/v1/keys` accepts `allBuckets` and `userPoliciesOnly` next to
+  `buckets`, and its response reports `access` (`buckets`, `all` or `user`).
+
+Tested on Docker against the released 4.4.78 image first: 14 checks, 6 failing there
+and none here. An upgrade run seeded keys on 4.4.78 and recreated the container on
+the fix over the same volumes: 14 checks, every old key kept its access, and the
+same checks fail 4 times without the fix. A 3-node cluster ran 12 checks against
+both followers. The new CLI was run against a real 4.4.78 server, where it
+refused and issued nothing. The reporter's flow was then run end to end with the
+official aws-cli image and the CLI inside the container: 22 checks covering
+multipart upload, presigned URLs, a read-only user, a container recreate, key
+revocation and user deletion. The dashboard's own key requests were replayed and
+checked with aws-cli: 11 checks. Every guard has a test that fails when the guard
+is reverted.
+
 ## [4.4.78] - 2026-10-06
 ### Fixed
 - **`vaults3-cli user delete` could delete a different user from the one named,

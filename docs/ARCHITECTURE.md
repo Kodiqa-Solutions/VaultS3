@@ -9,7 +9,7 @@ How the source tree is laid out and what it is built on.
 ```
 VaultS3/
 ├── cmd/vaults3/main.go        — Server entry point
-├── cmd/vaults3-cli/           — CLI tool (bucket, object, user, replication, cluster commands)
+├── cmd/vaults3-cli/           — CLI tool (bucket, object, user, key, replication, cluster, storage commands)
 ├── internal/
 │   ├── config/                — YAML config loader
 │   ├── server/                — HTTP server, routing, and auto-TLS

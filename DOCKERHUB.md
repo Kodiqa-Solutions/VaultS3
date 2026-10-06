@@ -113,6 +113,15 @@ docker run -d \
   eniz1806/vaults3
 ```
 
+## Command-line tool
+
+The image carries `vaults3-cli`, built from the same commit as the server. It uses the credentials the container was started with:
+
+```bash
+docker exec vaults3 vaults3-cli user create alice
+docker exec vaults3 vaults3-cli key create alice --bucket my-bucket
+```
+
 ## Architecture
 
 - **Single binary** -- no runtime dependencies

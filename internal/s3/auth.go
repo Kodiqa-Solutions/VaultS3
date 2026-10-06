@@ -174,6 +174,23 @@ func (a *Authenticator) resolveIdentity(accessKey string, r *http.Request) (*iam
 				// Load user's IP restrictions
 				if user, err := a.store.GetIAMUser(userID); err == nil {
 					identity.AllowedCIDRs = user.AllowedCIDRs
+
+					// The grant the key was issued with is the key's own, so a
+					// second key for the same user cannot change it. It applies
+					// only while the user exists: a key left behind by a deleted
+					// user must not keep its access.
+					if key.PolicyName != "" {
+						if p, err := a.store.GetIAMPolicy(key.PolicyName); err == nil {
+							var pol iam.Policy
+							if err := json.Unmarshal([]byte(p.Document), &pol); err != nil {
+								slog.Error("iam: an access key's policy failed to parse, denying this key until it is fixed",
+									"policy", p.Name, "user", userID, "error", err)
+								identity.PolicyLoadFailed = true
+							} else {
+								identity.Policies = append(identity.Policies, pol)
+							}
+						}
+					}
 				}
 			}
 

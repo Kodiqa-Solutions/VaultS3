@@ -23,7 +23,16 @@ type keyCreateResponse struct {
 	AccessKey string `json:"accessKey"`
 	SecretKey string `json:"secretKey"`
 	CreatedAt string `json:"createdAt"`
+	// Access says what the key can reach: "buckets" (the ones requested),
+	// "all" (every bucket) or "user" (exactly the user's own policies).
+	Access string `json:"access"`
 }
+
+const (
+	keyAccessBuckets = "buckets"
+	keyAccessAll     = "all"
+	keyAccessUser    = "user"
+)
 
 func (h *APIHandler) handleListKeys(w http.ResponseWriter, _ *http.Request) {
 	keys, err := h.store.ListAccessKeys()
@@ -56,8 +65,10 @@ func (h *APIHandler) handleListKeys(w http.ResponseWriter, _ *http.Request) {
 
 func (h *APIHandler) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	var reqBody struct {
-		UserID  string   `json:"userId"`
-		Buckets []string `json:"buckets"`
+		UserID           string   `json:"userId"`
+		Buckets          []string `json:"buckets"`
+		AllBuckets       bool     `json:"allBuckets"`
+		UserPoliciesOnly bool     `json:"userPoliciesOnly"`
 	}
 	if err := readJSON(r, &reqBody); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -65,6 +76,16 @@ func (h *APIHandler) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if reqBody.UserID == "" {
 		writeError(w, http.StatusBadRequest, "userId is required")
+		return
+	}
+	chosen := 0
+	for _, set := range []bool{len(reqBody.Buckets) > 0, reqBody.AllBuckets, reqBody.UserPoliciesOnly} {
+		if set {
+			chosen++
+		}
+	}
+	if chosen > 1 {
+		writeError(w, http.StatusBadRequest, "buckets, allBuckets and userPoliciesOnly are alternatives, set one")
 		return
 	}
 
@@ -90,110 +111,120 @@ func (h *APIHandler) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 
-	// Auto-create IAM user if it doesn't exist
-	if _, err := h.store.GetIAMUser(reqBody.UserID); err != nil {
-		user := metadata.IAMUser{
-			Name:      reqBody.UserID,
-			CreatedAt: now,
+	// Keys issued before 4.4.79 shared a policy attached to the user. Split it
+	// first, so it is neither counted as the user's own policy below nor
+	// inherited by the key about to be issued.
+	_, getErr := h.store.GetIAMUser(reqBody.UserID)
+	userExists := getErr == nil
+	if userExists {
+		if err := h.splitLegacyKeyPolicy(reqBody.UserID, now); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to convert the user's existing keys: "+err.Error())
+			return
 		}
-		if err := h.store.CreateIAMUser(user); err != nil {
+	}
+
+	// Decide what the key can reach. With no buckets named, a key used to get
+	// every bucket even when its user already had policies of its own, so the
+	// documented flow of creating a user, attaching ReadOnlyAccess and issuing a
+	// key produced a key that could write anywhere. Such a user's key now gets
+	// exactly the user's policies. Every bucket stays the default only for a
+	// user with no policies, where the key would otherwise reach nothing.
+	access := keyAccessAll
+	switch {
+	case len(reqBody.Buckets) > 0:
+		access = keyAccessBuckets
+	case reqBody.AllBuckets:
+		access = keyAccessAll
+	default:
+		var own []metadata.IAMPolicy
+		if userExists {
+			var err error
+			if own, err = h.store.GetUserPolicies(reqBody.UserID); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to read the user's policies")
+				return
+			}
+		}
+		if len(own) > 0 {
+			access = keyAccessUser
+		} else if reqBody.UserPoliciesOnly {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"user %q has no policies, so a key limited to them could reach nothing. Attach a policy first", reqBody.UserID))
+			return
+		}
+	}
+
+	// Auto-create the IAM user if it doesn't exist. It is marked as existing only
+	// for its keys, so deleting its last key removes it again.
+	if !userExists {
+		if err := h.store.CreateIAMUser(metadata.IAMUser{
+			Name:       reqBody.UserID,
+			CreatedAt:  now,
+			KeyManaged: true,
+		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create IAM user")
 			return
 		}
 	}
 
-	// Build policy: scoped to specific buckets or full access
-	policyName := fmt.Sprintf("key-policy-%s", reqBody.UserID)
-	var policyDoc string
-	if len(reqBody.Buckets) > 0 {
-		// Scoped: only allow access to specified buckets
-		resources := make([]string, 0, len(reqBody.Buckets)*2)
-		for _, bucket := range reqBody.Buckets {
-			resources = append(resources, fmt.Sprintf("arn:aws:s3:::%s", bucket))
-			resources = append(resources, fmt.Sprintf("arn:aws:s3:::%s/*", bucket))
-		}
-		doc, _ := json.Marshal(map[string]interface{}{
-			"Version": "2012-10-17",
-			"Statement": []map[string]interface{}{
-				{
-					"Effect":   "Allow",
-					"Action":   []string{"s3:*"},
-					"Resource": resources,
-				},
-			},
-		})
-		policyDoc = string(doc)
-	} else {
-		// No buckets specified: full S3 access
-		doc, _ := json.Marshal(map[string]interface{}{
-			"Version": "2012-10-17",
-			"Statement": []map[string]interface{}{
-				{
-					"Effect":   "Allow",
-					"Action":   []string{"s3:*"},
-					"Resource": []string{"*"},
-				},
-			},
-		})
-		policyDoc = string(doc)
+	resp := keyCreateResponse{
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		CreatedAt: now.Format(time.RFC3339),
+		Access:    access,
 	}
-
-	// Create or update the policy
-	if existing, err := h.store.GetIAMPolicy(policyName); err != nil {
-		// Policy doesn't exist, create it
-		policy := metadata.IAMPolicy{
-			Name:      policyName,
-			CreatedAt: now,
-			Document:  policyDoc,
-		}
-		if err := h.store.CreateIAMPolicy(policy); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to create policy")
-			return
-		}
-	} else {
-		// Policy exists, update the document
-		existing.Document = policyDoc
-		if err := h.store.UpdateIAMPolicy(*existing); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to update policy")
-			return
-		}
-	}
-
-	// Attach policy to user
-	iamUser, _ := h.store.GetIAMUser(reqBody.UserID)
-	hasPol := false
-	for _, p := range iamUser.PolicyARNs {
-		if p == policyName {
-			hasPol = true
-			break
-		}
-	}
-	if !hasPol {
-		iamUser.PolicyARNs = append(iamUser.PolicyARNs, policyName)
-		if err := h.store.UpdateIAMUser(*iamUser); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to attach policy")
-			return
-		}
-	}
-
-	// Create the access key
 	key := metadata.AccessKey{
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		CreatedAt: now,
 		UserID:    reqBody.UserID,
 	}
+	if access == keyAccessUser {
+		if err := h.store.CreateAccessKey(key); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create access key")
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp)
+		return
+	}
 
+	// Build policy: scoped to specific buckets or full access
+	var policyDoc string
+	if access == keyAccessBuckets {
+		// Scoped: only allow access to specified buckets
+		resources := make([]string, 0, len(reqBody.Buckets)*2)
+		for _, bucket := range reqBody.Buckets {
+			resources = append(resources, fmt.Sprintf("arn:aws:s3:::%s", bucket))
+			resources = append(resources, fmt.Sprintf("arn:aws:s3:::%s/*", bucket))
+		}
+		policyDoc = allowS3On(resources)
+	} else {
+		// No buckets specified: full S3 access
+		policyDoc = allowS3On([]string{"*"})
+	}
+
+	// The grant belongs to this key alone. It used to be one policy per USER,
+	// attached to the user and rewritten on every issue, so issuing a second key
+	// silently changed what the first could reach: a key scoped to one bucket
+	// lost it when the next was scoped to another, and was widened to every
+	// bucket when the next was issued with full access.
+	policyName := keyPolicyName(accessKey)
+	if err := h.store.CreateIAMPolicy(metadata.IAMPolicy{
+		Name:      policyName,
+		CreatedAt: now,
+		Document:  policyDoc,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create policy")
+		return
+	}
+
+	key.PolicyName = policyName
 	if err := h.store.CreateAccessKey(key); err != nil {
+		_ = h.store.DeleteIAMPolicy(policyName)
 		writeError(w, http.StatusInternalServerError, "failed to create access key")
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, keyCreateResponse{
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-		CreatedAt: now.Format(time.RFC3339),
-	})
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (h *APIHandler) handleDeleteKey(w http.ResponseWriter, _ *http.Request, accessKey string) {
@@ -213,25 +244,167 @@ func (h *APIHandler) handleDeleteKey(w http.ResponseWriter, _ *http.Request, acc
 		return
 	}
 
-	// Clean up auto-created IAM policy and user if no other keys reference this user
-	if key.UserID != "" {
-		hasOtherKeys := false
-		if allKeys, err := h.store.ListAccessKeys(); err == nil {
-			for _, k := range allKeys {
-				if k.AccessKey != accessKey && k.UserID == key.UserID {
-					hasOtherKeys = true
-					break
-				}
+	if key.PolicyName != "" {
+		_ = h.store.DeleteIAMPolicy(key.PolicyName)
+	}
+
+	// Remove the user with its last key only when the key is the reason it
+	// exists. This used to remove the user unconditionally, so a user created on
+	// purpose, with policies attached, vanished when its last key was deleted.
+	if key.UserID != "" && !h.userHasOtherKeys(key.UserID, accessKey) {
+		if user, err := h.store.GetIAMUser(key.UserID); err == nil {
+			legacy := legacyKeyPolicyName(key.UserID)
+			if keyManaged(user) {
+				_ = h.store.DeleteIAMUser(key.UserID)
+			} else if detachPolicy(user, legacy) {
+				// The shared grant of keys issued before 4.4.79 goes with the
+				// last of them. The user and its own policies stay.
+				_ = h.store.UpdateIAMUser(*user)
 			}
-		}
-		if !hasOtherKeys {
-			policyName := fmt.Sprintf("key-policy-%s", key.UserID)
-			_ = h.store.DeleteIAMPolicy(policyName)
-			_ = h.store.DeleteIAMUser(key.UserID)
+			_ = h.store.DeleteIAMPolicy(legacy)
 		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// keyPolicyName names the policy that holds one key's grant.
+func keyPolicyName(accessKey string) string {
+	return "access-key-" + accessKey
+}
+
+// legacyKeyPolicyName is the single per-user policy that keys issued before
+// 4.4.79 shared, attached to the user itself.
+func legacyKeyPolicyName(user string) string {
+	return "key-policy-" + user
+}
+
+func allowS3On(resources []string) string {
+	doc, _ := json.Marshal(map[string]interface{}{
+		"Version": "2012-10-17",
+		"Statement": []map[string]interface{}{
+			{
+				"Effect":   "Allow",
+				"Action":   []string{"s3:*"},
+				"Resource": resources,
+			},
+		},
+	})
+	return string(doc)
+}
+
+func (h *APIHandler) userHasOtherKeys(user, except string) bool {
+	keys, err := h.store.ListAccessKeys()
+	if err != nil {
+		// Unknown is not "none": keeping a user is recoverable, removing one is not.
+		return true
+	}
+	for _, k := range keys {
+		if k.AccessKey != except && k.UserID == user {
+			return true
+		}
+	}
+	return false
+}
+
+// keyManaged reports whether a user exists only for its access keys. Users
+// created before 4.4.79 carry no marker, so one is recognised by the only shape
+// key issuance ever gave it: the shared key policy and nothing else.
+func keyManaged(u *metadata.IAMUser) bool {
+	if u.KeyManaged {
+		return true
+	}
+	return len(u.PolicyARNs) == 1 && u.PolicyARNs[0] == legacyKeyPolicyName(u.Name) &&
+		len(u.Groups) == 0 && len(u.AllowedCIDRs) == 0
+}
+
+// detachPolicy removes a policy from a user's list and reports whether it was
+// there.
+func detachPolicy(u *metadata.IAMUser, name string) bool {
+	kept := u.PolicyARNs[:0:0]
+	for _, p := range u.PolicyARNs {
+		if p != name {
+			kept = append(kept, p)
+		}
+	}
+	found := len(kept) != len(u.PolicyARNs)
+	u.PolicyARNs = kept
+	return found
+}
+
+// splitLegacyKeyPolicy moves a user's keys off the shared per-user policy that
+// keys issued before 4.4.79 used. Each existing key gets its own copy of that
+// policy, so it keeps exactly the access it had, and the shared policy is then
+// detached, so the key about to be issued does not inherit it.
+//
+// The order is what makes a failure part way safe. Until the last step the
+// shared policy is still attached, and every key still has at least the access
+// it had before.
+func (h *APIHandler) splitLegacyKeyPolicy(user string, now time.Time) error {
+	u, err := h.store.GetIAMUser(user)
+	if err != nil {
+		return err
+	}
+	legacyName := legacyKeyPolicyName(user)
+	attached := false
+	for _, p := range u.PolicyARNs {
+		if p == legacyName {
+			attached = true
+			break
+		}
+	}
+	if !attached {
+		return nil
+	}
+	// The policy can be listed on the user after it was deleted by hand. The old
+	// keys had no grant from it then, so there is nothing to copy, only the stale
+	// entry to drop. Failing here instead refused every new key for the user.
+	legacy, err := h.store.GetIAMPolicy(legacyName)
+	if err != nil {
+		// Only a policy that is really gone counts as gone. An unreadable one
+		// stops the conversion, so the old keys keep their grant.
+		all, lerr := h.store.ListIAMPolicies()
+		if lerr != nil {
+			return err
+		}
+		for _, p := range all {
+			if p.Name == legacyName {
+				return err
+			}
+		}
+		legacy = nil
+	}
+	keys, err := h.store.ListAccessKeys()
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if legacy == nil || k.UserID != user || k.PolicyName != "" {
+			continue
+		}
+		name := keyPolicyName(k.AccessKey)
+		pol := metadata.IAMPolicy{Name: name, CreatedAt: now, Document: legacy.Document}
+		if err := h.store.CreateIAMPolicy(pol); err != nil {
+			// Left behind by an earlier attempt that failed part way.
+			if _, gerr := h.store.GetIAMPolicy(name); gerr != nil {
+				return err
+			}
+			if err := h.store.UpdateIAMPolicy(pol); err != nil {
+				return err
+			}
+		}
+		k.PolicyName = name
+		if err := h.store.CreateAccessKey(k); err != nil {
+			return err
+		}
+	}
+
+	u.KeyManaged = keyManaged(u)
+	detachPolicy(u, legacyName)
+	if err := h.store.UpdateIAMUser(*u); err != nil {
+		return err
+	}
+	return h.store.DeleteIAMPolicy(legacyName)
 }
 
 func maskSecret(secret string) string {

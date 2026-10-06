@@ -90,6 +90,8 @@ func main() {
 		runObject(cmdArgs)
 	case "user":
 		runUser(cmdArgs)
+	case "key":
+		runKey(cmdArgs)
 	case "replication":
 		runReplication(cmdArgs)
 	case "cluster":
@@ -126,6 +128,7 @@ Commands:
   bucket               Bucket operations (list, create, delete, info)
   object               Object operations (ls, put, get, rm, cp, presign)
   user                 IAM user operations (list, create, delete, attach-policy)
+  key                  Access key operations (list, create, delete)
   replication          Replication operations (status, queue)
   cluster              Cluster ops (status, join, leave, drain, undrain, rebalance, decommission)
   storage              Storage maintenance (reclaim orphaned data files)
