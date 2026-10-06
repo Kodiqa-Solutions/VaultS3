@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -131,7 +132,9 @@ func bucketDelete(name string) {
 }
 
 func bucketInfo(name string) {
-	resp, err := apiRequest("GET", "/buckets/"+name, nil)
+	// Escaped so a stray '?' or '#' cannot cut the name short and answer for a
+	// different bucket.
+	resp, err := apiRequest("GET", "/buckets/"+url.PathEscape(name), nil)
 	if err != nil {
 		fatal(err.Error())
 	}

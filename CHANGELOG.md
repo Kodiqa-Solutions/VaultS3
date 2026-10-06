@@ -4,6 +4,62 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [4.4.78] - 2026-10-06
+### Fixed
+- **`vaults3-cli user delete` could delete a different user from the one named,
+  and report the named one as deleted.** The CLI put the user name into the URL
+  path without escaping it, and the API routes on the decoded path, so a `?` ended
+  the path and a `#` began a fragment. `vaults3-cli user delete 'a?b'` deleted the
+  user `a` and printed `User 'a?b' deleted.`, leaving `a?b` in place.
+  `user attach-policy` built its path the same way. Every user name is now escaped,
+  and a test creates both users and checks that only the named one goes. **If you
+  ever ran either command on a name containing `?` or `#`, check which user it
+  touched**, see `docs/UPGRADING.md`.
+
+  A name containing `/` cannot be fixed by escaping: the API splits the decoded path
+  on it, so such a user could be created but never deleted or given a policy again,
+  from the CLI or the dashboard. The CLI now refuses to create one, and refuses to
+  act on an existing one with a message naming the `/` rather than answering
+  `user not found` for a user that exists. `bucket info` is escaped too, so a typo
+  like `bucket info 'photos?x'` no longer answers with the details of `photos`.
+
+- **`vaults3-cli user create` failed every time, and five more CLI commands were
+  broken the same way** (issue #62, reported by
+  [@nounfve-deploy](https://github.com/nounfve-deploy)). The CLI and the dashboard
+  API each declared their own JSON field names, and nothing checked that they
+  agreed. The API uses camelCase, the CLI was written in snake_case, and when the
+  API was reshaped for the dashboard its second consumer was never updated. Three
+  commands failed outright, two printed wrong values with no error at all, and one
+  reported a success that had not happened.
+
+  - `user create` sent `user_name` where the API reads `name`, so it always
+    answered `400 name is required`.
+  - `user attach-policy` sent `policy_name` where the API reads `policyName`, so it
+    always answered `400 policyName is required`.
+  - `user list` read `user_id`, `user_name` and `policies`, none of which the API
+    sends, so every user printed as a blank line.
+  - `replication status` expected a list while the API answers
+    `{"enabled": ..., "peers": [...]}`, so it failed to decode on every run.
+  - `replication queue` read the storage layer's `retry_count` and `created_at`
+    instead of the API's `retryCount` and `createdAt`, so every queued event showed
+    0 retries and a 1970 date.
+  - `user delete` printed "deleted" for a user that never existed, because the API
+    answers 204 either way. It now looks the user up first and reports
+    `user not found` with exit status 1, as `aws iam delete-user` does. A script
+    that relied on deleting a missing user succeeding needs `|| true`.
+
+  `user create` also accepted `--access-key` and `--secret-key`, which were
+  documented and never did anything: the server generates every access key itself
+  and has no way to take one the caller chose. Those flags are now refused with an
+  explanation instead of being silently dropped, and `docs/CLI.md` says where a new
+  user's credentials come from.
+
+  Every fix is in the CLI, so **the new `vaults3-cli` works against the server you
+  already run**, with no server upgrade. Tested against 4.4.56, the oldest published
+  image, and 4.4.77. The CLI now has tests that run each of these commands against
+  the real API handler, so a field renamed on either side fails the build instead of
+  shipping.
+
 ## [4.4.77] - 2026-09-30
 ### Fixed
 - **Object tags sent on the `x-amz-tagging` header were stored without being

@@ -59,6 +59,40 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 4.4.78
+
+**Only `vaults3-cli` changed.** The server is the same as 4.4.77, so there is
+nothing to upgrade on it. Replace the CLI binary to get these fixes. The new CLI
+works against a server you already run, tested back to 4.4.56.
+
+### Check any user you deleted through the CLI
+
+Before this release the CLI put a user name into the URL without escaping it, so a
+`?` or `#` in the name cut it short and the request acted on a different user.
+`vaults3-cli user delete 'a?b'` deleted the user `a` and reported `a?b` as deleted.
+`user attach-policy` built its request the same way.
+
+If you ever ran either command on a name containing `?` or `#`, list your users and
+check that the right one was removed or given the policy. A user deleted this way
+is gone and has to be created again, along with its policies and access keys. Names
+without those two characters were never affected.
+
+### Scripts that call the CLI
+
+- `user delete` on a user that does not exist now fails with `user not found` and
+  exit status 1, where it used to print "deleted" and exit 0. A teardown script
+  that deletes users which may already be gone needs `|| true`.
+- `user create` refuses `--access-key` and `--secret-key`. They were documented but
+  never did anything, because the server generates every access key itself. Issue a
+  key for the user from the dashboard, under Access Keys.
+- `user create`, `user delete` and `user attach-policy` refuse a name containing `/`.
+  The API cannot route such a name, so a user created with one could never be
+  managed again.
+
+`user create`, `user attach-policy`, `user list`, `replication status` and
+`replication queue` were broken on 4.4.77 and earlier and work now. Nothing to do
+for those beyond replacing the binary.
+
 ## Upgrading to 4.4.77
 
 **Take this one if you set object tags through the `x-amz-tagging` header.** No

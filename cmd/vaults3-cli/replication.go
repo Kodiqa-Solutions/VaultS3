@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"time"
 )
 
 func runReplication(args []string) {
@@ -31,6 +30,11 @@ Subcommands:
 	}
 }
 
+// replicationStatus prints each configured replication peer. The API answers
+// {"enabled":..., "peers":[...]} (replicationStatusResponse in
+// internal/api/replication.go); it was reshaped from a bare list for the
+// dashboard in issue #10 and this command was never updated, so it failed to
+// decode on every run.
 func replicationStatus() {
 	resp, err := apiRequest("GET", "/replication/status", nil)
 	if err != nil {
@@ -43,42 +47,51 @@ func replicationStatus() {
 		fatal(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
 	}
 
-	var statuses []struct {
-		Peer         string `json:"peer"`
-		QueueDepth   int    `json:"queue_depth"`
-		LastSyncTime int64  `json:"last_sync_time"`
-		LastError    string `json:"last_error"`
-		TotalSynced  int64  `json:"total_synced"`
-		TotalFailed  int64  `json:"total_failed"`
+	var status struct {
+		Enabled bool `json:"enabled"`
+		Peers   []struct {
+			Name        string `json:"name"`
+			URL         string `json:"url"`
+			QueueDepth  int    `json:"queueDepth"`
+			LastSync    string `json:"lastSync"`
+			TotalSynced int64  `json:"totalSynced"`
+			TotalFailed int64  `json:"totalFailed"`
+			LastError   string `json:"lastError"`
+		} `json:"peers"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&statuses); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		fatal("parse response: " + err.Error())
 	}
 
-	if len(statuses) == 0 {
+	if !status.Enabled {
+		fmt.Println("Replication is not enabled.")
+		return
+	}
+	if len(status.Peers) == 0 {
 		fmt.Println("No replication peers configured.")
 		return
 	}
 
-	headers := []string{"PEER", "QUEUE", "SYNCED", "FAILED", "LAST SYNC", "LAST ERROR"}
+	headers := []string{"PEER", "URL", "QUEUE", "SYNCED", "FAILED", "LAST SYNC", "LAST ERROR"}
 	var rows [][]string
-	for _, s := range statuses {
+	for _, p := range status.Peers {
 		lastSync := "never"
-		if s.LastSyncTime > 0 {
-			lastSync = time.Unix(s.LastSyncTime, 0).Format("2006-01-02 15:04:05")
+		if p.LastSync != "" {
+			lastSync = p.LastSync
 		}
 		lastErr := "-"
-		if s.LastError != "" {
-			lastErr = s.LastError
+		if p.LastError != "" {
+			lastErr = p.LastError
 			if len(lastErr) > 40 {
 				lastErr = lastErr[:40] + "..."
 			}
 		}
 		rows = append(rows, []string{
-			s.Peer,
-			strconv.Itoa(s.QueueDepth),
-			strconv.FormatInt(s.TotalSynced, 10),
-			strconv.FormatInt(s.TotalFailed, 10),
+			p.Name,
+			p.URL,
+			strconv.Itoa(p.QueueDepth),
+			strconv.FormatInt(p.TotalSynced, 10),
+			strconv.FormatInt(p.TotalFailed, 10),
 			lastSync,
 			lastErr,
 		})
@@ -98,14 +111,18 @@ func replicationQueue() {
 		fatal(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
 	}
 
+	// The keys the API writes (replicationEventResponse), not the ones the store
+	// keeps internally (metadata.ReplicationEvent). Decoding the store's
+	// retry_count and created_at found neither, so every queued event listed with
+	// 0 retries and a 1970 date.
 	var events []struct {
 		ID         uint64 `json:"id"`
 		Type       string `json:"type"`
 		Bucket     string `json:"bucket"`
 		Key        string `json:"key"`
 		Peer       string `json:"peer"`
-		RetryCount int    `json:"retry_count"`
-		CreatedAt  int64  `json:"created_at"`
+		RetryCount int    `json:"retryCount"`
+		CreatedAt  string `json:"createdAt"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
 		fatal("parse response: " + err.Error())
@@ -119,7 +136,10 @@ func replicationQueue() {
 	headers := []string{"ID", "TYPE", "BUCKET", "KEY", "PEER", "RETRIES", "CREATED"}
 	var rows [][]string
 	for _, e := range events {
-		created := time.Unix(e.CreatedAt, 0).Format("2006-01-02 15:04:05")
+		created := e.CreatedAt
+		if created == "" {
+			created = "-"
+		}
 		rows = append(rows, []string{
 			strconv.FormatUint(e.ID, 10),
 			e.Type,

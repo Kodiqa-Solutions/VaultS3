@@ -39,11 +39,12 @@ vaults3-cli object verify my-bucket --repair          # remove orphaned metadata
 vaults3-cli storage reclaim                    # report data files no metadata refers to (dry run)
 vaults3-cli storage reclaim --apply            # delete them and free the space
 
-# IAM user operations
+# IAM user operations. A new user has no credentials yet: the server generates
+# access keys itself, so issue one for the user in the dashboard under Access Keys.
 vaults3-cli user list
-vaults3-cli user create alice --access-key=ak --secret-key=sk
-vaults3-cli user attach-policy alice ReadWriteAccess
-vaults3-cli user delete alice
+vaults3-cli user create alice
+vaults3-cli user attach-policy alice ReadWriteAccess   # built in: ReadOnlyAccess, ReadWriteAccess, FullAccess
+vaults3-cli user delete alice                          # errors if the user does not exist
 
 # Replication monitoring
 vaults3-cli replication status

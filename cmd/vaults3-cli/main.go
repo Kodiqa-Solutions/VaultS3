@@ -135,9 +135,13 @@ Commands:
   help                 Show this help`)
 }
 
+// exit is os.Exit, held in a variable so a test can stop a failing command
+// without ending the test binary.
+var exit = os.Exit
+
 func fatal(msg string) {
 	fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
-	os.Exit(1)
+	exit(1)
 }
 
 func requireCreds() {
