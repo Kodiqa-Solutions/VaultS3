@@ -23,7 +23,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Bucket tagging**: S3-compatible tag sets with PUT/GET/DELETE
 - **Bucket/Object ACL**: S3-compatible ACL responses (GET/PUT)
 - **Multiple access keys**: Dynamic key management via BoltDB
-- **Object tagging**: Up to 10 tags per object
+- **Object tagging**: Up to 10 tags per object (keys up to 128 characters, values up to 256), returned in key order, with `x-amz-tagging-count` on GET and HEAD
 - **Range requests**: Partial content downloads (206 responses)
 - **Copy object**: Same-bucket and cross-bucket copies
 - **Batch delete**: Multi-object delete with XML body
@@ -101,7 +101,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Conditional copy**: `x-amz-copy-source-if-*` headers for conditional CopyObject
 - **Response header overrides**: `?response-content-type`, `?response-content-disposition`, etc. on GET
 - **Inline tagging on PUT**: `x-amz-tagging` header to set tags during object upload
-- **Inline retention on PUT**: `x-amz-object-lock-mode` header to set retention during upload
+- **Inline retention on PUT**: `x-amz-object-lock-mode` header to set retention during upload, on single and multipart uploads. GET and HEAD report the lock in the same headers
 - **Canned ACL headers**: `x-amz-acl` and `x-amz-grant-*` headers on PUT
 - **Replication status header**: `x-amz-replication-status` on GET/HEAD responses
 - **Website redirect**: `x-amz-website-redirect-location` header for per-object redirects

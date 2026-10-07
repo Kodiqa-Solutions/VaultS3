@@ -769,6 +769,8 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		if meta.PartsCount > 0 {
 			w.Header().Set("X-Amz-Mp-Parts-Count", strconv.Itoa(meta.PartsCount))
 		}
+		setTaggingCountHeader(w, meta)
+		setObjectLockHeaders(w, meta)
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	if h.sseHeaderApplies(bucket) {
@@ -1082,22 +1084,10 @@ func (h *ObjectHandler) deleteObjectVersion(bucket, key, versionID string, bypas
 		return objectDeletion{}, &deleteNotRecorded{op: "DeleteObjectVersion", err: err}
 	}
 
-	// The newest surviving version becomes current. Both records have to move:
-	// the version entry carries IsLatest, and the objects bucket holds the
-	// "latest" pointer, which still names the version just removed. Repointing
-	// only one of them is what left a deleted delete marker hiding a live object.
-	latest, _ := h.store.LatestObjectVersion(bucket, key)
-	if latest != nil {
-		latest.IsLatest = true
-		if err := h.store.UpdateObjectVersionMeta(*latest); err != nil {
-			return objectDeletion{}, &deleteNotRecorded{op: "promote next version", err: err}
-		}
-		if err := h.store.PutObjectMeta(*latest); err != nil {
-			return objectDeletion{}, &deleteNotRecorded{op: "repoint latest version", err: err}
-		}
-	} else if err := h.store.DeleteObjectMeta(bucket, key); err != nil {
-		return objectDeletion{}, &deleteNotRecorded{op: "DeleteObjectMeta", err: err}
-	}
+	// The store makes the newest surviving version current, both the version
+	// entry and the latest pointer, in the same transaction as the delete (see
+	// metadata.Store.DeleteObjectVersion). Doing it here, after the delete, raced
+	// with concurrent deletes of the same key and brought a deleted version back.
 	return objectDeletion{VersionID: versionID, Reap: true, ReapVersion: versionID}, nil
 }
 
@@ -1389,6 +1379,8 @@ func (h *ObjectHandler) HeadObject(w http.ResponseWriter, r *http.Request, bucke
 	if meta.PartsCount > 0 {
 		w.Header().Set("X-Amz-Mp-Parts-Count", strconv.Itoa(meta.PartsCount))
 	}
+	setTaggingCountHeader(w, meta)
+	setObjectLockHeaders(w, meta)
 	if meta.SSECustomerKeyMD5 != "" {
 		w.Header().Set(hdrSSECAlgo, "AES256")
 		w.Header().Set(hdrSSECKeyMD5, meta.SSECustomerKeyMD5)
@@ -1733,8 +1725,8 @@ func (h *ObjectHandler) PutObjectTagging(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	if len(req.TagSet.Tags) > 10 {
-		writeS3Error(w, "BadRequest", "Object tags cannot be greater than 10", http.StatusBadRequest)
+	if err := checkTagSet(req.TagSet.Tags); err != nil {
+		writeTagError(w, err)
 		return
 	}
 
@@ -1777,9 +1769,7 @@ func (h *ObjectHandler) GetObjectTagging(w http.ResponseWriter, r *http.Request,
 	resp := taggingResponse{
 		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
 	}
-	for k, v := range meta.Tags {
-		resp.TagSet.Tags = append(resp.TagSet.Tags, xmlTag{Key: k, Value: v})
-	}
+	resp.TagSet.Tags = sortedTags(meta.Tags)
 
 	if meta.VersionID != "" {
 		w.Header().Set("X-Amz-Version-Id", meta.VersionID)

@@ -305,7 +305,7 @@ the simple Python endpoint used for the measurement, so a faster endpoint will d
 better, but the shape holds: with no cache your storage runs at the speed of your
 authorizer. Do not set `0` without meaning it.
 
-The same effect shows on the S3 conformance suite. All 192 gated tests pass in
+The same effect shows on the S3 conformance suite. All 192 tests then gated pass in
 every configuration, but with caching off they take 47.7s and make 778 webhook
 calls, against 12.6s and 12 calls at the default, and a 12.4s baseline with the
 feature off.

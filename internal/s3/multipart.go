@@ -60,6 +60,9 @@ func (h *ObjectHandler) CreateMultipartUpload(w http.ResponseWriter, r *http.Req
 		CacheControl:       r.Header.Get("Cache-Control"),
 		ContentLanguage:    r.Header.Get("Content-Language"),
 		WebsiteRedirect:    r.Header.Get("X-Amz-Website-Redirect-Location"),
+		LockMode:           r.Header.Get("X-Amz-Object-Lock-Mode"),
+		LockRetainUntil:    r.Header.Get("X-Amz-Object-Lock-Retain-Until-Date"),
+		LockLegalHold:      r.Header.Get("X-Amz-Object-Lock-Legal-Hold"),
 	}
 
 	if err := h.multipartStore().CreateMultipartUpload(upload); err != nil {
@@ -456,7 +459,7 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		},
 		etag:             etag,
 		bypassGovernance: h.governanceBypass(r, bucket, key),
-		lockFrom:         r,
+		lockFrom:         uploadLockRequest(upload),
 	})
 	if err != nil {
 		// The parts are assembled but the object is not recorded. Failing here
@@ -721,4 +724,21 @@ func (h *ObjectHandler) ListParts(w http.ResponseWriter, r *http.Request, bucket
 		})
 	}
 	writeXML(w, http.StatusOK, resp)
+}
+
+// uploadLockRequest carries an upload's object-lock headers to completion. The
+// lock is asked for when the upload starts, not when it completes, so applying
+// it from the completing request lost it.
+func uploadLockRequest(u *metadata.MultipartUpload) *http.Request {
+	h := http.Header{}
+	for name, v := range map[string]string{
+		"X-Amz-Object-Lock-Mode":              u.LockMode,
+		"X-Amz-Object-Lock-Retain-Until-Date": u.LockRetainUntil,
+		"X-Amz-Object-Lock-Legal-Hold":        u.LockLegalHold,
+	} {
+		if v != "" {
+			h.Set(name, v)
+		}
+	}
+	return &http.Request{Header: h}
 }

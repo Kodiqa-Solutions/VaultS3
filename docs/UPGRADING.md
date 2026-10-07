@@ -63,6 +63,34 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.2
+
+A fix release. Nothing to migrate, and rolling back to 5.0.1 is safe.
+
+### Check: objects uploaded in parts with an object lock
+
+Before 5.0.2, `CreateMultipartUpload` ignored its object lock headers, so an
+object uploaded in parts with a retention or a legal hold got neither. aws-cli
+and most SDKs upload in parts above 8 MB. A bucket's default retention still
+applied, so only locks asked for per upload were lost.
+
+Upgrading does not lock those objects. To find them, look for objects that were
+uploaded in parts (`aws s3api head-object` shows `PartsCount`) in buckets with
+object lock, and that report no `ObjectLockMode`. Lock each again:
+
+```bash
+aws --endpoint-url $EP s3api put-object-retention --bucket <bucket> --key <key> \
+  --version-id <id> --retention Mode=COMPLIANCE,RetainUntilDate=2030-01-01T00:00:00Z
+```
+
+### Behaviour changes
+
+- `GetBucketTagging` on a bucket without tags answers `404 NoSuchTagSet`, as on
+  AWS, where it returned an empty tag set. AWS SDKs and Terraform expect this.
+- `PutObjectTagging` refuses more than 10 tags, a key over 128 characters or a
+  value over 256 with `InvalidTag`. Over-long keys and values were stored.
+- Tags are listed in key order.
+
 ## Upgrading to 5.0.0
 
 A security and durability release. There is no migration to run, but it changes

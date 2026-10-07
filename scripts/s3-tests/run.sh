@@ -63,7 +63,15 @@ run_pytest() {
 
 if [ "$MODE" = "all" ]; then
   echo "s3-tests: full sweep, this reports promotion candidates and does not gate"
+  # VaultS3 deliberately lets a legal hold or retention be set in any bucket,
+  # where AWS requires object lock on the bucket. These two tests set one in a
+  # bucket without it, VaultS3 honours it, and the suite's cleanup then cannot
+  # delete that bucket. Every later test fails in setup with BucketNotEmpty,
+  # which hid about 300 results of every sweep. Skipping them keeps the sweep
+  # readable.
   run_pytest s3tests/functional/test_s3.py --tb=no -q -p no:cacheprovider \
+    --deselect s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_bucket \
+    --deselect s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_bucket \
     --junitxml=/out/results.xml || true
   python3 "$HERE/report.py" "$WORK/out/results.xml" "$HERE/implemented_tests.txt"
   exit 0

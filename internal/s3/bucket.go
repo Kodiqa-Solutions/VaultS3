@@ -1448,12 +1448,15 @@ func (h *BucketHandler) GetBucketTagging(w http.ResponseWriter, r *http.Request,
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 		return
 	}
+	// A bucket with no tags answers NoSuchTagSet, as AWS does, not an empty set.
+	if len(tags) == 0 {
+		writeS3Error(w, "NoSuchTagSet", "The TagSet does not exist", http.StatusNotFound)
+		return
+	}
 	resp := taggingResponse{
 		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
 	}
-	for k, v := range tags {
-		resp.TagSet.Tags = append(resp.TagSet.Tags, xmlTag{Key: k, Value: v})
-	}
+	resp.TagSet.Tags = sortedTags(tags)
 	writeXML(w, http.StatusOK, resp)
 }
 

@@ -291,6 +291,13 @@ type MultipartUpload struct {
 	CacheControl       string            `json:"cache_control,omitempty"`
 	ContentLanguage    string            `json:"content_language,omitempty"`
 	WebsiteRedirect    string            `json:"website_redirect,omitempty"`
+
+	// The x-amz-object-lock-* headers of the request that started the upload.
+	// They used to be dropped, so an object uploaded in parts with a retention
+	// or a legal hold ended up with neither.
+	LockMode        string `json:"lock_mode,omitempty"`
+	LockRetainUntil string `json:"lock_retain_until,omitempty"`
+	LockLegalHold   string `json:"lock_legal_hold,omitempty"`
 }
 
 type PartInfo struct {
@@ -1702,10 +1709,61 @@ func (s *Store) LatestObjectVersion(bucket, key string) (*ObjectMeta, error) {
 	return meta, err
 }
 
+// DeleteObjectVersion removes a version. When the latest pointer names it, the
+// newest surviving version becomes current in the same transaction, or the
+// pointer goes when none survives.
+//
+// The S3 handler used to do the promotion itself, in three steps after the
+// delete: read the newest survivor, mark it latest, repoint to it. When several
+// versions of one key were deleted at once, another request could delete that
+// survivor between the read and the write, and the write put it back. The key
+// kept a version every client had deleted, and its bucket could never be
+// deleted again. Doing it here makes it part of the applied command, so it also
+// happens the same way on every node of a cluster.
 func (s *Store) DeleteObjectVersion(bucket, key, versionID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectVersionsBucket)
-		return b.Delete(versionKey(bucket, key, versionID))
+		if err := b.Delete(versionKey(bucket, key, versionID)); err != nil {
+			return err
+		}
+		ob := tx.Bucket(objectsBucket)
+		mk := objectMetaKey(bucket, key)
+		cur := getObjectMetaTx(ob, mk)
+		if cur == nil || cur.VersionID != versionID {
+			return nil
+		}
+		oSize, oCount := metaWeight(cur)
+		prefix := versionPrefix(bucket, key)
+		c := b.Cursor()
+		k, v := c.Seek(append(append([]byte{}, prefix...), 0xff))
+		if k == nil {
+			k, v = c.Last()
+		} else {
+			k, v = c.Prev()
+		}
+		if k == nil || !bytes.HasPrefix(k, prefix) {
+			if err := ob.Delete(mk); err != nil {
+				return err
+			}
+			return adjustBucketStatsTx(tx, bucket, -oSize, -oCount)
+		}
+		var next ObjectMeta
+		if err := json.Unmarshal(v, &next); err != nil {
+			return err
+		}
+		next.IsLatest = true
+		data, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		if err := b.Put(append([]byte{}, k...), data); err != nil {
+			return err
+		}
+		if err := ob.Put(mk, data); err != nil {
+			return err
+		}
+		nSize, nCount := metaWeight(&next)
+		return adjustBucketStatsTx(tx, bucket, nSize-oSize, nCount-oCount)
 	})
 }
 

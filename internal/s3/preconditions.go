@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
@@ -291,6 +294,11 @@ func parseInlineTags(r *http.Request) (map[string]string, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
+	for k, v := range values {
+		if err := checkTagLength(k, v[len(v)-1]); err != nil {
+			return nil, err
+		}
+	}
 	tags := make(map[string]string, len(values))
 	for k, v := range values {
 		// On a repeated key PutObjectTagging keeps the last one, because it fills the
@@ -299,6 +307,75 @@ func parseInlineTags(r *http.Request) (map[string]string, error) {
 		tags[k] = v[len(v)-1]
 	}
 	return tags, nil
+}
+
+// Object tag limits, as AWS sets them.
+const (
+	maxTagKeyLength   = 128
+	maxTagValueLength = 256
+)
+
+// checkTagLength refuses a tag whose key or value is longer than S3 allows.
+// They used to be stored as sent.
+func checkTagLength(key, value string) error {
+	if utf8.RuneCountInString(key) > maxTagKeyLength {
+		return &tagError{code: "InvalidTag", msg: fmt.Sprintf("The TagKey you have provided is too long, max %d", maxTagKeyLength)}
+	}
+	if utf8.RuneCountInString(value) > maxTagValueLength {
+		return &tagError{code: "InvalidTag", msg: fmt.Sprintf("The TagValue you have provided is too long, max %d", maxTagValueLength)}
+	}
+	return nil
+}
+
+// checkTagSet validates the tag set of a PutObjectTagging request. Too many
+// tags is InvalidTag here, where the x-amz-tagging header answers BadRequest,
+// because that is what AWS answers on each path.
+func checkTagSet(tags []xmlTag) error {
+	if len(tags) > maxObjectTags {
+		return &tagError{code: "InvalidTag", msg: fmt.Sprintf("Object tags cannot be greater than %d", maxObjectTags)}
+	}
+	for _, t := range tags {
+		if err := checkTagLength(t.Key, t.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sortedTags lists a tag map in key order. Tags are stored as a map, so
+// listing them straight from it returned a different order on every request.
+func sortedTags(tags map[string]string) []xmlTag {
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]xmlTag, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, xmlTag{Key: k, Value: tags[k]})
+	}
+	return out
+}
+
+// setTaggingCountHeader reports how many tags an object carries on GET and
+// HEAD, as AWS does with x-amz-tagging-count.
+func setTaggingCountHeader(w http.ResponseWriter, meta *metadata.ObjectMeta) {
+	if n := len(meta.Tags); n > 0 {
+		w.Header().Set("X-Amz-Tagging-Count", strconv.Itoa(n))
+	}
+}
+
+// setObjectLockHeaders reports an object's retention and legal hold on GET and
+// HEAD, as AWS does. They were never sent, so a client could only learn that an
+// object was locked by asking for ?retention and ?legal-hold separately.
+func setObjectLockHeaders(w http.ResponseWriter, meta *metadata.ObjectMeta) {
+	if meta.RetentionMode != "" && meta.RetentionUntil > 0 {
+		w.Header().Set("X-Amz-Object-Lock-Mode", meta.RetentionMode)
+		w.Header().Set("X-Amz-Object-Lock-Retain-Until-Date", time.Unix(meta.RetentionUntil, 0).UTC().Format(time.RFC3339))
+	}
+	if meta.LegalHold {
+		w.Header().Set("X-Amz-Object-Lock-Legal-Hold", "ON")
+	}
 }
 
 // tagError carries the S3 error code a bad tag set should answer with, so the

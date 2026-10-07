@@ -6,6 +6,39 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.2] - 2026-10-07
+### Security
+- **An object uploaded in parts ignored the object lock it asked for.** The
+  `x-amz-object-lock-mode`, `retain-until-date` and `legal-hold` headers of
+  `CreateMultipartUpload` were never recorded, so the completed object had no
+  retention and no legal hold and could be deleted at once. aws-cli and most
+  SDKs switch to multipart above 8 MB, so this hit most large files uploaded
+  with a lock. A bucket's default retention still applied. The upload now keeps
+  the headers and the object gets the lock. **Objects uploaded this way before
+  upgrading are not locked**, see `docs/UPGRADING.md`.
+
+### Fixed
+- **Deleting several versions of one key at once could bring a deleted version
+  back.** The newest surviving version was promoted after the delete, in
+  separate steps, and a concurrent delete of that version was undone by the
+  promotion. The key kept a version every client had deleted, and its bucket
+  could never be deleted. The store now promotes in the same transaction as the
+  delete. 4.4.79 and 5.0.1 failed the S3 conformance test for this nearly every
+  run.
+- **Object tags came back in a different order on every request.** They are
+  now sorted by key, for objects and buckets.
+- **Tag limits are enforced as on AWS.** A key over 128 characters or a value
+  over 256 was stored. Both, and more than 10 tags in `PutObjectTagging`, now
+  answer `InvalidTag`.
+- `GET` and `HEAD` of an object now report `x-amz-tagging-count`, and its
+  `x-amz-object-lock-mode`, `retain-until-date` and `legal-hold`.
+- `GetBucketTagging` on a bucket without tags answers `404 NoSuchTagSet`, as on
+  AWS, instead of an empty tag set.
+
+### Changed
+- The S3 conformance gate grew from 192 to 317 tests, 15 of them for object
+  tagging, after the full sweep could run to the end for the first time.
+
 ## [5.0.1] - 2026-10-07
 ### Fixed
 - **A presigned URL valid for more than 7 days was refused with `400` instead

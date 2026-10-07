@@ -53,8 +53,19 @@ Captured 2026-08-24 against a single node with default settings:
 | failing | 155 |
 | errored | 492 |
 
-The gate takes about 13 seconds locally and about 28 seconds on a GitHub
-runner, inside a job of roughly two minutes. The tests outside the whitelist are a mix of
+Grown on 2026-10-07 to **317 gated tests**, including 15 for object tagging,
+against 5.0.1 plus the tagging and object lock fixes that followed. That was the
+first sweep to run to the end. Before it, every sweep stopped part way: two
+tests leave a lock the suite's own cleanup cannot remove, after which every
+later test failed in setup with `BucketNotEmpty` or "still has objects locked".
+That hid about 300 results per sweep. `run.sh` now skips the two tests that set
+a legal hold or retention in a bucket without object lock (VaultS3 allows that
+on purpose, AWS does not), and the fixes made the rest clean up. Each new entry
+passed three times on fresh servers, and the whole list passes together in
+about 70 seconds.
+
+At 192 tests the gate took about 13 seconds locally and about 28 seconds on a
+GitHub runner, inside a job of roughly two minutes. The tests outside the whitelist are a mix of
 features VaultS3 does not implement (ACL-based authorization, several SSE-KMS
 variants, RGW-specific behaviour) and genuine gaps worth fixing. The sweep is how
 they get triaged, one promotion at a time.
