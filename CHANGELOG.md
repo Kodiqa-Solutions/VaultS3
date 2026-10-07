@@ -5,6 +5,12 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+### Fixed
+- **A presigned URL valid for more than 7 days was refused with `400` instead
+  of `403 AccessDenied`.** 5.0.0 made `X-Amz-Expires` required and moved this
+  refusal to the same `400` by mistake. The URL was refused either way, only
+  the status changed. It is `403` again, as in 4.4.x. This was the one S3
+  conformance test of 192 that failed on 5.0.0.
 
 ## [5.0.0] - 2026-10-07
 A major version because it changes behaviour a working setup can depend on:

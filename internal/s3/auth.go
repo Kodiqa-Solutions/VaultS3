@@ -489,9 +489,11 @@ func (a *Authenticator) authenticatePresigned(r *http.Request) (*iam.Identity, e
 	if expiresStr == "" || perr != nil || expiresSecs <= 0 {
 		return nil, errAuthQueryParams("X-Amz-Expires must be a positive number of seconds.")
 	}
-	// AWS caps presigned URL expiry at 7 days (604800 seconds)
+	// AWS caps presigned URL expiry at 7 days (604800 seconds). A longer one is
+	// refused as AccessDenied, as before 5.0.0 and as the s3-tests conformance
+	// suite expects (test_object_raw_get_x_amz_expires_out_max_range).
 	if expiresSecs > 604800 {
-		return nil, errAuthQueryParams("X-Amz-Expires must be less than a week (in seconds) that is 604800")
+		return nil, errAuthAccessDenied("X-Amz-Expires must be less than a week (in seconds) that is 604800")
 	}
 	// A URL dated in the future was accepted, which let one be minted to start
 	// working later and so outlive its stated lifetime.

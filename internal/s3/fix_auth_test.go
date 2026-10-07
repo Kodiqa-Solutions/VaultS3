@@ -232,6 +232,9 @@ func TestPresignedURLRejectsWhatItUsedToSkip(t *testing.T) {
 	expect(t, "control", presign(now, "300"), http.StatusOK, "")
 	// A missing lifetime defaulted to the seven day maximum.
 	expect(t, "no X-Amz-Expires", presign(now, ""), http.StatusBadRequest, "AuthorizationQueryParametersError")
+	// Over the seven day maximum is AccessDenied, which the conformance suite
+	// checks. 5.0.0 briefly made it a 400 along with the missing case.
+	expect(t, "over seven days", presign(now, "604801"), http.StatusForbidden, "AccessDenied")
 	// A URL dated tomorrow was accepted, so it outlived its stated lifetime.
 	expect(t, "dated in the future", presign(now.Add(24*time.Hour), "300"), http.StatusForbidden, "AccessDenied")
 }
