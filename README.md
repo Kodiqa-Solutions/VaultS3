@@ -120,8 +120,8 @@ docker exec vaults3 vaults3-cli key create alice --bucket my-bucket   # prints t
 
 Prefer a package or a plain binary? Every [release](https://github.com/Kodiqa-Solutions/VaultS3/releases)
 ships `.deb`, `.rpm` and `.apk` packages, static binaries for Linux, macOS and
-Windows, an SPDX SBOM per platform, and a Sigstore provenance bundle you can
-verify offline:
+Windows, a `checksums.txt` signed with the project's release key, an SPDX SBOM
+per platform, and a Sigstore provenance bundle you can verify offline:
 
 ```bash
 sudo apt install ./vaults3_5.0.2_amd64.deb

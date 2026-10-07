@@ -325,8 +325,10 @@ vector:
 
 # Auto-update (optional). Checks GitHub Releases daily and shows a dashboard
 # banner when a newer version exists. Self-update only ever swaps the binary —
-# object data, metadata, and config are never touched, and downloads are
-# checksum-verified. For Docker, leave `apply` off and use Watchtower instead.
+# object data, metadata, and config are never touched. A download is installed
+# only if checksums.txt verifies against its Ed25519 signature, checked with a
+# public key built into release binaries, so a binary built from source refuses
+# to update itself. For Docker, leave `apply` off and use Watchtower instead.
 auto_update:
   enabled: false               # run the daily check + dashboard notifier
   apply: false                 # also download+install automatically (binary deploys only)
