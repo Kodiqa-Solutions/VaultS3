@@ -82,6 +82,12 @@ func EvaluateDetailed(policies []Policy, action, resource string, ctx map[string
 // bypassed simply by evaluating it without context.
 func evaluateConditions(conditions map[string]map[string][]string, ctx map[string]string) (ok, determined bool) {
 	for operator, kvs := range conditions {
+		// An operator this evaluator does not implement cannot be shown to hold
+		// or to fail. It used to count as failed, which is right for an Allow but
+		// let a Deny written with such an operator never apply at all.
+		if !knownOperator(operator) {
+			return false, false
+		}
 		for key, values := range kvs {
 			ctxVal, present := ctx[key]
 			if !present {
@@ -93,6 +99,24 @@ func evaluateConditions(conditions map[string]map[string][]string, ctx map[strin
 		}
 	}
 	return true, true
+}
+
+// ConditionsHold evaluates a statement's Condition block against a request
+// context. determined is false when the answer cannot be known, because a key
+// has no value in ctx or an operator is not implemented. A caller must then
+// refuse an Allow and enforce a Deny. It is the evaluator IAM policies use,
+// shared so that bucket policies cannot decide conditions differently.
+func ConditionsHold(conditions map[string]map[string][]string, ctx map[string]string) (ok, determined bool) {
+	return evaluateConditions(conditions, ctx)
+}
+
+func knownOperator(operator string) bool {
+	switch operator {
+	case "StringEquals", "StringNotEquals", "StringLike", "StringNotLike", "StringEqualsIgnoreCase",
+		"IpAddress", "NotIpAddress", "DateLessThan", "DateGreaterThan", "Bool":
+		return true
+	}
+	return false
 }
 
 func evaluateOperator(operator, actual string, expected []string) bool {

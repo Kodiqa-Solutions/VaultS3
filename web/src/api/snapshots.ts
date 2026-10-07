@@ -1,4 +1,5 @@
 import { apiFetch } from './client'
+import { encodeSegment } from './paths'
 
 export interface Snapshot {
   id: string
@@ -25,24 +26,27 @@ export interface RestoreResult {
   reverted: number
   removed: number
   skipped: number
+  // A restore that could not finish answers 500 with these filled in.
+  failed?: number
+  errors?: string[]
 }
 
-export function listSnapshots(bucket: string): Promise<Snapshot[]> {
-  return apiFetch(`/buckets/${bucket}/snapshots`)
+export async function listSnapshots(bucket: string): Promise<Snapshot[]> {
+  return apiFetch(`/buckets/${encodeSegment(bucket)}/snapshots`)
 }
 
-export function createSnapshot(bucket: string, message: string): Promise<Snapshot> {
-  return apiFetch(`/buckets/${bucket}/snapshots`, { method: 'POST', body: JSON.stringify({ message }) })
+export async function createSnapshot(bucket: string, message: string): Promise<Snapshot> {
+  return apiFetch(`/buckets/${encodeSegment(bucket)}/snapshots`, { method: 'POST', body: JSON.stringify({ message }) })
 }
 
-export function diffSnapshot(bucket: string, id: string): Promise<SnapshotDiff> {
-  return apiFetch(`/buckets/${bucket}/snapshots/${id}/diff`)
+export async function diffSnapshot(bucket: string, id: string): Promise<SnapshotDiff> {
+  return apiFetch(`/buckets/${encodeSegment(bucket)}/snapshots/${encodeSegment(id)}/diff`)
 }
 
-export function restoreSnapshot(bucket: string, id: string): Promise<RestoreResult> {
-  return apiFetch(`/buckets/${bucket}/snapshots/${id}/restore`, { method: 'POST' })
+export async function restoreSnapshot(bucket: string, id: string): Promise<RestoreResult> {
+  return apiFetch(`/buckets/${encodeSegment(bucket)}/snapshots/${encodeSegment(id)}/restore`, { method: 'POST' })
 }
 
-export function deleteSnapshot(bucket: string, id: string): Promise<void> {
-  return apiFetch(`/buckets/${bucket}/snapshots/${id}`, { method: 'DELETE' })
+export async function deleteSnapshot(bucket: string, id: string): Promise<void> {
+  return apiFetch(`/buckets/${encodeSegment(bucket)}/snapshots/${encodeSegment(id)}`, { method: 'DELETE' })
 }

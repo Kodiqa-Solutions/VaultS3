@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -296,8 +297,13 @@ func (p *PackedEngine) Compact(minDeadRatio float64) (int64, error) {
 		// No index entry references this volume anymore; delete it under the write
 		// lock so no read is mid-flight with a location pointing into it.
 		p.compactMu.Lock()
-		os.Remove(vp)
+		err = os.Remove(vp)
 		p.compactMu.Unlock()
+		if err != nil && !os.IsNotExist(err) {
+			// The volume is still on disk, so nothing was reclaimed. It holds no
+			// live frames any more, so the next compaction retries it.
+			return reclaimed, fmt.Errorf("compact remove volume %d: %w", id, err)
+		}
 		reclaimed += total - liveBytes[id]
 	}
 	return reclaimed, nil
@@ -309,22 +315,35 @@ func (p *PackedEngine) CreateBucketDir(bucket string) error { return p.inner.Cre
 
 func (p *PackedEngine) DeleteBucketDir(bucket string) error {
 	// Drop packed index entries for the bucket (frames become dead space).
+	// The keys are collected first and deleted after the walk, because a delete
+	// under a bbolt cursor can make the following Next() skip a key, and every
+	// skipped entry would reappear as an object in a recreated bucket.
 	prefix := []byte(bucket + "\x00")
-	p.index.Update(func(tx *bolt.Tx) error {
-		c := tx.Bucket(locBucket).Cursor()
+	if err := p.index.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(locBucket)
+		var keys [][]byte
+		c := b.Cursor()
 		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-			c.Delete()
+			keys = append(keys, append([]byte(nil), k...))
+		}
+		for _, k := range keys {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
 		}
 		return nil
-	})
+	}); err != nil {
+		// Removing the directory anyway would leave index entries that a
+		// recreated bucket of the same name would serve as its own objects.
+		return fmt.Errorf("drop packed index for bucket %s: %w", bucket, err)
+	}
 	return p.inner.DeleteBucketDir(bucket)
 }
 
 func (p *PackedEngine) PutObject(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
 	// Large or unknown-size objects go to the inner engine as individual files.
 	if size < 0 || size > p.maxObjSize {
-		p.delLoc(bucket, key) // remove any stale packed entry
-		return p.inner.PutObject(bucket, key, reader, size)
+		return p.putLarge(bucket, key, reader, size)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(reader, p.maxObjSize+1))
@@ -333,8 +352,7 @@ func (p *PackedEngine) PutObject(bucket, key string, reader io.Reader, size int6
 	}
 	if int64(len(data)) > p.maxObjSize {
 		// Size hint lied — actually larger than the pack threshold; delegate.
-		p.delLoc(bucket, key)
-		return p.inner.PutObject(bucket, key, io.MultiReader(bytes.NewReader(data), reader), -1)
+		return p.putLarge(bucket, key, io.MultiReader(bytes.NewReader(data), reader), -1)
 	}
 
 	h := md5.Sum(data)
@@ -350,8 +368,32 @@ func (p *PackedEngine) PutObject(bucket, key string, reader io.Reader, size int6
 		return 0, "", err
 	}
 	// Remove any stale individual file from a previous (large) write of this key.
-	p.inner.DeleteObject(bucket, key)
+	// Reads already resolve to the packed copy, so a failure here only leaves a
+	// stray file behind. It is logged rather than failing a write that landed.
+	if err := p.inner.DeleteObject(bucket, key); err != nil && !os.IsNotExist(err) {
+		slog.Warn("packed: could not remove superseded large object file", "bucket", bucket, "key", key, "error", err)
+	}
 	return int64(len(data)), etag, nil
+}
+
+// putLarge stores an object too big to pack as an individual file. The packed
+// index entry of a previous small version is dropped only after that write
+// succeeds: dropping it first meant a failed upload destroyed the old object
+// while its metadata still described it.
+func (p *PackedEngine) putLarge(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
+	n, etag, err := p.inner.PutObject(bucket, key, reader, size)
+	if err != nil {
+		return n, etag, err
+	}
+	if _, ok := p.getLoc(bucket, key); ok {
+		// A packed entry shadows the individual file on every read, so leaving
+		// it in place would keep serving the old content. Report the write as
+		// failed so the caller does not record metadata for bytes nobody sees.
+		if err := p.delLoc(bucket, key); err != nil {
+			return 0, "", fmt.Errorf("drop superseded packed entry: %w", err)
+		}
+	}
+	return n, etag, nil
 }
 
 func (p *PackedEngine) GetObject(bucket, key string) (ReadSeekCloser, int64, error) {

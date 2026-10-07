@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -65,6 +67,16 @@ func validateObjectKey(key string) error {
 }
 
 // ValidateWebhookURL checks that a URL is safe to call (prevents SSRF).
+//
+// The host is resolved and EVERY address it resolves to is checked. Only
+// literal IPs used to be checked, so a name such as internal.example.com that
+// resolved to 10.0.0.5, 127.0.0.1 or 169.254.169.254 passed, and the function
+// was then called with the server's network position. A name that does not
+// resolve is refused too, since nothing about it can be checked.
+//
+// A check at save time cannot stop a name that changes its answer later (DNS
+// rebinding). That needs the dial-time guard the migration client uses
+// (internal/migrate/ssrfguard.go) on the client that calls the URL.
 func ValidateWebhookURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -77,25 +89,66 @@ func ValidateWebhookURL(rawURL string) error {
 	if host == "" {
 		return fmt.Errorf("URL must have a host")
 	}
-	// Block well-known internal/metadata addresses
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
 		return fmt.Errorf("URL must not point to localhost")
 	}
-	if strings.HasPrefix(host, "169.254.") || host == "metadata.google.internal" {
+	if strings.EqualFold(host, "metadata.google.internal") {
 		return fmt.Errorf("URL must not point to cloud metadata service")
 	}
-	// Block private IP ranges
+	var ips []net.IP
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-			return fmt.Errorf("URL must not point to loopback or link-local address")
+		ips = []net.IP{ip}
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ips, err = lookupWebhookHost(ctx, host)
+		if err != nil {
+			return fmt.Errorf("could not resolve %s: %v", host, err)
 		}
-		privateRanges := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"}
-		for _, cidr := range privateRanges {
-			_, network, _ := net.ParseCIDR(cidr)
-			if network.Contains(ip) {
-				return fmt.Errorf("URL must not point to private network (%s)", cidr)
+		if len(ips) == 0 {
+			return fmt.Errorf("%s resolves to no address", host)
+		}
+	}
+	for _, ip := range ips {
+		if blockedWebhookIP(ip) {
+			if ip.String() == host {
+				return fmt.Errorf("URL must not point to a loopback, private, link-local or metadata address (%s)", ip)
 			}
+			return fmt.Errorf("URL host %s resolves to %s, a loopback, private, link-local or metadata address", host, ip)
 		}
 	}
 	return nil
+}
+
+// lookupWebhookHost resolves a webhook host. A variable so tests can answer
+// without real DNS.
+var lookupWebhookHost = func(ctx context.Context, host string) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		ips = append(ips, a.IP)
+	}
+	return ips, nil
+}
+
+// blockedWebhookIP reports whether an address is off limits for a URL the
+// server calls on a caller's behalf. Same rule as the migration client's
+// dial-time guard (blockedIP in internal/migrate/ssrfguard.go), which is not
+// exported.
+func blockedWebhookIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
+		return true
+	}
+	if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00:ec2::254")) {
+		return true
+	}
+	// IPv4-mapped IPv6 hides a loopback or private address behind ::ffff:.
+	if v4 := ip.To4(); v4 != nil && !ip.Equal(v4) {
+		return blockedWebhookIP(v4)
+	}
+	return false
 }

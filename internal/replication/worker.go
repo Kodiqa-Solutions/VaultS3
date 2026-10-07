@@ -2,8 +2,10 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,7 +18,16 @@ import (
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
-// validatePeerURL checks that a replication peer URL does not point to internal/metadata endpoints.
+// validatePeerURL checks that a replication peer URL is one the worker can
+// use: an http(s) URL with a host, and not a cloud metadata service.
+//
+// A peer is operator configuration, read from the config file and never from
+// a request, so it is trusted the way external_auth is. It used to be put
+// through the SSRF filter meant for URLs a caller supplies, which dropped any
+// peer on a private or loopback address with only a warning, and every event
+// for that peer was then dead-lettered as "unknown peer". Replicating to a
+// second site on the same private network is the normal deployment, so only
+// the metadata endpoints, which are never a peer, are still refused.
 func validatePeerURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -29,18 +40,36 @@ func validatePeerURL(rawURL string) error {
 	if host == "" {
 		return fmt.Errorf("URL must have a host")
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
-		return fmt.Errorf("URL must not point to localhost")
-	}
-	if strings.HasPrefix(host, "169.254.") || host == "metadata.google.internal" {
+	if host == "metadata.google.internal" {
 		return fmt.Errorf("URL must not point to cloud metadata service")
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() {
-			return fmt.Errorf("URL must not point to loopback, link-local, or private address")
+		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00:ec2::254")) {
+			return fmt.Errorf("URL must not point to cloud metadata service")
 		}
 	}
 	return nil
+}
+
+// peerURL builds the URL of a bucket, or of an object when key is not empty,
+// on a peer. Formatting the names into a string let the first '?' end the
+// path and a '#' start a fragment, so replicating "a?b" overwrote or deleted
+// the peer's "a", and "a%41b" landed as "aAb". The path is set decoded and its
+// escaped form is set to exactly what signV4 canonicalizes, so the bytes on the
+// wire and the signed path are the same.
+func peerURL(peer, bucket, key string) (string, error) {
+	u, err := url.Parse(strings.TrimRight(peer, "/"))
+	if err != nil {
+		return "", fmt.Errorf("invalid peer URL: %w", err)
+	}
+	p := strings.TrimRight(u.Path, "/") + "/" + bucket
+	if key != "" {
+		p += "/" + key
+	}
+	u.Path = p
+	u.RawPath = uriEncodePath(p)
+	u.RawQuery, u.Fragment = "", ""
+	return u.String(), nil
 }
 
 // ReplicationEvent is sent via the event channel for real-time replication.
@@ -67,9 +96,8 @@ type Worker struct {
 func NewWorker(store metadata.StoreAPI, engine storage.Engine, cfg config.ReplicationConfig) *Worker {
 	peers := make(map[string]config.ReplicationPeer)
 	for _, p := range cfg.Peers {
-		// Validate peer URLs against SSRF on startup
 		if err := validatePeerURL(p.URL); err != nil {
-			slog.Warn("skipping replication peer with invalid URL", "peer", p.Name, "url", p.URL, "error", err)
+			slog.Error("replication peer has an unusable URL, its events will be dead-lettered", "peer", p.Name, "url", p.URL, "error", err)
 			continue
 		}
 		peers[p.Name] = p
@@ -191,17 +219,25 @@ func (w *Worker) replicatePut(peer config.ReplicationPeer, event metadata.Replic
 		return fmt.Errorf("ensure bucket: %w", err)
 	}
 
-	// Read object from local storage
+	// Read object from local storage. An object deleted since the event was
+	// queued is skipped, since its delete event follows. Any other failure is
+	// returned so the event is retried: acking it lost the copy for good, and
+	// a read error is usually brief.
 	reader, size, err := w.engine.GetObject(event.Bucket, event.Key)
 	if err != nil {
-		// Object no longer exists locally — skip
-		slog.Debug("replication object not found locally, skipping", "bucket", event.Bucket, "key", event.Key)
-		return nil
+		if errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("replication object not found locally, skipping", "bucket", event.Bucket, "key", event.Key)
+			return nil
+		}
+		return fmt.Errorf("read local object: %w", err)
 	}
 	defer reader.Close()
 
-	url := fmt.Sprintf("%s/%s/%s", strings.TrimRight(peer.URL, "/"), event.Bucket, event.Key)
-	req, err := http.NewRequest("PUT", url, reader)
+	u, err := peerURL(peer.URL, event.Bucket, event.Key)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("PUT", u, reader)
 	if err != nil {
 		return err
 	}
@@ -224,8 +260,11 @@ func (w *Worker) replicatePut(peer config.ReplicationPeer, event metadata.Replic
 }
 
 func (w *Worker) replicateDelete(peer config.ReplicationPeer, event metadata.ReplicationEvent) error {
-	url := fmt.Sprintf("%s/%s/%s", strings.TrimRight(peer.URL, "/"), event.Bucket, event.Key)
-	req, err := http.NewRequest("DELETE", url, nil)
+	u, err := peerURL(peer.URL, event.Bucket, event.Key)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("DELETE", u, nil)
 	if err != nil {
 		return err
 	}
@@ -248,8 +287,11 @@ func (w *Worker) replicateDelete(peer config.ReplicationPeer, event metadata.Rep
 }
 
 func (w *Worker) ensureBucket(peer config.ReplicationPeer, bucket string) error {
-	url := fmt.Sprintf("%s/%s", strings.TrimRight(peer.URL, "/"), bucket)
-	req, err := http.NewRequest("PUT", url, nil)
+	u, err := peerURL(peer.URL, bucket, "")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("PUT", u, nil)
 	if err != nil {
 		return err
 	}

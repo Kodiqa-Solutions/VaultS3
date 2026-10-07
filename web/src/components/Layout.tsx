@@ -5,12 +5,15 @@ import Sidebar from './Sidebar'
 import TopBar from './TopBar'
 import UpdateBanner from './UpdateBanner'
 import { useKeyboardShortcuts, shortcuts } from '../hooks/useKeyboardShortcuts'
+import { useAuth } from '../hooks/useAuth'
+import { isAdminSession } from '../api/auth'
 
 export default function Layout() {
   const { t } = useI18n()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [isCollapsed, setIsCollapsed] = useState(false)
   const { showHelp, setShowHelp } = useKeyboardShortcuts()
+  const { user } = useAuth()
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-gray-900">
@@ -53,9 +56,9 @@ export default function Layout() {
               </button>
             </div>
             <div className="space-y-3">
-              {shortcuts.map(s => (
+              {shortcuts.filter(s => !s.adminOnly || isAdminSession(user)).map(s => (
                 <div key={s.key} className="flex items-center justify-between">
-                  <span className="text-sm text-gray-600 dark:text-gray-400">{s.description}</span>
+                  <span className="text-sm text-gray-600 dark:text-gray-400">{t(s.descKey)}</span>
                   <kbd className="px-2 py-1 rounded bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 text-xs font-mono text-gray-700 dark:text-gray-300">
                     {s.key}
                   </kbd>

@@ -59,6 +59,13 @@ type degradedStream struct {
 // the uniform one Split produces, or when too many shards are gone, leaving the
 // caller to fall back to the buffering path (which will report the real error).
 func (e *Engine) newDegradedStream(bucket, key string, meta *ShardMeta) (*degradedStream, bool) {
+	return e.newDegradedStreamExcluding(bucket, key, meta, -1)
+}
+
+// newDegradedStreamExcluding is newDegradedStream with one shard treated as
+// missing even if it opens, for a reader that has just found that shard
+// corrupt or unreadable. Pass -1 to exclude nothing.
+func (e *Engine) newDegradedStreamExcluding(bucket, key string, meta *ShardMeta, exclude int) (*degradedStream, bool) {
 	total := meta.DataShards + meta.ParityShards
 	if meta.DataShards <= 0 || meta.ParityShards < 0 || len(meta.ShardSizes) < total {
 		return nil, false
@@ -93,7 +100,10 @@ func (e *Engine) newDegradedStream(bucket, key string, meta *ShardMeta) (*degrad
 
 	present := 0
 	for i := 0; i < total; i++ {
-		rc, _, err := e.backendFor(i).GetObject(bucket, shardKey(key, i))
+		if i == exclude {
+			continue
+		}
+		rc, _, err := e.backendFor(i).GetObject(bucket, meta.shardPath(key, i))
 		if err != nil {
 			continue
 		}
@@ -147,6 +157,14 @@ func (s *degradedStream) fill(inShard int64) error {
 		if _, err := io.ReadFull(rc, buf); err != nil {
 			// A shard that is present but short or unreadable is treated as missing,
 			// exactly as the buffering path did, so parity covers it.
+			s.readers[i] = nil
+			rc.Close()
+			continue
+		}
+		if !s.meta.stripeOK(i, off, buf) {
+			// Present but corrupt: the same as missing, and for the rest of the
+			// read, since a shard that is wrong here is not trusted elsewhere.
+			slog.Warn("erasure: shard failed its checksum", "bucket", s.bucket, "key", s.key, "shard", i, "offset", off)
 			s.readers[i] = nil
 			rc.Close()
 			continue

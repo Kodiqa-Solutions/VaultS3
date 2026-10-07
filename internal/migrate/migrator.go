@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -371,6 +372,9 @@ func (m *Manager) migrateBucketMeta(src *Source, bucket string, job *Job) {
 }
 
 func (m *Manager) copyOne(src *Source, bucket string, o ObjectInfo) error {
+	if reason := unsafeKey(o.Key); reason != "" {
+		return fmt.Errorf("refusing source key %q: %s", o.Key, reason)
+	}
 	obj, err := src.GetObject(bucket, o.Key)
 	if err != nil {
 		return err
@@ -472,4 +476,32 @@ func (m *Manager) ListJobs() []*Job {
 		out = append(out, &cp)
 	}
 	return out
+}
+
+// unsafeKey says why a key listed by the migration source cannot be written
+// here, or "" when it can. The source is a remote endpoint, already treated as
+// untrusted for where it may connect, and its keys went straight to the storage
+// engine. Keys are stored as paths, so "../victim/a.txt" landed in another
+// bucket, and a key under one of the engine's own directories (.vs/ versions,
+// .ec/ erasure shards, .multipart/ uploads) would overwrite its internal files.
+func unsafeKey(key string) string {
+	switch {
+	case key == "":
+		return "empty key"
+	case strings.ContainsRune(key, 0):
+		return "NUL byte in key"
+	case strings.HasPrefix(key, "/"):
+		return "key begins with '/'"
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == ".." {
+			return "'..' path segment"
+		}
+	}
+	first := strings.SplitN(key, "/", 2)[0]
+	switch {
+	case first == ".vs", first == ".ec", first == ".multipart", strings.HasPrefix(first, ".vaults3-tmp-"):
+		return "key names an internal storage directory"
+	}
+	return ""
 }

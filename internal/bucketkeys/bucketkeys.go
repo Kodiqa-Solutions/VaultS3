@@ -24,7 +24,10 @@ func (s storeKeyStore) load(bucket string) *metadata.BucketEncryptionConfig {
 
 func (s storeKeyStore) Current(bucket string) (int, []byte, bool) {
 	cfg := s.load(bucket)
-	if cfg.KeyVersion == 0 {
+	// The current key is the one new objects are sealed with, so a bucket whose
+	// default encryption was removed has none, though it keeps every version for
+	// reading the objects encrypted before. Get still finds those.
+	if cfg.KeyVersion == 0 || cfg.SSEAlgorithm != "AES256" {
 		return 0, nil, false
 	}
 	return cfg.KeyVersion, cfg.WrappedDEKs[cfg.KeyVersion], true
@@ -60,15 +63,28 @@ func (s storeKeyStore) SetCurrent(bucket string, version int, wrapped []byte) er
 	if cfg.SSEAlgorithm == "" {
 		cfg.SSEAlgorithm = "AES256"
 	}
+	cfg.Shredded = false // a new key after a shred is a fresh start
 	return s.store.PutEncryptionConfig(bucket, *cfg)
 }
 
 // Delete crypto-shreds: it clears the key material from the bucket's config while
 // leaving the row, so the ciphertext is unrecoverable.
+//
+// It also turns the bucket's default encryption off and marks the row
+// Shredded. Leaving SSEAlgorithm at AES256 with no key is exactly what
+// EncryptionPending reads as "the key has not reached this node yet", so every
+// write to a shredded bucket was refused with a retryable 503, forever. After a
+// shred the bucket stores new objects as plaintext, the same as one that never
+// opted in, and says so in its config, until encryption is enabled again,
+// which provisions a fresh key.
 func (s storeKeyStore) Delete(bucket string) error {
 	cfg := s.load(bucket)
 	cfg.KeyVersion = 0
 	cfg.WrappedDEKs = nil
+	if cfg.SSEAlgorithm == "AES256" {
+		cfg.SSEAlgorithm = ""
+	}
+	cfg.Shredded = true
 	return s.store.PutEncryptionConfig(bucket, *cfg)
 }
 

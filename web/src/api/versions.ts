@@ -60,8 +60,10 @@ export function deleteVersionTag(bucket: string, key: string, tag: string): Prom
   )
 }
 
-export function rollbackVersion(bucket: string, key: string, versionId: string): Promise<void> {
-  return apiFetch<void>('/versions/rollback', {
+// Rollback writes the chosen version again as a new latest version, and answers
+// with that new version's id.
+export function rollbackVersion(bucket: string, key: string, versionId: string): Promise<{ versionId?: string }> {
+  return apiFetch<{ versionId?: string }>('/versions/rollback', {
     method: 'POST',
     body: JSON.stringify({ bucket, key, versionId }),
   })

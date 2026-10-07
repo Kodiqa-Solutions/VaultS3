@@ -54,7 +54,11 @@ func (h *ObjectHandler) PutBucketObjectLockConfig(w http.ResponseWriter, r *http
 		return
 	}
 	// Configuring object lock marks the bucket object-lock enabled.
-	h.store.SetBucketObjectLockEnabled(bucket, true)
+	if err := h.store.SetBucketObjectLockEnabled(bucket, true); err != nil {
+		slog.Error("internal error", "error", err)
+		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 }

@@ -206,7 +206,7 @@ func (e *PerBucketEngine) streamKey(bucket string, keyVersion uint32) ([]byte, e
 // whole-object path they were written with, and plaintext passes through.
 // flightKey names the stored blob so concurrent whole-object reads of it share
 // one plaintext (see wholeflight.go).
-func (e *PerBucketEngine) get(bucket, flightKey string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+func (e *PerBucketEngine) get(bucket, key, flightKey string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	// An empty object carries no header and no ciphertext, so there is nothing to
 	// decrypt. Without this it fell through to the whole-object path, which
 	// rejected it as "encrypted data too short", making every zero-byte object in
@@ -214,7 +214,7 @@ func (e *PerBucketEngine) get(bucket, flightKey string, reader ReadSeekCloser, s
 	if stored == 0 {
 		return reader, 0, nil
 	}
-	reader, stored, uerr := openSealed(reader, stored)
+	reader, stored, uerr := e.unwrapLegacyCompression(key, reader, stored)
 	if uerr != nil {
 		return nil, 0, uerr
 	}
@@ -283,7 +283,7 @@ func (e *PerBucketEngine) GetObject(bucket, key string) (ReadSeekCloser, int64, 
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.get(bucket, wholeFlightKey(bucket, key, "", stored), reader, stored)
+	return e.get(bucket, key, wholeFlightKey(bucket, key, "", stored), reader, stored)
 }
 
 func (e *PerBucketEngine) PutObjectVersion(bucket, key, versionID string, reader io.Reader, size int64) (int64, string, error) {
@@ -297,5 +297,84 @@ func (e *PerBucketEngine) GetObjectVersion(bucket, key, versionID string) (ReadS
 	if err != nil {
 		return nil, 0, err
 	}
-	return e.get(bucket, wholeFlightKey(bucket, key, versionID, stored), reader, stored)
+	return e.get(bucket, key, wholeFlightKey(bucket, key, versionID, stored), reader, stored)
+}
+
+// unwrapLegacyCompression undoes the compression that wrapped encryption before
+// 4.4.70 (see openSealed), and only that.
+//
+// This engine is the one encryption layer that also stores plaintext: a bucket
+// that has not opted in keeps the caller's bytes as they are. It used to unwrap
+// any blob that began with a zstd or gzip magic, so a user's own .gz or .zst
+// file in such a bucket came back decompressed: a different body, a different
+// length, and a checksum the client rejects. Three rules now decide:
+//
+//   - A key the compressor has always passed through (.gz, .zst, .zip, ...) was
+//     never compressed by VaultS3, so it is never unwrapped.
+//   - A blob that does not decompress cleanly is the caller's own bytes.
+//   - A blob that does decompress is kept decompressed only when what is inside
+//     is sealed, or when a legacy server-wide key may have sealed it in the old
+//     headerless format. Otherwise it is returned as stored, and the compression
+//     layer above, when there is one, removes its own wrapping.
+func (e *PerBucketEngine) unwrapLegacyCompression(key string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
+	if neverCompressed(key) || !hasCompressionMagic(reader) {
+		return reader, stored, nil
+	}
+	dr, size, err := decompressIfCompressed(keepOpen{reader}, stored)
+	if err != nil {
+		if _, serr := reader.Seek(0, io.SeekStart); serr != nil {
+			reader.Close()
+			return nil, 0, serr
+		}
+		return reader, stored, nil
+	}
+	var magic [4]byte
+	n, _ := io.ReadFull(dr, magic[:])
+	inner := magic[:n]
+	if string(inner) == streamMagic || bucketcrypto.HasHeader(inner) || e.legacy != nil {
+		if _, err := dr.Seek(0, io.SeekStart); err != nil {
+			dr.Close()
+			reader.Close()
+			return nil, 0, err
+		}
+		return closeBoth{ReadSeekCloser: dr, under: reader}, size, nil
+	}
+	dr.Close()
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		reader.Close()
+		return nil, 0, err
+	}
+	return reader, stored, nil
+}
+
+// hasCompressionMagic peeks for a zstd or gzip magic and rewinds.
+func hasCompressionMagic(r ReadSeekCloser) bool {
+	var m [4]byte
+	n, _ := io.ReadFull(r, m[:])
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+	isZstd := n == 4 && m[0] == 0x28 && m[1] == 0xB5 && m[2] == 0x2F && m[3] == 0xFD
+	isGzip := n >= 2 && m[0] == 0x1F && m[1] == 0x8B
+	return isZstd || isGzip
+}
+
+// keepOpen hides Close, so a decoder that gives up does not close the stored
+// blob it was handed, which is still needed to serve the bytes as they are.
+type keepOpen struct{ ReadSeekCloser }
+
+func (keepOpen) Close() error { return nil }
+
+// closeBoth is a decoded reader that also closes the stored blob under it.
+type closeBoth struct {
+	ReadSeekCloser
+	under io.Closer
+}
+
+func (c closeBoth) Close() error {
+	err := c.ReadSeekCloser.Close()
+	if uerr := c.under.Close(); err == nil {
+		err = uerr
+	}
+	return err
 }

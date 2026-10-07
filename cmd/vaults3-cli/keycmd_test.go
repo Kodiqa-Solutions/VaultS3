@@ -8,6 +8,10 @@ import (
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
+// The test API reports its version as "dev", which key create cannot compare,
+// so these tests pass --force to get past the version check. The check itself
+// is covered in keyversion_test.go.
+
 var secretLine = regexp.MustCompile(`(?m)^Secret key: (\S+)$`)
 var accessLine = regexp.MustCompile(`(?m)^Access key: (\S+)$`)
 
@@ -20,7 +24,7 @@ func TestKeyCreatePrintsTheCredentialsTheServerStored(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, errOut, failed := runCLI(t, "key", "create", "alice", "--bucket", "bkt-one")
+	out, errOut, failed := runCLI(t, "key", "create", "alice", "--bucket", "bkt-one", "--force")
 	if failed {
 		t.Fatalf("key create failed: %s", errOut)
 	}
@@ -52,7 +56,7 @@ func TestKeyCreatePrintsTheCredentialsTheServerStored(t *testing.T) {
 func TestKeyCreateRefusesWithoutAScope(t *testing.T) {
 	store := cliServer(t, nil)
 
-	_, errOut, failed := runCLI(t, "key", "create", "alice")
+	_, errOut, failed := runCLI(t, "key", "create", "alice", "--force")
 	if !failed {
 		t.Fatal("a key was issued without saying which buckets it can reach")
 	}
@@ -67,7 +71,7 @@ func TestKeyCreateRefusesWithoutAScope(t *testing.T) {
 func TestKeyCreateAllBucketsIsExplicit(t *testing.T) {
 	store := cliServer(t, nil)
 
-	out, errOut, failed := runCLI(t, "key", "create", "alice", "--all-buckets")
+	out, errOut, failed := runCLI(t, "key", "create", "alice", "--all-buckets", "--force")
 	if failed {
 		t.Fatalf("key create --all-buckets failed: %s", errOut)
 	}
@@ -95,12 +99,12 @@ func TestKeyCreateRejectsConflictingAndUnknownArguments(t *testing.T) {
 	}{
 		{[]string{"key", "create", "alice", "--bucket", "bkt-one", "--all-buckets"}, "only one of"},
 		{[]string{"key", "create", "alice", "--all-buckets", "--user-policies"}, "only one of"},
-		{[]string{"key", "create", "alice", "--user-policies"}, "no policies"},
+		{[]string{"key", "create", "alice", "--user-policies", "--force"}, "no policies"},
 		{[]string{"key", "create", "alice", "--bucket"}, "needs a bucket name"},
 		{[]string{"key", "create", "alice", "--bucket="}, "needs a bucket name"},
 		{[]string{"key", "create", "alice", "--read-only"}, "unknown argument"},
 		{[]string{"key", "create", "--bucket", "bkt-one"}, "requires a user name"},
-		{[]string{"key", "create", "alice", "--bucket", "no-such-bucket"}, "does not exist"},
+		{[]string{"key", "create", "alice", "--bucket", "no-such-bucket", "--force"}, "does not exist"},
 	} {
 		_, errOut, failed := runCLI(t, c.args...)
 		if !failed {
@@ -118,7 +122,7 @@ func TestKeyCreateRejectsConflictingAndUnknownArguments(t *testing.T) {
 
 func TestKeyListShowsEachKeysUser(t *testing.T) {
 	cliServer(t, nil)
-	out, errOut, failed := runCLI(t, "key", "create", "alice", "--all-buckets")
+	out, errOut, failed := runCLI(t, "key", "create", "alice", "--all-buckets", "--force")
 	if failed {
 		t.Fatalf("create: %s", errOut)
 	}
@@ -147,7 +151,7 @@ func TestKeyListShowsEachKeysUser(t *testing.T) {
 
 func TestKeyDeleteRemovesTheKeyAndReportsAMissingOne(t *testing.T) {
 	store := cliServer(t, nil)
-	out, _, _ := runCLI(t, "key", "create", "alice", "--all-buckets")
+	out, _, _ := runCLI(t, "key", "create", "alice", "--all-buckets", "--force")
 	ak := accessLine.FindStringSubmatch(out)[1]
 
 	if _, errOut, failed := runCLI(t, "key", "delete", ak); failed {
@@ -177,7 +181,7 @@ func TestUserThenKeyThenRevokeKeepsTheUser(t *testing.T) {
 	if !strings.Contains(out, "key create alice") {
 		t.Errorf("user create does not say how to get credentials: %q", out)
 	}
-	out, errOut, failed = runCLI(t, "key", "create", "alice", "--bucket", "bkt-one")
+	out, errOut, failed = runCLI(t, "key", "create", "alice", "--bucket", "bkt-one", "--force")
 	if failed {
 		t.Fatalf("key create: %s", errOut)
 	}
@@ -204,7 +208,7 @@ func TestKeyCreateUserPoliciesLimitsTheKeyToThem(t *testing.T) {
 		t.Fatalf("attach: %s", errOut)
 	}
 
-	out, errOut, failed := runCLI(t, "key", "create", "alice", "--user-policies")
+	out, errOut, failed := runCLI(t, "key", "create", "alice", "--user-policies", "--force")
 	if failed {
 		t.Fatalf("key create --user-policies failed: %s", errOut)
 	}
@@ -227,7 +231,7 @@ func TestKeyCreateBucketOutputDoesNotOverclaimTheLimit(t *testing.T) {
 	if err := store.CreateBucket("bkt-one"); err != nil {
 		t.Fatal(err)
 	}
-	out, errOut, failed := runCLI(t, "key", "create", "alice", "--bucket", "bkt-one")
+	out, errOut, failed := runCLI(t, "key", "create", "alice", "--bucket", "bkt-one", "--force")
 	if failed {
 		t.Fatalf("key create: %s", errOut)
 	}

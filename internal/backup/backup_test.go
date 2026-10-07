@@ -35,14 +35,16 @@ func newBackupRig(t *testing.T) (*storage.FileSystem, *metadata.Store, string) {
 	return eng, store, base
 }
 
-func putObj(t *testing.T, eng *storage.FileSystem, key string, data []byte, modTime time.Time) {
+// putObj stores an object the way the S3 handler does: data through the
+// engine and a metadata record, which is what a backup enumerates.
+func putObj(t *testing.T, eng *storage.FileSystem, store *metadata.Store, key string, data []byte, modTime time.Time) {
 	t.Helper()
-	if _, _, err := eng.PutObject("b", key, bytes.NewReader(data), int64(len(data))); err != nil {
+	_, etag, err := eng.PutObject("b", key, bytes.NewReader(data), int64(len(data)))
+	if err != nil {
 		t.Fatalf("put %s: %v", key, err)
 	}
-	p := eng.ObjectPath("b", key)
-	if err := os.Chtimes(p, modTime, modTime); err != nil {
-		t.Fatalf("chtimes %s: %v", key, err)
+	if err := store.PutObjectMeta(metadata.ObjectMeta{Bucket: "b", Key: key, ETag: etag, Size: int64(len(data)), LastModified: modTime.Unix()}); err != nil {
+		t.Fatalf("put meta %s: %v", key, err)
 	}
 }
 
@@ -92,8 +94,8 @@ func TestLocalTargetRejectsTraversal(t *testing.T) {
 func TestFullBackupCopiesEverything(t *testing.T) {
 	eng, store, base := newBackupRig(t)
 	alpha, bravo := []byte("alpha-contents"), []byte("bravo-contents")
-	putObj(t, eng, "a.txt", alpha, time.Now())
-	putObj(t, eng, "dir/b.txt", bravo, time.Now())
+	putObj(t, eng, store, "a.txt", alpha, time.Now())
+	putObj(t, eng, store, "dir/b.txt", bravo, time.Now())
 
 	targetDir := filepath.Join(base, "backup")
 	target := config.BackupTarget{Name: "local", Type: "local", Path: targetDir}
@@ -118,8 +120,8 @@ func TestIncrementalBackupCopiesOnlyChanged(t *testing.T) {
 	now := time.Now()
 
 	// "old" predates the last backup; "new" was modified after it.
-	putObj(t, eng, "old.txt", []byte("old data"), now.Add(-2*time.Hour))
-	putObj(t, eng, "new.txt", []byte("new data"), now)
+	putObj(t, eng, store, "old.txt", []byte("old data"), now.Add(-2*time.Hour))
+	putObj(t, eng, store, "new.txt", []byte("new data"), now)
 
 	targetDir := filepath.Join(base, "backup")
 	target := config.BackupTarget{Name: "local", Type: "local", Path: targetDir}

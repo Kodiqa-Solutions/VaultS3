@@ -88,7 +88,7 @@ func (r *Reporter) generateBucketReport(bucket string) error {
 		if err != nil {
 			continue
 		}
-		modTime := time.Unix(0, meta.LastModified).UTC()
+		modTime := time.Unix(meta.LastModified, 0).UTC()
 		w.Write([]string{
 			bucket,
 			obj.Key,
@@ -121,7 +121,7 @@ func (r *Reporter) generateBucketReport(bucket string) error {
 		Key:          reportKey,
 		Size:         int64(len(data)),
 		ContentType:  "text/csv",
-		LastModified: time.Now().UTC().UnixNano(),
+		LastModified: time.Now().UTC().Unix(),
 	})
 
 	slog.Info("inventory report generated", "bucket", bucket, "report", reportKey, "objects", len(objects))

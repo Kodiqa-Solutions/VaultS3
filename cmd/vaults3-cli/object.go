@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,10 +23,10 @@ func runObject(args []string) {
 Subcommands:
   ls <bucket> [--prefix=<p>] [--recursive] [--max-keys=<n>]   List objects (folders + leaves; --recursive for all nested; paginates past 1000)
   put <bucket> <key> <file>                           Upload object
-  get <bucket> <key> <file>                           Download object
+  get <bucket> <key> <file> [--force]                 Download object (refuses to overwrite without --force, - for stdout)
   rm <bucket> <key>                                   Delete object
   cp <src-bucket/key> <dst-bucket/key>                Copy object
-  presign <bucket> <key> [--expires=3600]             Generate presigned GET URL
+  presign <bucket> <key> [--expires=3600]             Generate presigned GET URL (1 to 604800 seconds)
   verify <bucket> [--prefix=<p>] [--repair]           Find objects that list but cannot be read (metadata/data desync); --repair removes the orphaned metadata`)
 		os.Exit(1)
 	}
@@ -106,7 +107,7 @@ func objectList(args []string) {
 			}
 		}
 
-		path := fmt.Sprintf("/%s?list-type=2&max-keys=%d", bucket, pageSize)
+		path := fmt.Sprintf("%s?list-type=2&max-keys=%d", bucketPath(bucket), pageSize)
 		if prefix != "" {
 			path += "&prefix=" + url.QueryEscape(prefix)
 		}
@@ -189,6 +190,7 @@ func objectPut(args []string) {
 		fatal("object put requires: <bucket> <key> <file>")
 	}
 	bucket, key, filePath := args[0], args[1], args[2]
+	u := objectURL(bucket, key)
 
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -201,20 +203,41 @@ func objectPut(args []string) {
 		fatal(err.Error())
 	}
 
-	data, err := io.ReadAll(f)
+	// A regular file is streamed straight from disk with its length known up
+	// front, so an upload costs a small buffer instead of the file's size held
+	// three times over (read, copied for the request, copied again to hash it).
+	// The payload is signed as UNSIGNED-PAYLOAD, which the server accepts, so
+	// nothing has to read the file before it is sent. A pipe or other special
+	// file has no length to declare, and is read into memory as before.
+	var body io.Reader = f
+	size := stat.Size()
+	if !stat.Mode().IsRegular() {
+		data, err := io.ReadAll(f)
+		if err != nil {
+			fatal(err.Error())
+		}
+		body, size = bytes.NewReader(data), int64(len(data))
+	}
+	if size == 0 {
+		body = http.NoBody
+	}
+
+	req, err := http.NewRequest("PUT", u, body)
 	if err != nil {
 		fatal(err.Error())
 	}
+	req.ContentLength = size
+	req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+	signV4(req, accessKey, secretKey, region)
 
-	path := fmt.Sprintf("/%s/%s", bucket, key)
-	resp, err := s3Request("PUT", path, bytes.NewReader(data))
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fatal(err.Error())
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 200 || resp.StatusCode == 204 {
-		fmt.Printf("Uploaded '%s' to %s/%s (%s)\n", filePath, bucket, key, formatSize(stat.Size()))
+		fmt.Printf("Uploaded '%s' to %s/%s (%s)\n", filePath, bucket, key, formatSize(size))
 	} else {
 		body, _ := io.ReadAll(resp.Body)
 		fatal(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
@@ -222,13 +245,34 @@ func objectPut(args []string) {
 }
 
 func objectGet(args []string) {
-	if len(args) < 3 {
-		fatal("object get requires: <bucket> <key> <file>")
+	force := false
+	var pos []string
+	for _, arg := range args {
+		switch {
+		case arg == "--force" || arg == "-f":
+			force = true
+		case strings.HasPrefix(arg, "--"):
+			fatal("unknown flag for object get: " + arg)
+		default:
+			pos = append(pos, arg)
+		}
 	}
-	bucket, key, filePath := args[0], args[1], args[2]
+	if len(pos) < 3 {
+		fatal("object get requires: <bucket> <key> <file> [--force] (use - as the file for stdout)")
+	}
+	bucket, key, filePath := pos[0], pos[1], pos[2]
+	toStdout := filePath == "-"
 
-	path := fmt.Sprintf("/%s/%s", bucket, key)
-	resp, err := s3Request("GET", path, nil)
+	// Overwriting a local file nobody asked to replace loses it for good, so an
+	// existing destination needs --force. Checked before the download, so a
+	// refusal costs nothing.
+	if !toStdout && !force {
+		if _, err := os.Lstat(filePath); err == nil {
+			fatal(fmt.Sprintf("'%s' already exists. Pass --force to overwrite it", filePath))
+		}
+	}
+
+	resp, err := s3Request("GET", objectPath(bucket, key), nil)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -239,14 +283,42 @@ func objectGet(args []string) {
 		fatal(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
 	}
 
-	out, err := os.Create(filePath)
+	if toStdout {
+		if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
+			fatal(err.Error())
+		}
+		return
+	}
+
+	// Download next to the destination and rename into place, so a transfer
+	// that fails halfway leaves the old file (or nothing) rather than a
+	// truncated copy under the real name.
+	dir, base := filepath.Split(filePath)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, "."+base+".part-*")
 	if err != nil {
 		fatal(err.Error())
 	}
-	defer out.Close()
-
-	n, err := io.Copy(out, resp.Body)
+	tmpName := tmp.Name()
+	n, err := io.Copy(tmp, resp.Body)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
 	if err != nil {
+		os.Remove(tmpName)
+		fatal(err.Error())
+	}
+	if !force {
+		// Something may have created the file while the download ran.
+		if _, err := os.Lstat(filePath); err == nil {
+			os.Remove(tmpName)
+			fatal(fmt.Sprintf("'%s' appeared during the download. Pass --force to overwrite it", filePath))
+		}
+	}
+	if err := os.Rename(tmpName, filePath); err != nil {
+		os.Remove(tmpName)
 		fatal(err.Error())
 	}
 
@@ -259,8 +331,7 @@ func objectDelete(args []string) {
 	}
 	bucket, key := args[0], args[1]
 
-	path := fmt.Sprintf("/%s/%s", bucket, key)
-	resp, err := s3Request("DELETE", path, nil)
+	resp, err := s3Request("DELETE", objectPath(bucket, key), nil)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -281,18 +352,18 @@ func objectCopy(args []string) {
 	srcParts := strings.SplitN(args[0], "/", 2)
 	dstParts := strings.SplitN(args[1], "/", 2)
 
-	if len(srcParts) != 2 || len(dstParts) != 2 {
+	if len(srcParts) != 2 || len(dstParts) != 2 || srcParts[1] == "" || dstParts[1] == "" {
 		fatal("source and destination must be in format: bucket/key")
 	}
 
-	path := fmt.Sprintf("/%s/%s", dstParts[0], dstParts[1])
-	url := strings.TrimRight(endpoint, "/") + path
-
-	req, err := newHTTPRequest("PUT", url, nil)
+	req, err := newHTTPRequest("PUT", objectURL(dstParts[0], dstParts[1]), nil)
 	if err != nil {
 		fatal(err.Error())
 	}
-	req.Header.Set("X-Amz-Copy-Source", fmt.Sprintf("/%s/%s", srcParts[0], srcParts[1]))
+	// The server URL-decodes the copy source, as S3 does, so it has to be sent
+	// encoded. Sent raw, a '%' in the source key was decoded into a different
+	// key and a '?' began a version query.
+	req.Header.Set("X-Amz-Copy-Source", objectPath(srcParts[0], srcParts[1]))
 	signV4(req, accessKey, secretKey, region)
 
 	resp, err := httpClient().Do(req)
@@ -309,6 +380,10 @@ func objectCopy(args []string) {
 	}
 }
 
+// maxPresignExpiry is the longest a SigV4 presigned URL may live, seven days,
+// as in AWS. Clients and S3 implementations reject anything longer.
+const maxPresignExpiry = 604800
+
 func objectPresign(args []string) {
 	if len(args) < 2 {
 		fatal("object presign requires: <bucket> <key> [--expires=3600]")
@@ -317,20 +392,31 @@ func objectPresign(args []string) {
 	expires := 3600
 
 	for _, arg := range args[2:] {
-		if strings.HasPrefix(arg, "--expires=") {
+		switch {
+		case strings.HasPrefix(arg, "--expires="):
 			n, err := strconv.Atoi(strings.TrimPrefix(arg, "--expires="))
-			if err == nil {
-				expires = n
+			if err != nil || n < 1 || n > maxPresignExpiry {
+				fatal(fmt.Sprintf("--expires must be a number of seconds from 1 to %d (7 days)", maxPresignExpiry))
 			}
+			expires = n
+		default:
+			fatal("unknown flag for object presign: " + arg)
 		}
 	}
+	fmt.Println(presignURL(bucket, key, expires, time.Now().UTC()))
+}
 
-	// Generate presigned URL locally
-	now := time.Now().UTC()
+// presignURL signs a GET for one object. The canonical URI is the escaped path
+// the URL carries, the same bytes the server rebuilds from the decoded path,
+// so a key with a space or a reserved character verifies like any other.
+func presignURL(bucket, key string, expires int, now time.Time) string {
 	dateStr := now.Format("20060102")
 	amzDate := now.Format("20060102T150405Z")
 
-	u, _ := url.Parse(endpoint)
+	u, err := url.Parse(strings.TrimRight(endpoint, "/"))
+	if err != nil {
+		fatal("invalid endpoint: " + err.Error())
+	}
 	host := u.Host
 
 	credential := fmt.Sprintf("%s/%s/%s/s3/aws4_request", accessKey, dateStr, region)
@@ -342,7 +428,9 @@ func objectPresign(args []string) {
 	params.Set("X-Amz-Expires", strconv.Itoa(expires))
 	params.Set("X-Amz-SignedHeaders", "host")
 
-	canonicalURI := fmt.Sprintf("/%s/%s", bucket, key)
+	// A base path on the endpoint (a reverse proxy subpath) is part of what the
+	// server signs, so it is part of the canonical URI here too.
+	canonicalURI := uriEncodePath(u.Path) + objectPath(bucket, key)
 	canonicalQueryString := params.Encode()
 	canonicalHeaders := fmt.Sprintf("host:%s\n", host)
 	signedHeaders := "host"
@@ -363,7 +451,7 @@ func objectPresign(args []string) {
 
 	params.Set("X-Amz-Signature", signature)
 
-	fmt.Printf("%s%s?%s\n", endpoint, canonicalURI, params.Encode())
+	return fmt.Sprintf("%s://%s%s?%s", u.Scheme, host, canonicalURI, params.Encode())
 }
 
 // objectVerify walks every object in a bucket and probes whether its data is
@@ -456,7 +544,7 @@ func listAllObjectKeys(bucket, prefix string) []string {
 	var keys []string
 	token := ""
 	for {
-		path := fmt.Sprintf("/%s?list-type=2&max-keys=1000", bucket)
+		path := bucketPath(bucket) + "?list-type=2&max-keys=1000"
 		if prefix != "" {
 			path += "&prefix=" + url.QueryEscape(prefix)
 		}
@@ -516,12 +604,39 @@ func probeObjectReadable(bucket, key string) (int, error) {
 // objectURL builds a properly path-encoded S3 URL for a bucket/key, so keys with
 // spaces or other special characters sign and route correctly.
 func objectURL(bucket, key string) string {
-	u, err := url.Parse(strings.TrimRight(endpoint, "/"))
-	if err != nil {
-		return strings.TrimRight(endpoint, "/") + "/" + bucket + "/" + key
+	return strings.TrimRight(endpoint, "/") + objectPath(bucket, key)
+}
+
+// bucketPath is the escaped request path of a bucket. A name pasted into a URL
+// as it is gets cut short by the first '?' or '#', so "a?b" would address
+// bucket "a". The server routes on the decoded path, so escaping every byte
+// that is not unreserved addresses exactly the bucket that was named.
+func bucketPath(bucket string) string {
+	refuseBadBucket(bucket)
+	return "/" + uriEncode(bucket)
+}
+
+// objectPath is the escaped request path of an object. Each '/' in the key is
+// kept, because S3 keys use it as a separator, and everything else outside the
+// unreserved set is escaped. Without this, "rm b 'a?b'" deleted the object "a"
+// and reported "a?b" deleted, and a key holding "%41" addressed "A".
+func objectPath(bucket, key string) string {
+	if key == "" {
+		fatal("an object key cannot be empty")
 	}
-	u.Path = "/" + bucket + "/" + key
-	return u.String()
+	return bucketPath(bucket) + "/" + uriEncodePath(key)
+}
+
+// refuseBadBucket stops a bucket name the S3 path cannot carry. A '/' would
+// split it into a bucket and a key, so the request would act on a different
+// bucket than the one named.
+func refuseBadBucket(bucket string) {
+	if bucket == "" {
+		fatal("a bucket name cannot be empty")
+	}
+	if strings.Contains(bucket, "/") {
+		fatal(fmt.Sprintf("bucket name %q contains '/', which is not a valid bucket name", bucket))
+	}
 }
 
 func newHTTPRequest(method, url string, body io.Reader) (*http.Request, error) {

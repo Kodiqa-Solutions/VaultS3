@@ -62,10 +62,9 @@ type ReplicaRepairer struct {
 	secret string
 	scheme string
 
-	replicasFor      func(bucket string) int
-	bucketEncrypted  func(bucket string) bool
-	erasureFor       func(bucket string) bool
-	rebalanceRunning func() bool
+	replicasFor     func(bucket string) int
+	bucketEncrypted func(bucket string) bool
+	erasureFor      func(bucket string) bool
 
 	// coordinateAll is set when metadata is sharded across Raft groups. Each
 	// node then iterates only the shards it leads, so an object's metadata is
@@ -152,11 +151,11 @@ func (r *ReplicaRepairer) SetErasurePolicy(fn func(bucket string) bool) { r.eras
 // view of the config has not caught up.
 func (r *ReplicaRepairer) SetBucketEncrypted(fn func(bucket string) bool) { r.bucketEncrypted = fn }
 
-// SetRebalanceGuard wires a check that reports whether a rebalance is running.
-// The two must not overlap: rebalance deletes the local copy after handing an
-// object to its new owner, and a repairer watching that would read the gap as a
-// lost replica and copy it straight back.
-func (r *ReplicaRepairer) SetRebalanceGuard(fn func() bool) { r.rebalanceRunning = fn }
+// SetRebalanceGuard is kept for callers and ignored. It used to hold repair off
+// while a rebalance ran, because rebalance deleted local copies. Rebalance no
+// longer moves data, and a guard that could suppress the one mechanism restoring
+// lost replicas is not worth keeping in case it ever reports true again.
+func (r *ReplicaRepairer) SetRebalanceGuard(fn func() bool) {}
 
 // SetShardedMetadata tells the repairer that metadata is split across Raft
 // groups, so it should repair every object it can see rather than only those it
@@ -222,10 +221,6 @@ func (r *ReplicaRepairer) Status() RepairStats {
 // scan walks every object this node is responsible for and tops up any that
 // hold fewer copies than their bucket asks for.
 func (r *ReplicaRepairer) scan(ctx context.Context) {
-	if r.rebalanceRunning != nil && r.rebalanceRunning() {
-		slog.Info("replica repair: rebalance in progress, skipping scan")
-		return
-	}
 	start := time.Now()
 	var st RepairStats
 

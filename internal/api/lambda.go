@@ -97,6 +97,9 @@ func (h *APIHandler) handlePutLambdaTriggers(w http.ResponseWriter, r *http.Requ
 
 	// Validate function URLs to prevent SSRF
 	for _, t := range cfg.Triggers {
+		if h.allowPrivateLambda {
+			continue // the operator allows functions on private addresses
+		}
 		if err := ValidateWebhookURL(t.FunctionURL); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid function URL: %v", err))
 			return

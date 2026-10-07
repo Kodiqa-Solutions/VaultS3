@@ -108,6 +108,44 @@ func (d *FailureDetector) AddNode(nodeID, addr string) {
 	}
 }
 
+// Reconcile makes the monitored set match a membership snapshot of node ID to
+// API address: new members are added, departed ones dropped, and a member whose
+// address changed is probed at the new one.
+//
+// The detector used to learn its peers once, at startup, from the configured
+// list. A node that joined later (every node, under Kubernetes auto-join with no
+// static peers) was never probed at all, and a peer whose address changed was
+// probed at the old one forever and declared DOWN while it was serving. The
+// proxy's membership sync calls this on every tick.
+//
+// A moved node keeps its state and failure count: if it was DOWN, the first
+// successful probe at the new address brings it back through the normal recover
+// path.
+func (d *FailureDetector) Reconcile(members map[string]string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, addr := range members {
+		if id == d.selfID || addr == "" {
+			continue
+		}
+		nh, ok := d.nodes[id]
+		if !ok {
+			d.nodes[id] = &NodeHealth{NodeID: id, Addr: addr, State: NodeHealthy, LastSeen: time.Now()}
+			slog.Info("failure detector: monitoring new member", "node_id", id, "addr", addr)
+			continue
+		}
+		if nh.Addr != addr {
+			slog.Info("failure detector: member address changed", "node_id", id, "from", nh.Addr, "to", addr)
+			nh.Addr = addr
+		}
+	}
+	for id := range d.nodes {
+		if _, ok := members[id]; !ok {
+			delete(d.nodes, id)
+		}
+	}
+}
+
 // RemoveNode stops monitoring a node.
 func (d *FailureDetector) RemoveNode(nodeID string) {
 	d.mu.Lock()
@@ -151,8 +189,11 @@ func (d *FailureDetector) probeAll() {
 }
 
 func (d *FailureDetector) probeNode(nh *NodeHealth) {
-	url := fmt.Sprintf("http://%s/health", nh.Addr)
-	resp, err := d.client.Get(url)
+	// The address is read under the lock because Reconcile may move it.
+	d.mu.RLock()
+	addr := nh.Addr
+	d.mu.RUnlock()
+	resp, err := d.client.Get(interNodeURL(addr, "/health"))
 
 	d.mu.Lock()
 	defer d.mu.Unlock()

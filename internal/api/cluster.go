@@ -37,7 +37,14 @@ func (h *APIHandler) forwardUpload(ownerAddr, bucket, prefix, filename, contentT
 		pw.Close()
 	}()
 
-	u := fmt.Sprintf("http://%s/api/v1/buckets/%s/upload", ownerAddr, url.PathEscape(bucket))
+	// The owner is reached on its API port, which speaks TLS when the server
+	// does. This used to be plain http whatever the configuration, so every
+	// forwarded dashboard upload failed on a TLS cluster.
+	scheme := "http"
+	if h.cfg != nil && h.cfg.Server.TLS.Enabled {
+		scheme = "https"
+	}
+	u := fmt.Sprintf("%s://%s/api/v1/buckets/%s/upload", scheme, ownerAddr, url.PathEscape(bucket))
 	if prefix != "" {
 		u += "?prefix=" + url.QueryEscape(prefix)
 	}
@@ -46,7 +53,7 @@ func (h *APIHandler) forwardUpload(ownerAddr, bucket, prefix, filename, contentT
 		return 0, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	if tok, err := h.jwt.Generate("admin", time.Hour); err == nil {
+	if tok, err := h.jwtService().Generate("admin", time.Hour); err == nil {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
@@ -20,6 +22,9 @@ import (
 
 // Authenticator validates S3 Signature V4 requests.
 type Authenticator struct {
+	// adminMu guards the admin pair, which the dashboard can change while
+	// requests are being authenticated.
+	adminMu         sync.RWMutex
 	adminAccessKey  string
 	adminSecretKey  string
 	store           metadata.StoreAPI
@@ -95,112 +100,211 @@ func NewAuthenticator(accessKey, secretKey string, store metadata.StoreAPI, allo
 
 // UpdateAdminCredentials updates the admin access key and secret key at runtime.
 func (a *Authenticator) UpdateAdminCredentials(accessKey, secretKey string) {
+	a.adminMu.Lock()
 	a.adminAccessKey = accessKey
 	a.adminSecretKey = secretKey
+	a.adminMu.Unlock()
+}
+
+func (a *Authenticator) adminPair() (string, string) {
+	a.adminMu.RLock()
+	defer a.adminMu.RUnlock()
+	return a.adminAccessKey, a.adminSecretKey
+}
+
+// authError is a refusal to authenticate. code and msg are what the client is
+// shown, and they are fixed per code: the reason in detail goes to the server
+// log only. The text of the underlying error used to be sent back as the
+// message, so a caller could tell an unknown key from an expired one from a bad
+// session token before proving it held the secret, and the IP check echoed the
+// address ranges it compared against.
+type authError struct {
+	code   string
+	msg    string
+	status int
+	detail string
+	// afterSignature marks a refusal that may be revealed only once the
+	// request's signature has verified. Until then the caller has not shown it
+	// holds the secret, and the specific reason would tell a stranger which
+	// state a credential it guessed is in.
+	afterSignature bool
+}
+
+func (e *authError) Error() string {
+	if e.detail != "" {
+		return e.code + ": " + e.detail
+	}
+	return e.code
+}
+
+func errAuthAccessDenied(detail string) *authError {
+	return &authError{code: "AccessDenied", msg: "Access Denied", status: http.StatusForbidden, detail: detail}
+}
+
+func errAuthUnknownKey() *authError {
+	return &authError{code: "InvalidAccessKeyId", msg: "The AWS Access Key Id you provided does not exist in our records.",
+		status: http.StatusForbidden, detail: "unknown access key"}
+}
+
+func errAuthSignature() *authError {
+	return &authError{code: "SignatureDoesNotMatch",
+		msg:    "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
+		status: http.StatusForbidden, detail: "signature mismatch"}
+}
+
+func errAuthHeaderMalformed(msg string) *authError {
+	return &authError{code: "AuthorizationHeaderMalformed", msg: msg, status: http.StatusBadRequest, detail: msg}
+}
+
+func errAuthQueryParams(msg string) *authError {
+	return &authError{code: "AuthorizationQueryParametersError", msg: msg, status: http.StatusBadRequest, detail: msg}
+}
+
+// writeAuthError answers a refused authentication. Anything that is not an
+// authError is answered as a plain AccessDenied, never with its own text.
+func writeAuthError(w http.ResponseWriter, err error) {
+	var ae *authError
+	if errors.As(err, &ae) {
+		writeS3Error(w, ae.code, ae.msg, ae.status)
+		return
+	}
+	writeS3Error(w, "AccessDenied", "Access Denied", http.StatusForbidden)
 }
 
 // resolveIdentity looks up the identity for a given access key.
 // Returns the identity with user info and policies.
+//
+// An error with afterSignature set still returns the secret, so the caller can
+// verify the signature first and reveal the reason only to the key's holder.
 func (a *Authenticator) resolveIdentity(accessKey string, r *http.Request) (*iam.Identity, string, error) {
-	if accessKey == a.adminAccessKey {
+	if adminAK, adminSK := a.adminPair(); accessKey == adminAK {
 		return &iam.Identity{
 			AccessKey: accessKey,
 			IsAdmin:   true,
-		}, a.adminSecretKey, nil
+		}, adminSK, nil
 	}
-	if a.store != nil {
-		if key, err := a.store.GetAccessKey(accessKey); err == nil {
-			// Check STS expiration
-			if key.ExpiresAt > 0 && time.Now().Unix() > key.ExpiresAt {
-				return nil, "", fmt.Errorf("credentials have expired")
-			}
+	if a.store == nil {
+		return nil, "", errAuthUnknownKey()
+	}
+	key, err := a.store.GetAccessKey(accessKey)
+	if err != nil {
+		return nil, "", errAuthUnknownKey()
+	}
 
-			// A session credential must present the session token it was issued
-			// with. It was never read anywhere, so the access key and secret alone
-			// were sufficient and any token value, or none, was accepted
-			// (security assessment finding 11).
-			if key.SessionToken != "" {
-				presented := r.Header.Get("X-Amz-Security-Token")
-				if presented == "" {
-					presented = r.URL.Query().Get("X-Amz-Security-Token")
-				}
-				if !hmac.Equal([]byte(presented), []byte(key.SessionToken)) {
-					return nil, "", fmt.Errorf("invalid session token")
-				}
-			}
+	// Check STS expiration
+	if key.ExpiresAt > 0 && time.Now().Unix() > key.ExpiresAt {
+		return nil, key.SecretKey, &authError{code: "ExpiredToken", msg: "The provided token has expired.",
+			status: http.StatusBadRequest, detail: "credentials have expired", afterSignature: true}
+	}
 
-			// An STS key resolves against its OWN synthetic user, which carries the
-			// session policy supplied when the token was minted. It used to resolve
-			// against SourceUserID, the user the session was derived from, so the
-			// scoped-down credential inherited that user's full permissions and the
-			// session policy was never evaluated at all: a session created to allow
-			// only GetObject could PUT, and one that explicitly denied GetObject
-			// could read (security assessment finding 11).
-			//
-			// The fall back to the source user applies only when the session was
-			// created with no policy of its own, which is the unscoped case where
-			// inheriting is the intent.
-			userID := key.UserID
-			if key.SourceUserID != "" && !a.hasOwnPolicies(key.UserID) {
-				userID = key.SourceUserID
-			}
+	// A session credential must present the session token it was issued
+	// with. It was never read anywhere, so the access key and secret alone
+	// were sufficient and any token value, or none, was accepted
+	// (security assessment finding 11).
+	if key.SessionToken != "" {
+		presented := r.Header.Get("X-Amz-Security-Token")
+		if presented == "" {
+			presented = r.URL.Query().Get("X-Amz-Security-Token")
+		}
+		if !hmac.Equal([]byte(presented), []byte(key.SessionToken)) {
+			return nil, key.SecretKey, &authError{code: "InvalidToken", msg: "The provided token is malformed or otherwise invalid.",
+				status: http.StatusBadRequest, detail: "invalid session token", afterSignature: true}
+		}
+	}
 
-			identity := &iam.Identity{
-				AccessKey: accessKey,
-				UserID:    userID,
-			}
+	identity := &iam.Identity{AccessKey: accessKey, UserID: key.UserID}
 
-			// Load policies if linked to a user
-			if userID != "" {
-				iamPolicies, err := a.store.GetUserPolicies(userID)
-				if err == nil {
-					for _, p := range iamPolicies {
-						var pol iam.Policy
-						if err := json.Unmarshal([]byte(p.Document), &pol); err != nil {
-							// A policy that cannot be parsed used to be dropped in
-							// silence, so an operator saw it created, listed and
-							// attached while it took no part in any decision, and a
-							// Deny written that way protected nothing. Refuse the
-							// whole identity instead of deciding on a partial set.
-							slog.Error("iam: a policy failed to parse, denying this identity until it is fixed",
-								"policy", p.Name, "user", userID, "error", err)
-							identity.PolicyLoadFailed = true
-							continue
-						}
+	if key.SourceUserID != "" {
+		// A session is only ever as good as the user it was derived from. It used
+		// to be resolved without looking at that user at all once it carried a
+		// session policy, so deleting the user did not end the session, and the
+		// user's IP allowlist did not apply to it.
+		source, err := a.store.GetIAMUser(key.SourceUserID)
+		if err != nil {
+			return nil, key.SecretKey, &authError{code: "AccessDenied", msg: "Access Denied", status: http.StatusForbidden,
+				detail: "the user this session was issued for no longer exists", afterSignature: true}
+		}
+		identity.UserID = key.SourceUserID
+		identity.AllowedCIDRs = source.AllowedCIDRs
+		identity.Policies, identity.PolicyLoadFailed = a.loadUserPolicies(key.SourceUserID)
+
+		// A session minted with a policy of its own carries it on a synthetic
+		// user. That policy narrows the source user and never widens them: AWS
+		// grants a session only what BOTH allow. It used to be evaluated on its
+		// own, so a session could do things its user could not, and before that
+		// (security assessment finding 11) it was not evaluated at all.
+		if key.UserID != "" && key.UserID != key.SourceUserID {
+			sessionPolicies, failed := a.loadUserPolicies(key.UserID)
+			identity.SessionScoped = true
+			identity.SessionPolicies = sessionPolicies
+			identity.PolicyLoadFailed = identity.PolicyLoadFailed || failed
+		}
+		return identity, key.SecretKey, nil
+	}
+
+	// Load policies if linked to a user
+	if key.UserID != "" {
+		identity.Policies, identity.PolicyLoadFailed = a.loadUserPolicies(key.UserID)
+
+		// Load user's IP restrictions
+		if user, err := a.store.GetIAMUser(key.UserID); err == nil {
+			identity.AllowedCIDRs = user.AllowedCIDRs
+
+			// The grant the key was issued with is the key's own, so a
+			// second key for the same user cannot change it. It applies
+			// only while the user exists: a key left behind by a deleted
+			// user must not keep its access.
+			if key.PolicyName != "" {
+				if p, err := a.store.GetIAMPolicy(key.PolicyName); err == nil {
+					var pol iam.Policy
+					if err := json.Unmarshal([]byte(p.Document), &pol); err != nil {
+						slog.Error("iam: an access key's policy failed to parse, denying this key until it is fixed",
+							"policy", p.Name, "user", key.UserID, "error", err)
+						identity.PolicyLoadFailed = true
+					} else {
 						identity.Policies = append(identity.Policies, pol)
 					}
 				}
-
-				// Load user's IP restrictions
-				if user, err := a.store.GetIAMUser(userID); err == nil {
-					identity.AllowedCIDRs = user.AllowedCIDRs
-
-					// The grant the key was issued with is the key's own, so a
-					// second key for the same user cannot change it. It applies
-					// only while the user exists: a key left behind by a deleted
-					// user must not keep its access.
-					if key.PolicyName != "" {
-						if p, err := a.store.GetIAMPolicy(key.PolicyName); err == nil {
-							var pol iam.Policy
-							if err := json.Unmarshal([]byte(p.Document), &pol); err != nil {
-								slog.Error("iam: an access key's policy failed to parse, denying this key until it is fixed",
-									"policy", p.Name, "user", userID, "error", err)
-								identity.PolicyLoadFailed = true
-							} else {
-								identity.Policies = append(identity.Policies, pol)
-							}
-						}
-					}
-				}
 			}
-
-			// Keys without policies are denied by default (least privilege).
-			// Key creation auto-generates IAM user + policy, so this
-			// only affects manually created keys with no IAM setup.
-			return identity, key.SecretKey, nil
 		}
 	}
-	return nil, "", fmt.Errorf("invalid access key")
+
+	// Keys without policies are denied by default (least privilege).
+	// Key creation auto-generates IAM user + policy, so this
+	// only affects manually created keys with no IAM setup.
+	return identity, key.SecretKey, nil
+}
+
+// loadUserPolicies reads and parses every policy attached to a user. failed is
+// set when any of them could not be read or parsed. An unreadable policy set is
+// not an empty one: the read error used to be ignored, so the user's own
+// policies, Denies included, were silently dropped while the key's own grant
+// still loaded, and a user-attached Deny protected nothing.
+func (a *Authenticator) loadUserPolicies(userID string) ([]iam.Policy, bool) {
+	iamPolicies, err := a.store.GetUserPolicies(userID)
+	if err != nil {
+		slog.Error("iam: could not read a user's policies, denying this identity until it can",
+			"user", userID, "error", err)
+		return nil, true
+	}
+	var out []iam.Policy
+	failed := false
+	for _, p := range iamPolicies {
+		var pol iam.Policy
+		if err := json.Unmarshal([]byte(p.Document), &pol); err != nil {
+			// A policy that cannot be parsed used to be dropped in
+			// silence, so an operator saw it created, listed and
+			// attached while it took no part in any decision, and a
+			// Deny written that way protected nothing. Refuse the
+			// whole identity instead of deciding on a partial set.
+			slog.Error("iam: a policy failed to parse, denying this identity until it is fixed",
+				"policy", p.Name, "user", userID, "error", err)
+			failed = true
+			continue
+		}
+		out = append(out, pol)
+	}
+	return out, failed
 }
 
 // CheckIPAccess validates client IP against global and per-user restrictions.
@@ -232,24 +336,27 @@ func (a *Authenticator) CheckIPAccess(identity *iam.Identity, clientIP string) e
 	return iam.CheckIP(clientIP, allowList, blockList)
 }
 
+// maxClockSkew is how far a request's own timestamp may be from the server's.
+const maxClockSkew = 15 * time.Minute
+
 // Authenticate validates the Authorization header using AWS Signature V4.
-// Returns the identity of the caller.
+// Returns the identity of the caller. A refusal is an *authError.
 func (a *Authenticator) Authenticate(r *http.Request) (*iam.Identity, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		if r.URL.Query().Get("X-Amz-Signature") != "" {
 			return a.authenticatePresigned(r)
 		}
-		return nil, fmt.Errorf("missing Authorization header")
+		return nil, errAuthAccessDenied("missing Authorization header")
 	}
 
 	if !strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256") {
-		return nil, fmt.Errorf("unsupported auth scheme")
+		return nil, errAuthAccessDenied("unsupported auth scheme")
 	}
 
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("malformed auth header")
+		return nil, errAuthHeaderMalformed("The authorization header is malformed.")
 	}
 
 	params := parseAuthParams(parts[1])
@@ -258,12 +365,12 @@ func (a *Authenticator) Authenticate(r *http.Request) (*iam.Identity, error) {
 	signature := params["Signature"]
 
 	if credential == "" || signedHeaders == "" || signature == "" {
-		return nil, fmt.Errorf("missing auth parameters")
+		return nil, errAuthHeaderMalformed("The authorization header is malformed; it must carry Credential, SignedHeaders and Signature.")
 	}
 
 	credParts := strings.Split(credential, "/")
 	if len(credParts) != 5 {
-		return nil, fmt.Errorf("malformed credential")
+		return nil, errAuthHeaderMalformed("The authorization header is malformed; the Credential is mal-formed.")
 	}
 
 	reqAccessKey := credParts[0]
@@ -271,35 +378,86 @@ func (a *Authenticator) Authenticate(r *http.Request) (*iam.Identity, error) {
 	region := credParts[2]
 	service := credParts[3]
 
+	// The timestamp is part of what is signed, so it has to be one this server
+	// can read. An unparseable X-Amz-Date used to skip the skew check entirely,
+	// which made a captured request replayable forever.
+	amzDate, reqTime, ok := requestTimestamp(r)
+	if !ok {
+		return nil, errAuthAccessDenied("AWS authentication requires a valid Date or x-amz-date header")
+	}
+	if skew := time.Since(reqTime); skew > maxClockSkew || skew < -maxClockSkew {
+		return nil, &authError{code: "RequestTimeTooSkewed",
+			msg:    "The difference between the request time and the server's time is too large.",
+			status: http.StatusForbidden, detail: "request time too skewed"}
+	}
+	// The signing key is derived from the credential scope date, which was never
+	// compared with the request time, so a key derived for one day signed
+	// requests stamped with any other.
+	if dateStr != amzDate[:8] {
+		return nil, errAuthHeaderMalformed("Invalid credential date. Date is not the same as X-Amz-Date.")
+	}
+	// Without host among the signed headers a signature does not bind the
+	// request to this endpoint.
+	if !signsHost(signedHeaders) {
+		return nil, errAuthAccessDenied("host must be a signed header")
+	}
+
 	identity, secretKey, err := a.resolveIdentity(reqAccessKey, r)
-	if err != nil {
+	if err != nil && !isAfterSignature(err) {
 		return nil, err
 	}
 
-	// Validate request timestamp is within 15 minutes of server time
-	amzDate := r.Header.Get("X-Amz-Date")
-	if amzDate != "" {
-		if t, err := time.Parse("20060102T150405Z", amzDate); err == nil {
-			skew := time.Since(t)
-			if skew < 0 {
-				skew = -skew
-			}
-			if skew > 15*time.Minute {
-				return nil, fmt.Errorf("request time too skewed")
-			}
-		}
-	}
-
 	canonicalRequest := buildCanonicalRequest(r, signedHeaders, a.canonicalBasePrefix(r))
-	stringToSign := buildStringToSign(dateStr, region, service, canonicalRequest, r)
+	stringToSign := buildStringToSignAt(amzDate, dateStr, region, service, canonicalRequest)
 	signingKey := deriveSigningKey(secretKey, dateStr, region, service)
 	expectedSig := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
 	if !hmac.Equal([]byte(signature), []byte(expectedSig)) {
-		return nil, fmt.Errorf("signature mismatch")
+		return nil, errAuthSignature()
+	}
+	if err != nil {
+		// The caller holds the secret, so it may now learn why it was refused.
+		return nil, err
 	}
 
 	return identity, nil
+}
+
+// isAfterSignature reports a refusal that must wait for the signature check.
+func isAfterSignature(err error) bool {
+	var ae *authError
+	return errors.As(err, &ae) && ae.afterSignature
+}
+
+// signsHost reports whether a SignedHeaders list includes host.
+func signsHost(signedHeaders string) bool {
+	for _, h := range strings.Split(signedHeaders, ";") {
+		if strings.EqualFold(strings.TrimSpace(h), "host") {
+			return true
+		}
+	}
+	return false
+}
+
+// requestTimestamp returns the request's signing time, in the ISO 8601 basic
+// form the string to sign carries, from X-Amz-Date or failing that the Date
+// header, as SigV4 allows.
+func requestTimestamp(r *http.Request) (string, time.Time, bool) {
+	if v := r.Header.Get("X-Amz-Date"); v != "" {
+		t, err := time.Parse("20060102T150405Z", v)
+		if err != nil {
+			return "", time.Time{}, false
+		}
+		return v, t, true
+	}
+	if v := r.Header.Get("Date"); v != "" {
+		t, err := http.ParseTime(v)
+		if err != nil {
+			return "", time.Time{}, false
+		}
+		return t.UTC().Format("20060102T150405Z"), t, true
+	}
+	return "", time.Time{}, false
 }
 
 func (a *Authenticator) authenticatePresigned(r *http.Request) (*iam.Identity, error) {
@@ -311,45 +469,57 @@ func (a *Authenticator) authenticatePresigned(r *http.Request) (*iam.Identity, e
 	expiresStr := q.Get("X-Amz-Expires")
 
 	if credential == "" || signature == "" || dateStr == "" {
-		return nil, fmt.Errorf("missing presigned parameters")
+		return nil, errAuthQueryParams("Query-string authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters.")
 	}
 
 	credParts := strings.Split(credential, "/")
 	if len(credParts) != 5 {
-		return nil, fmt.Errorf("invalid credential")
-	}
-
-	identity, secretKey, err := a.resolveIdentity(credParts[0], r)
-	if err != nil {
-		return nil, err
+		return nil, errAuthQueryParams("Error parsing the X-Amz-Credential parameter; the Credential is mal-formed.")
 	}
 
 	// Validate expiry
 	t, err := time.Parse("20060102T150405Z", dateStr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid date: %w", err)
+		return nil, errAuthQueryParams("X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"")
 	}
-	expiresSecs := 604800 // default 7 days max
-	if expiresStr != "" {
-		if parsed, parseErr := strconv.Atoi(expiresStr); parseErr == nil && parsed > 0 {
-			expiresSecs = parsed
-		}
+	// A presigned URL has to say how long it lives. A missing X-Amz-Expires used
+	// to default to the seven day maximum, so a URL meant to last minutes lived
+	// for a week.
+	expiresSecs, perr := strconv.Atoi(expiresStr)
+	if expiresStr == "" || perr != nil || expiresSecs <= 0 {
+		return nil, errAuthQueryParams("X-Amz-Expires must be a positive number of seconds.")
 	}
 	// AWS caps presigned URL expiry at 7 days (604800 seconds)
 	if expiresSecs > 604800 {
-		return nil, fmt.Errorf("presigned URL expiry exceeds maximum of 604800 seconds")
+		return nil, errAuthQueryParams("X-Amz-Expires must be less than a week (in seconds) that is 604800")
+	}
+	// A URL dated in the future was accepted, which let one be minted to start
+	// working later and so outlive its stated lifetime.
+	if time.Until(t) > maxClockSkew {
+		return nil, errAuthAccessDenied("Request is not valid yet")
 	}
 	if time.Since(t) > time.Duration(expiresSecs)*time.Second {
-		return nil, fmt.Errorf("presigned URL expired")
+		return nil, &authError{code: "AccessDenied", msg: "Request has expired", status: http.StatusForbidden, detail: "presigned URL expired"}
+	}
+	credDate := credParts[1]
+	if credDate != dateStr[:8] {
+		return nil, errAuthQueryParams("Invalid credential date. Date is not the same as X-Amz-Date.")
 	}
 
-	// Validate signature — rebuild canonical request from query params
+	// Validate signature, rebuilding the canonical request from the query
 	if signedHeaders == "" {
 		signedHeaders = "host"
 	}
+	if !signsHost(signedHeaders) {
+		return nil, errAuthQueryParams("X-Amz-SignedHeaders must include host.")
+	}
 	region := credParts[2]
 	service := credParts[3]
-	credDate := credParts[1]
+
+	identity, secretKey, err := a.resolveIdentity(credParts[0], r)
+	if err != nil && !isAfterSignature(err) {
+		return nil, err
+	}
 
 	// Build canonical query string (all params except X-Amz-Signature)
 	canonicalParams := url.Values{}
@@ -388,16 +558,15 @@ func (a *Authenticator) authenticatePresigned(r *http.Request) (*iam.Identity, e
 		signedHeaders,
 	)
 
-	scope := fmt.Sprintf("%s/%s/%s/aws4_request", credDate, region, service)
-	hash := sha256.Sum256([]byte(canonicalRequest))
-	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s",
-		dateStr, scope, hex.EncodeToString(hash[:]))
-
+	stringToSign := buildStringToSignAt(dateStr, credDate, region, service, canonicalRequest)
 	signingKey := deriveSigningKey(secretKey, credDate, region, service)
 	expectedSig := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
 	if !hmac.Equal([]byte(signature), []byte(expectedSig)) {
-		return nil, fmt.Errorf("signature mismatch")
+		return nil, errAuthSignature()
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return identity, nil
@@ -429,7 +598,9 @@ func (a *Authenticator) AuthorizeWithContext(identity *iam.Identity, action, res
 	if identity.PolicyLoadFailed {
 		return fmt.Errorf("access denied: %s on %s (a policy attached to this identity could not be parsed)", action, resource)
 	}
-	allowed, explicitDeny := iam.EvaluateDetailed(identity.Policies, action, resource, ctx)
+	// A scoped session is allowed only what both its own policy and its source
+	// user's allow, and a Deny in either is final.
+	allowed, explicitDeny := iam.EvaluateIdentity(identity, action, resource, ctx)
 
 	// An explicit Deny written by the operator is final. It is not put to the
 	// external authorizer even in authoritative mode, so turning that mode on
@@ -557,7 +728,11 @@ func buildStringToSign(dateStr, region, service, canonicalRequest string, r *htt
 	if amzDate == "" {
 		amzDate = time.Now().UTC().Format("20060102T150405Z")
 	}
+	return buildStringToSignAt(amzDate, dateStr, region, service, canonicalRequest)
+}
 
+// buildStringToSignAt is the SigV4 string to sign for a request stamped amzDate.
+func buildStringToSignAt(amzDate, dateStr, region, service, canonicalRequest string) string {
 	scope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStr, region, service)
 	hash := sha256.Sum256([]byte(canonicalRequest))
 
@@ -620,22 +795,6 @@ func hmacSHA256(key, data []byte) []byte {
 }
 
 func (a *Authenticator) GetAccessKey() string {
-	return a.adminAccessKey
-}
-
-// hasOwnPolicies reports whether an identity carries policies of its own. For an
-// STS session this is the inline session policy: when it exists it is the whole
-// permission set, and it must not be widened by the source user's policies.
-func (a *Authenticator) hasOwnPolicies(userID string) bool {
-	if userID == "" || a.store == nil {
-		return false
-	}
-	policies, err := a.store.GetUserPolicies(userID)
-	if err != nil {
-		// An unreadable policy set is not an empty one. Treat the session as
-		// scoped so a store error cannot silently promote it to the source
-		// user's full permissions.
-		return true
-	}
-	return len(policies) > 0
+	ak, _ := a.adminPair()
+	return ak
 }

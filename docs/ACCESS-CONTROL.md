@@ -106,13 +106,23 @@ Rules worth knowing:
   and granting the listing never makes objects readable.
 - A statement with no `Resource` grants nothing.
 - An explicit `Deny` always wins over an `Allow`.
+- `Condition` is evaluated, with the same operators as IAM policies.
+  `aws:SourceIp` is the address the connection comes from, never an
+  `X-Forwarded-For` header, and `s3:prefix` is set only when the request names a
+  prefix. A condition that cannot be decided (a key the request does not carry,
+  or an operator VaultS3 does not implement) makes an `Allow` grant nothing and
+  a `Deny` still apply. Before 5.0.0 conditions in bucket policies were
+  ignored, so a conditional `Allow` granted to everyone.
 - **Public Access Block overrides the policy.** With `BlockPublicPolicy` or
   `RestrictPublicBuckets` set, the bucket is never anonymously accessible no
   matter what its policy says.
 
-Static website hosting is separate from all of this: enabling it serves GET and
-HEAD without authentication for the whole bucket by design. Do not enable it on a
-bucket holding anything private.
+Static website hosting is separate from all of this: enabling it serves every
+object in the bucket to anyone through plain GET and HEAD requests (no query
+string), by design. Do not enable it on a bucket holding anything private. S3 API
+calls on a website bucket still need authentication: a listing, `?versionId=`, or
+any configuration such as `?policy`. Before 5.0.0 those were answered to anyone
+as well.
 
 ## CORS per Bucket
 

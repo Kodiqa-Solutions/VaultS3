@@ -63,8 +63,10 @@ spec:
               export VAULTS3_CLUSTER_REPAIR_INTERVAL_SECS={{ .Values.cluster.repairIntervalSecs }}
               {{- end }}
               export VAULTS3_CLUSTER_JOIN_ADDR="{{ include "vaults3.fullname" . }}-headless:{{ .Values.service.port }}"
-              # Authenticate inter-node calls with the (shared) admin secret key.
-              export VAULTS3_CLUSTER_SECRET="$VAULTS3_SECRET_KEY"
+              # Inter-node calls are authenticated with the cluster secret. A
+              # Secret without that key (an existingSecret made for an older
+              # chart) falls back to the admin secret, which is what it was.
+              export VAULTS3_CLUSTER_SECRET="${VAULTS3_CLUSTER_SECRET_VALUE:-$VAULTS3_SECRET_KEY}"
               if [ "$ORD" = "0" ]; then
                 export VAULTS3_CLUSTER_BOOTSTRAP=true
               else
@@ -96,6 +98,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "vaults3.secretName" . }}
                   key: secret-key
+            - name: VAULTS3_CLUSTER_SECRET_VALUE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vaults3.secretName" . }}
+                  key: cluster-secret
+                  optional: true
             - name: VAULTS3_DATA_DIR
               value: /data
             - name: VAULTS3_METADATA_DIR

@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -89,32 +88,49 @@ func (h *Healer) healScope(bucket, prefix string) HealResult {
 	}
 
 	for _, name := range bucketNames {
-		// List .ec/ prefix to find erasure-coded objects
-		objects, _, err := h.engine.inner.ListObjects(name, ".ec/", "", 10000)
-		if err != nil {
-			continue
-		}
-
-		// Group by object key (extract from .ec/{key}/meta.json)
-		seen := make(map[string]bool)
-		for _, obj := range objects {
-			key := extractObjectKey(obj.Key)
-			if key == "" || seen[key] {
-				continue
-			}
-			if prefix != "" && !strings.HasPrefix(key, prefix) {
-				continue
-			}
-			seen[key] = true
+		h.forEachCodedObject(name, prefix, func(key string) {
 			res.Scanned++
-
 			if h.healObject(name, key) {
 				res.Repaired++
 			}
-		}
+		})
 	}
 
 	return res
+}
+
+// healPageSize is how many object keys one metadata page holds. A var so a
+// test can force several pages without writing thousands of objects.
+var healPageSize = 1000
+
+// forEachCodedObject calls fn for every erasure-coded object in bucket under
+// prefix. It pages through the metadata store, which keeps keys sorted, and
+// checks each key for a meta.json. The previous scan listed the .ec/ tree with
+// a cap of 10,000 files, and every object has five or more files there, so on
+// a bucket with more than about 2,000 coded objects the rest were never
+// checked or repaired. A coded object with no metadata record cannot be read
+// by anyone, so it has nothing worth healing.
+//
+// Each page is fetched and released before fn runs, so fn never executes
+// inside a store transaction.
+func (h *Healer) forEachCodedObject(bucket, prefix string, fn func(key string)) {
+	after := ""
+	for {
+		objs, truncated, err := h.store.ListLatestObjects(bucket, prefix, after, healPageSize)
+		if err != nil {
+			slog.Error("erasure healer: list objects failed", "bucket", bucket, "error", err)
+			return
+		}
+		for _, o := range objs {
+			if h.engine.backendFor(0).ObjectExists(bucket, metaKey(o.Key)) {
+				fn(o.Key)
+			}
+		}
+		if !truncated || len(objs) == 0 {
+			return
+		}
+		after = objs[len(objs)-1].Key
+	}
 }
 
 // healObject checks a single EC object and repairs missing shards.
@@ -135,23 +151,14 @@ func (h *Healer) healObject(bucket, key string) bool {
 
 	totalShards := meta.DataShards + meta.ParityShards
 
-	// Check which shards are missing
+	// Check which shards are missing. A shard that is short or fails its
+	// checksum counts as missing, so it is rebuilt and rewritten here too.
 	shards := make([][]byte, totalShards)
 	missing := make([]int, 0)
 
 	for i := 0; i < totalShards; i++ {
-		backend := h.engine.backendFor(i)
-		sKey := shardKey(key, i)
-
-		reader, _, err := backend.GetObject(bucket, sKey)
-		if err != nil {
-			shards[i] = nil
-			missing = append(missing, i)
-			continue
-		}
-		data, err := io.ReadAll(reader)
-		reader.Close()
-		if err != nil {
+		data, ok := h.engine.readWholeShard(bucket, key, meta, i)
+		if !ok {
 			shards[i] = nil
 			missing = append(missing, i)
 			continue
@@ -188,7 +195,7 @@ func (h *Healer) healObject(bucket, key string) bool {
 	// Write repaired shards back
 	for _, idx := range missing {
 		backend := h.engine.backendFor(idx)
-		sKey := shardKey(key, idx)
+		sKey := meta.shardPath(key, idx)
 		if _, _, err := backend.PutObject(bucket, sKey, bytes.NewReader(shards[idx]), int64(len(shards[idx]))); err != nil {
 			slog.Error("erasure healer: write repaired shard failed",
 				"bucket", bucket, "key", key, "shard", idx, "error", err,
@@ -204,27 +211,6 @@ func (h *Healer) healObject(bucket, key string) bool {
 	return true
 }
 
-// extractObjectKey extracts the original object key from an .ec/ path.
-// Input: ".ec/some/path/to/file.txt/meta.json" → "some/path/to/file.txt"
-// Input: ".ec/some/path/to/file.txt/shard-00" → "some/path/to/file.txt"
-func extractObjectKey(ecPath string) string {
-	if len(ecPath) < 5 || ecPath[:4] != ".ec/" {
-		return ""
-	}
-	rest := ecPath[4:] // "some/path/to/file.txt/meta.json"
-
-	// Find the last "/" before meta.json or shard-XX
-	for i := len(rest) - 1; i >= 0; i-- {
-		if rest[i] == '/' {
-			suffix := rest[i+1:]
-			if suffix == "meta.json" || (len(suffix) >= 6 && suffix[:6] == "shard-") {
-				return rest[:i]
-			}
-		}
-	}
-	return ""
-}
-
 // HealStatus returns stats about erasure-coded objects.
 type HealStatus struct {
 	TotalObjects    int `json:"total_objects"`
@@ -238,26 +224,14 @@ func (h *Healer) Status() HealStatus {
 	buckets, _ := h.store.ListBuckets()
 
 	for _, bucket := range buckets {
-		objects, _, err := h.engine.inner.ListObjects(bucket.Name, ".ec/", "", 10000)
-		if err != nil {
-			continue
-		}
-
-		seen := make(map[string]bool)
-		for _, obj := range objects {
-			key := extractObjectKey(obj.Key)
-			if key == "" || seen[key] {
-				continue
-			}
-			seen[key] = true
+		h.forEachCodedObject(bucket.Name, "", func(key string) {
 			status.TotalObjects++
-
 			if h.isDegraded(bucket.Name, key) {
 				status.DegradedObjects++
 			} else {
 				status.HealthyObjects++
 			}
-		}
+		})
 	}
 
 	return status
@@ -280,7 +254,7 @@ func (h *Healer) isDegraded(bucket, key string) bool {
 	totalShards := meta.DataShards + meta.ParityShards
 	for i := 0; i < totalShards; i++ {
 		backend := h.engine.backendFor(i)
-		if !backend.ObjectExists(bucket, shardKey(key, i)) {
+		if !backend.ObjectExists(bucket, meta.shardPath(key, i)) {
 			return true
 		}
 	}

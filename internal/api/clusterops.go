@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/hmac"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -190,7 +191,14 @@ func (h *APIHandler) handleClusterDrain(w http.ResponseWriter, r *http.Request, 
 	var req struct {
 		NodeID string `json:"nodeId"`
 	}
-	_ = readJSON(r, &req) // body optional (defaults to this node)
+	// The body is optional, and an empty one means this node. A body that is
+	// present but does not parse is refused: it used to be ignored, so a typo in
+	// the node id field, or a truncated request, drained the node that happened
+	// to receive it instead of the one named.
+	if err := readJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
 
 	self := ""
 	if h.clusterCtl != nil {
@@ -524,12 +532,14 @@ func (h *APIHandler) handleClusterRebalance(w http.ResponseWriter, _ *http.Reque
 		writeError(w, http.StatusBadRequest, "rebalance is unavailable (node not clustered)")
 		return
 	}
-	h.triggerRebalance()
-	running := false
-	if h.rebalanceRunning != nil {
-		running = h.rebalanceRunning()
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "triggered", "running": running})
+	// Rebalance no longer moves data: its transfers were refused by every
+	// node, and had they worked they would have deleted valid copies. Replica
+	// repair does the job, so the endpoint answers with what to use instead.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "retired",
+		"running": false,
+		"message": "rebalance no longer moves data: replica repair restores every object's placement and copy count (POST /api/v1/cluster/repair, or wait for the next scheduled scan)",
+	})
 }
 
 // SetReplicaRepair wires the replica repair trigger and its status reader.

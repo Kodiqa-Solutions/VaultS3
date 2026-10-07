@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,4 +44,36 @@ var InterNodeTransport = &http.Transport{
 // stream a body (an overall timeout would cap the transfer, not just the setup).
 func InterNodeClient(timeout time.Duration) *http.Client {
 	return &http.Client{Transport: InterNodeTransport, Timeout: timeout}
+}
+
+// interNodeScheme is the scheme every node-to-node call uses. A node with TLS
+// enabled serves its API, and every /cluster/ endpoint on it, over HTTPS only,
+// so it has to be reached that way. The control plane used to hard-code http://,
+// which with TLS on either failed outright or, behind something that accepted
+// plain HTTP, sent the cluster secret across the wire in clear text on every
+// forwarded write, read-index query, shard call and join.
+//
+// It is process-wide because every node in a cluster serves the same scheme and
+// the calls are spread over several types. The server sets it once at startup.
+var interNodeScheme atomic.Value
+
+// SetInterNodeScheme sets the scheme for node-to-node calls: "https" when the
+// server has TLS enabled, "http" otherwise. Anything else is ignored.
+func SetInterNodeScheme(scheme string) {
+	if scheme == "http" || scheme == "https" {
+		interNodeScheme.Store(scheme)
+	}
+}
+
+// InterNodeScheme returns the scheme node-to-node calls use.
+func InterNodeScheme() string {
+	if s, ok := interNodeScheme.Load().(string); ok {
+		return s
+	}
+	return "http"
+}
+
+// interNodeURL builds the URL of a path on a peer's API address.
+func interNodeURL(addr, path string) string {
+	return InterNodeScheme() + "://" + addr + path
 }

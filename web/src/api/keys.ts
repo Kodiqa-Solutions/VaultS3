@@ -1,4 +1,5 @@
 import { apiFetch } from './client'
+import { encodeSegment } from './paths'
 
 export interface AccessKey {
   accessKey: string
@@ -27,6 +28,6 @@ export function createKey(userId: string, buckets?: string[]): Promise<CreatedKe
   })
 }
 
-export function deleteKey(accessKey: string): Promise<void> {
-  return apiFetch<void>(`/keys/${accessKey}`, { method: 'DELETE' })
+export async function deleteKey(accessKey: string): Promise<void> {
+  return apiFetch<void>(`/keys/${encodeSegment(accessKey)}`, { method: 'DELETE' })
 }

@@ -77,9 +77,13 @@ type TriggerManager struct {
 // NewTriggerManager creates a new trigger manager.
 func NewTriggerManager(store metadata.StoreAPI, engine storage.Engine, cfg config.LambdaConfig) *TriggerManager {
 	return &TriggerManager{
-		store:           store,
-		engine:          engine,
-		client:          &http.Client{Timeout: time.Duration(cfg.TimeoutSecs) * time.Second},
+		store:  store,
+		engine: engine,
+		// The function URL is checked when the trigger is saved, and again on
+		// every dial (ssrfguard.go). Following a redirect would let it send
+		// the call anywhere after the save-time check, so redirects are not
+		// followed.
+		client:          newFunctionClient(time.Duration(cfg.TimeoutSecs)*time.Second, false),
 		workerCh:        make(chan triggerJob, cfg.QueueSize),
 		maxResponseSize: cfg.MaxResponseSize,
 		maxWorkers:      cfg.MaxWorkers,
@@ -209,6 +213,15 @@ func (m *TriggerManager) executeTrigger(job triggerJob) {
 		return
 	}
 
+	// A trigger saved before 5.0.0 may still name another bucket. Its output is
+	// refused rather than written there: the write below bypasses IAM, object
+	// lock and quotas, so it must never leave the bucket that fired it.
+	if job.trigger.OutputBucket != "" && job.trigger.OutputBucket != job.bucket {
+		slog.Warn("lambda output refused: output_bucket is not the trigger's own bucket",
+			"trigger_id", job.trigger.ID, "bucket", job.bucket, "output_bucket", job.trigger.OutputBucket)
+		return
+	}
+
 	// Store response as new object if output bucket is configured
 	if job.trigger.OutputBucket != "" && job.trigger.OutputKeyTemplate != "" {
 		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, m.maxResponseSize))
@@ -232,20 +245,26 @@ func (m *TriggerManager) executeTrigger(job triggerJob) {
 			contentType = "application/octet-stream"
 		}
 
-		_, _, err = m.engine.PutObject(job.trigger.OutputBucket, outputKey, bytes.NewReader(responseBody), int64(len(responseBody)))
+		written, etag, err := m.engine.PutObject(job.trigger.OutputBucket, outputKey, bytes.NewReader(responseBody), int64(len(responseBody)))
 		if err != nil {
 			slog.Error("lambda error storing output", "trigger_id", job.trigger.ID, "bucket", job.trigger.OutputBucket, "key", outputKey, "error", err)
 			return
 		}
 
-		// Update metadata
-		m.store.PutObjectMeta(metadata.ObjectMeta{
+		// The metadata error used to be dropped, and the record carried no
+		// ETag. A failed write left bytes no metadata refers to, which the
+		// orphan reclaim later deletes, while the log said the output was stored.
+		if err := m.store.PutObjectMeta(metadata.ObjectMeta{
 			Bucket:       job.trigger.OutputBucket,
 			Key:          outputKey,
 			ContentType:  contentType,
-			Size:         int64(len(responseBody)),
+			Size:         written,
+			ETag:         etag,
 			LastModified: time.Now().Unix(),
-		})
+		}); err != nil {
+			slog.Error("lambda error recording output metadata", "trigger_id", job.trigger.ID, "bucket", job.trigger.OutputBucket, "key", outputKey, "error", err)
+			return
+		}
 
 		slog.Info("lambda trigger stored output", "trigger_id", job.trigger.ID, "bucket", job.trigger.OutputBucket, "key", outputKey, "bytes", len(responseBody))
 	}

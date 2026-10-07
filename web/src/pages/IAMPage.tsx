@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useI18n } from '../i18n'
+import { useInFlight } from '../hooks/useInFlight'
 import {
   listUsers, createUser, deleteUser, attachUserPolicy, detachUserPolicy,
   addUserToGroup, removeUserFromGroup, setIPRestrictions,
@@ -24,6 +25,8 @@ export default function IAMPage() {
   const [createName, setCreateName] = useState('')
   const [policyDoc, setPolicyDoc] = useState('{\n  "Version": "2012-10-17",\n  "Statement": []\n}')
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleting, runDelete] = useInFlight()
+  const [detaching, runDetach] = useInFlight()
 
   // detail/expand
   const [expandedUser, setExpandedUser] = useState<string | null>(null)
@@ -61,7 +64,7 @@ export default function IAMPage() {
     }
   }
 
-  const handleDelete = async () => {
+  const handleDelete = () => runDelete(async () => {
     if (!deleteTarget) return
     setError('')
     try {
@@ -73,7 +76,7 @@ export default function IAMPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : t('iam.deleteFailed'))
     }
-  }
+  })
 
   const handleAttachPolicy = async (target: string, policy: string, isGroup: boolean) => {
     setError('')
@@ -87,7 +90,7 @@ export default function IAMPage() {
     }
   }
 
-  const handleDetachPolicy = async (target: string, policy: string, isGroup: boolean) => {
+  const handleDetachPolicy = (target: string, policy: string, isGroup: boolean) => runDetach(async () => {
     setError('')
     try {
       if (isGroup) await detachGroupPolicy(target, policy)
@@ -96,7 +99,7 @@ export default function IAMPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : t('iam.detachFailed'))
     }
-  }
+  })
 
   const handleAddToGroup = async (userName: string, groupName: string) => {
     setError('')
@@ -247,8 +250,8 @@ export default function IAMPage() {
                   {(u.policyArns || []).map(p => (
                     <div key={p} className="flex items-center justify-between bg-white dark:bg-gray-800 rounded px-2 py-1">
                       <span className="text-sm text-gray-700 dark:text-gray-300">{p}</span>
-                      <button onClick={() => handleDetachPolicy(u.name, p, false)}
-                        className="text-xs text-red-500 hover:text-red-700">{t('iam.detach')}</button>
+                      <button onClick={() => handleDetachPolicy(u.name, p, false)} disabled={detaching}
+                        className="text-xs text-red-500 hover:text-red-700 disabled:opacity-50">{t('iam.detach')}</button>
                     </div>
                   ))}
                 </div>
@@ -367,8 +370,8 @@ export default function IAMPage() {
               {(g.policyArns || []).map(p => (
                 <div key={p} className="flex items-center justify-between bg-white dark:bg-gray-800 rounded px-2 py-1">
                   <span className="text-sm text-gray-700 dark:text-gray-300">{p}</span>
-                  <button onClick={() => handleDetachPolicy(g.name, p, true)}
-                    className="text-xs text-red-500 hover:text-red-700">{t('iam.detach')}</button>
+                  <button onClick={() => handleDetachPolicy(g.name, p, true)} disabled={detaching}
+                    className="text-xs text-red-500 hover:text-red-700 disabled:opacity-50">{t('iam.detach')}</button>
                 </div>
               ))}
             </div>
@@ -467,16 +470,16 @@ export default function IAMPage() {
       {deleteTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
           <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-gray-200 dark:border-gray-700 p-6 w-full max-w-sm mx-4">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Delete {tab.slice(0, -1)}</h3>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">{t(tab === 'users' ? 'iam.deleteUserTitle' : tab === 'groups' ? 'iam.deleteGroupTitle' : 'iam.deletePolicyTitle')}</h3>
             <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
               {t('buckets.deleteConfirm')} <strong>{deleteTarget}</strong>?
               {tab === 'users' && <><br />{t('iam.deleteUserDeletesKeys')}</>}
             </p>
             <div className="flex gap-2 justify-end">
-              <button onClick={() => setDeleteTarget(null)}
-                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">{t('iam.cancel')}</button>
-              <button onClick={handleDelete}
-                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors">{t('iam.delete')}</button>
+              <button onClick={() => setDeleteTarget(null)} disabled={deleting}
+                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50">{t('iam.cancel')}</button>
+              <button onClick={handleDelete} disabled={deleting}
+                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50">{t('iam.delete')}</button>
             </div>
           </div>
         </div>

@@ -13,6 +13,9 @@ import (
 // FileSystem implements Engine using the local filesystem.
 type FileSystem struct {
 	dataDir string
+	// noDirSync skips the directory fsync after a rename. It is stored inverted
+	// so the zero value is the safe default.
+	noDirSync bool
 }
 
 func NewFileSystem(dataDir string) (*FileSystem, error) {
@@ -20,6 +23,79 @@ func NewFileSystem(dataDir string) (*FileSystem, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	return &FileSystem{dataDir: dataDir}, nil
+}
+
+// SetSyncDirs controls whether the directory is fsynced after an object file is
+// renamed into place (default on). The file's own bytes are always synced
+// before the rename. Without the directory sync a power loss can lose the
+// rename itself, so a key whose metadata was committed reads as missing. Turn
+// it off only on a filesystem that orders renames durably on its own, or when
+// that window is acceptable.
+func (fs *FileSystem) SetSyncDirs(on bool) { fs.noDirSync = !on }
+
+// writeFileAtomic streams reader into a temp file next to dst, syncs it and
+// renames it over dst, so a failed or interrupted write never truncates the
+// object already there. The metadata store fsyncs its commit, so the bytes
+// have to be durable first: otherwise a power loss right after a 200 could
+// leave committed metadata pointing at an empty or missing file.
+func (fs *FileSystem) writeFileAtomic(dst string, reader io.Reader) (int64, string, error) {
+	dir := filepath.Dir(dst)
+	tmpFile, err := os.CreateTemp(dir, ".vaults3-tmp-*")
+	if err != nil {
+		return 0, "", fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	h := md5.New()
+	written, err := io.Copy(tmpFile, io.TeeReader(reader, h))
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return 0, "", fmt.Errorf("write object: %w", err)
+	}
+	if err := syncFile(tmpFile); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return 0, "", fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return 0, "", fmt.Errorf("close temp file: %w", err)
+	}
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, dst); err != nil {
+		os.Remove(tmpPath)
+		return 0, "", fmt.Errorf("rename object: %w", err)
+	}
+	if !fs.noDirSync {
+		if err := syncDirFn(dir); err != nil {
+			return 0, "", fmt.Errorf("sync object dir: %w", err)
+		}
+	}
+
+	etag := fmt.Sprintf("\"%x\"", h.Sum(nil))
+	return written, etag, nil
+}
+
+// syncFile and syncDirFn are variables so a test can observe that every write
+// path asks for durability. Nothing else replaces them.
+var (
+	syncFile  = (*os.File).Sync
+	syncDirFn = syncDir
+)
+
+// syncDir fsyncs a directory so a rename into it survives a power loss.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func (fs *FileSystem) DataDir() string {
@@ -107,27 +183,53 @@ func (fs *FileSystem) bucketPath(bucket string) string {
 	return p
 }
 
-func (fs *FileSystem) objectPath(bucket, key string) string {
-	if p, ok := fs.containedPath(bucket, key); ok {
-		return p
+// within joins segments onto base and reports whether the result lies strictly
+// inside base.
+func within(base string, segments ...string) (string, bool) {
+	p := filepath.Join(append([]string{base}, segments...)...)
+	if !strings.HasPrefix(p, base+string(filepath.Separator)) {
+		return "", false
 	}
-	// The key escaped but the bucket is sound: keep the old sentinel so the
-	// failure still lands inside that bucket.
-	if bp, ok := fs.containedPath(bucket); ok {
-		return filepath.Join(bp, "invalid-key")
-	}
-	// The bucket itself escaped, so there is no bucket directory to fall back to.
-	return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-key")
+	return p, true
 }
 
-func (fs *FileSystem) versionPath(bucket, key, versionID string) string {
-	if p, ok := fs.containedPath(bucket, ".vs", key, versionID); ok {
+// objectPath keeps a key inside its own bucket's directory. It used to check
+// only that the path stayed inside the data directory, so a key such as
+// "../victim/a.txt" resolved to another bucket's object and overwrote it. The
+// S3 router refuses ".." in the request path, but keys also arrive from a
+// Snowball archive, a POST upload form and a remote migration source, none of
+// which pass through it. An empty key, which resolved to the bucket directory
+// itself, is refused the same way.
+func (fs *FileSystem) objectPath(bucket, key string) string {
+	bp, ok := fs.containedPath(bucket)
+	if !ok {
+		// The bucket itself escaped, so there is no bucket directory to fall back to.
+		return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-key")
+	}
+	if p, ok := within(bp, key); ok {
 		return p
 	}
-	if bp, ok := fs.containedPath(bucket, ".vs"); ok {
-		return filepath.Join(bp, "invalid-version")
+	// The key escaped: keep the old sentinel so the failure lands inside this
+	// bucket and touches nothing else.
+	return filepath.Join(bp, "invalid-key")
+}
+
+// versionPath keeps a version inside its object's directory under .vs/, so
+// neither the key nor the version ID can reach a plain object, another key's
+// versions or another bucket.
+func (fs *FileSystem) versionPath(bucket, key, versionID string) string {
+	vs, ok := fs.containedPath(bucket, ".vs")
+	if !ok {
+		return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-version")
 	}
-	return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-version")
+	keyDir, ok := within(vs, key)
+	if !ok {
+		return filepath.Join(vs, "invalid-version")
+	}
+	if p, ok := within(keyDir, versionID); ok {
+		return p
+	}
+	return filepath.Join(vs, "invalid-version")
 }
 
 // CreateBucketDir refuses a name that resolves outside the data directory rather
@@ -171,32 +273,7 @@ func (fs *FileSystem) PutObject(bucket, key string, reader io.Reader, size int64
 	}
 
 	// Write to temp file first, then atomic rename to prevent corruption
-	tmpFile, err := os.CreateTemp(filepath.Dir(objPath), ".vaults3-tmp-*")
-	if err != nil {
-		return 0, "", fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-
-	h := md5.New()
-	written, err := io.Copy(tmpFile, io.TeeReader(reader, h))
-	if err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
-		return 0, "", fmt.Errorf("write object: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpPath)
-		return 0, "", fmt.Errorf("close temp file: %w", err)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tmpPath, objPath); err != nil {
-		os.Remove(tmpPath)
-		return 0, "", fmt.Errorf("rename object: %w", err)
-	}
-
-	etag := fmt.Sprintf("\"%x\"", h.Sum(nil))
-	return written, etag, nil
+	return fs.writeFileAtomic(objPath, reader)
 }
 
 func (fs *FileSystem) GetObject(bucket, key string) (ReadSeekCloser, int64, error) {
@@ -367,20 +444,14 @@ func (fs *FileSystem) PutObjectVersion(bucket, key, versionID string, reader io.
 		return 0, "", fmt.Errorf("create version dir: %w", err)
 	}
 
-	f, err := os.Create(vPath)
+	// The version file is written beside its final path and renamed in, the
+	// same as PutObject. Writing it in place truncated an existing version
+	// (the null version is rewritten on every PUT to a suspended bucket) the
+	// moment the write began, and the error path then removed it outright.
+	written, etag, err := fs.writeFileAtomic(vPath, reader)
 	if err != nil {
-		return 0, "", fmt.Errorf("create version file: %w", err)
-	}
-	defer f.Close()
-
-	h := md5.New()
-	written, err := io.Copy(f, io.TeeReader(reader, h))
-	if err != nil {
-		os.Remove(vPath)
 		return 0, "", fmt.Errorf("write version: %w", err)
 	}
-
-	etag := fmt.Sprintf("\"%x\"", h.Sum(nil))
 	return written, etag, nil
 }
 

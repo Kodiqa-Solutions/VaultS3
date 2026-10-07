@@ -56,7 +56,20 @@ func (h *APIHandler) routeSnapshots(w http.ResponseWriter, r *http.Request, buck
 	case action == "restore" && r.Method == http.MethodPost:
 		res, err := h.snapshots.Restore(bucket, id)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			if res == nil {
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			// Part of the bucket was restored. Say how much, with the reasons,
+			// rather than a bare error that hides what did change.
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":    err.Error(),
+				"reverted": res.Reverted,
+				"removed":  res.Removed,
+				"skipped":  res.Skipped,
+				"failed":   res.Failed,
+				"errors":   res.Errors,
+			})
 			return
 		}
 		writeJSON(w, http.StatusOK, res)

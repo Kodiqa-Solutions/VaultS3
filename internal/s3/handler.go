@@ -5,9 +5,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/bucketcrypto"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -167,6 +168,13 @@ func (h *Handler) SetPerBucketMode(on bool) {
 	h.buckets.perBucketMode = on
 }
 
+// SetPrivateEndpoints passes the operator's choice to let webhooks and lambda
+// functions reach private addresses down to the configuration endpoints.
+func (h *Handler) SetPrivateEndpoints(webhooks, lambda bool) {
+	h.buckets.allowPrivateWebhooks = webhooks
+	h.buckets.allowPrivateLambda = lambda
+}
+
 func (h *Handler) SetKeyManager(m *bucketcrypto.Manager) {
 	h.buckets.keyMgr = m
 	// The object handler needs it too, to answer whether a bucket really is
@@ -274,18 +282,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Cluster proxy: forward to the correct node if this isn't the primary
 	// Skip if already proxied (X-VaultS3-Proxy header present) to prevent loops
 	if h.clusterProxy != nil && r.Header.Get("X-VaultS3-Proxy") == "" {
-		if h.clusterProxy(w, r, bucket, key) {
+		if h.clusterProxy(w, r, bucket, h.websiteRouteKey(r, bucket, key)) {
 			return
 		}
 	}
 
 	// Reject path traversal in keys
 	if key != "" {
-		for _, seg := range strings.Split(key, "/") {
-			if seg == ".." {
-				writeS3Error(w, "InvalidArgument", "Key must not contain '..' path segments", http.StatusBadRequest)
-				return
-			}
+		if msg := objectKeyProblem(key); msg != "" {
+			writeS3Error(w, "InvalidArgument", msg, http.StatusBadRequest)
+			return
 		}
 	}
 
@@ -341,23 +347,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if bucket != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		// The key is part of this decision: a policy scoped to one prefix
 		// publishes that prefix only, never the rest of the bucket.
-		if key != "" && h.store.IsObjectPublicRead(bucket, key) {
+		anonCtx := anonymousPolicyContext(r)
+		if key != "" && h.store.IsObjectPublicRead(bucket, key, anonCtx) {
 			authRequired = false
 		}
 		// A policy granting s3:ListBucket to everyone makes the object listing
 		// itself public. This is only ever the plain listing: every bucket
 		// sub-resource (?policy, ?acl, ...) still requires authentication, so a
 		// public bucket never leaks its own configuration.
-		if key == "" && isPlainBucketListing(r) && h.store.IsBucketPublicList(bucket) {
+		if key == "" && isPlainBucketListing(r) && h.store.IsBucketPublicList(bucket, anonCtx) {
 			authRequired = false
 		}
-		if h.store.IsBucketWebsite(bucket) {
+		// A website bucket is public only for what the website handler serves:
+		// a GET or HEAD with no query string. Any query is an S3 API call and
+		// keeps its authentication. This used to waive it for every GET and HEAD
+		// on the bucket, so an anonymous ?list-type=2, ?versions, ?policy,
+		// ?notification or ?versionId= on a website bucket was answered in full.
+		if servesAsWebsite(r) && h.store.IsBucketWebsite(bucket) {
 			authRequired = false
 		}
 	}
 
-	// Extract client IP — use RemoteAddr for rate limiting (tamper-proof),
-	// X-Forwarded-For only for audit logging (can be spoofed)
+	// The TCP peer is the only client address the caller cannot choose, so it
+	// is what rate limiting, the IP allowlist and every IAM condition see.
+	// X-Forwarded-For is kept for the audit log alone, where it is useful
+	// behind a proxy and harmless if forged.
 	rateLimitIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if rateLimitIP == "" {
 		rateLimitIP = r.RemoteAddr
@@ -367,20 +381,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clientIP = strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])
 	}
 
-	// Rate limit check (uses RemoteAddr, not X-Forwarded-For)
-	if h.rateLimiter != nil {
-		accessKeyID := extractAccessKeyFromAuth(r)
-		if !h.rateLimiter.Allow(rateLimitIP, accessKeyID) {
-			w.Header().Set("Retry-After", "1")
-			writeS3Error(w, "SlowDown", "Rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
+	// Rate limit by address before anything else. The per-key bucket is charged
+	// only once the key has been proven below: it used to be charged here from
+	// the unsigned Authorization header, so anyone could drain a victim key's
+	// allowance just by naming it, and the victim's own requests then failed.
+	if h.rateLimiter != nil && !h.rateLimiter.Allow(rateLimitIP, "") {
+		w.Header().Set("Retry-After", "1")
+		writeS3Error(w, "SlowDown", "Rate limit exceeded", http.StatusTooManyRequests)
+		return
 	}
 
 	// Authenticate and authorize
 	if authRequired {
 		identity, err := h.auth.Authenticate(r)
 		if err != nil {
+			// The reason goes to the log. The client gets a fixed message per
+			// error code, so a refusal cannot be used to learn which state a
+			// guessed credential is in.
+			slog.Info("s3: request refused at authentication", "reason", err.Error(), "remote", rateLimitIP)
 			// Log authentication failure for security monitoring
 			if h.onAudit != nil {
 				action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
@@ -388,20 +406,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				accessKey := extractAccessKeyFromAuth(r)
 				h.onAudit(accessKey, "", action, resource, "Deny", clientIP, http.StatusForbidden)
 			}
-			writeS3Error(w, "AccessDenied", err.Error(), http.StatusForbidden)
+			writeAuthError(w, err)
+			return
+		}
+
+		if h.rateLimiter != nil && !h.allowKey(identity.AccessKey) {
+			w.Header().Set("Retry-After", "1")
+			writeS3Error(w, "SlowDown", "Rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 
 		// IP access check — use RemoteAddr (tamper-proof), not X-Forwarded-For
 		if err := h.auth.CheckIPAccess(identity, rateLimitIP); err != nil {
+			// The error names the ranges it compared against, which are the
+			// operator's, not the caller's, to know.
+			slog.Info("s3: request refused by the IP access list", "reason", err.Error(),
+				"remote", rateLimitIP, "access_key", identity.AccessKey)
 			if h.onAudit != nil {
 				action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
 				resource := formatResource(bucket, key)
 				h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Deny", clientIP, http.StatusForbidden)
 			}
-			writeS3Error(w, "AccessDenied", err.Error(), http.StatusForbidden)
+			writeS3Error(w, "AccessDenied", "Access Denied", http.StatusForbidden)
 			return
 		}
+
+		// The condition context IAM and the external authorizer evaluate. Its
+		// aws:SourceIp used to be the client-supplied X-Forwarded-For, so a
+		// policy allowing one address range was satisfied by anyone who sent
+		// that header.
+		reqCtx := requestConditionContext(r)
 
 		// Authorize non-admin identities. Admin skips authorization altogether,
 		// which also means it never reaches the external authorizer, so say that
@@ -412,12 +446,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !identity.IsAdmin {
 			action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
 			resource := formatResource(bucket, key)
-			reqCtx := map[string]string{"aws:SourceIp": clientIP}
 			if err := h.auth.AuthorizeWithContext(identity, action, resource, reqCtx); err != nil {
+				slog.Info("s3: request refused by policy", "reason", err.Error(), "access_key", identity.AccessKey)
 				if h.onAudit != nil {
 					h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Deny", clientIP, http.StatusForbidden)
 				}
-				writeS3Error(w, "AccessDenied", err.Error(), http.StatusForbidden)
+				writeS3Error(w, "AccessDenied", "Access Denied", http.StatusForbidden)
 				return
 			}
 			// A copy reads its SOURCE as well as writing its destination, and the
@@ -425,18 +459,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// write access to one bucket could copy any object out of any other
 			// bucket and then read it from their own, which defeats the read side
 			// of the policy model entirely (security assessment finding 13).
-			if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
-				srcBucket, srcKey := parseCopySource(strings.TrimPrefix(copySourcePath(src), "/"))
-				if srcBucket != "" {
-					srcResource := formatResource(srcBucket, srcKey)
-					if err := h.auth.AuthorizeWithContext(identity, "s3:GetObject", srcResource, reqCtx); err != nil {
+			//
+			// The source is parsed by the same function the copy handlers use. It
+			// used to be parsed three different ways, so the key authorized here
+			// was not always the key the handler then read.
+			if hdr := r.Header.Get("X-Amz-Copy-Source"); hdr != "" {
+				if src, perr := parseCopySourceHeader(hdr); perr == nil {
+					srcAction := "s3:GetObject"
+					if src.versionID != "" {
+						srcAction = "s3:GetObjectVersion"
+					}
+					srcResource := formatResource(src.bucket, src.key)
+					if err := h.auth.AuthorizeWithContext(identity, srcAction, srcResource, reqCtx); err != nil {
+						slog.Info("s3: copy refused on its source", "reason", err.Error(), "access_key", identity.AccessKey)
 						if h.onAudit != nil {
-							h.onAudit(identity.AccessKey, identity.UserID, "s3:GetObject", srcResource, "Deny", clientIP, http.StatusForbidden)
+							h.onAudit(identity.AccessKey, identity.UserID, srcAction, srcResource, "Deny", clientIP, http.StatusForbidden)
 						}
-						writeS3Error(w, "AccessDenied", "s3:GetObject on "+srcResource, http.StatusForbidden)
+						writeS3Error(w, "AccessDenied", "Access Denied", http.StatusForbidden)
 						return
 					}
 				}
+				// An unparseable source is refused by the handler before it reads
+				// anything, so there is no source to authorize here.
 			}
 			// Record allowed access
 			if h.onAudit != nil {
@@ -447,7 +491,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// Admins skip policy evaluation, but per-entry checks still need the
 			// identity to see that.
-			r = withIdentity(r, identity, map[string]string{"aws:SourceIp": clientIP})
+			r = withIdentity(r, identity, reqCtx)
 			if h.onAudit != nil {
 				action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
 				resource := formatResource(bucket, key)
@@ -497,12 +541,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Static website serving — intercept before normal routing
 	if bucket != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		if h.store.IsBucketWebsite(bucket) {
-			// Only serve website for non-API requests (no query params like ?policy, ?versioning, etc.)
-			if len(r.URL.Query()) == 0 {
-				h.serveWebsite(w, r, bucket, key)
-				return
-			}
+		if servesAsWebsite(r) && h.store.IsBucketWebsite(bucket) {
+			h.serveWebsite(w, r, bucket, key)
+			return
 		}
 	}
 
@@ -1003,8 +1044,72 @@ func parsePath(path string) (bucket, key string) {
 	return
 }
 
+// subresourceAction is the IAM action for one (sub-resource, method) pair. It
+// is keyed on the method because each verb on a sub-resource is a different
+// permission: s3:PutLifecycleConfiguration is not s3:CreateBucket, and
+// s3:DeleteBucketPolicy is not s3:GetBucketPolicy.
+type subresourceAction struct {
+	sub     string
+	actions map[string]string
+}
+
+// bucketActions lists the bucket sub-resources in the order the router tests
+// them, so a request naming two of them is mapped to the one that is actually
+// served. Every sub-resource used to fall back on the bare method: any PUT was
+// s3:CreateBucket, any GET s3:ListBucket and any DELETE s3:DeleteBucket, so a
+// user allowed only to create buckets could rewrite a bucket's lifecycle,
+// website, replication and notification configuration, and DELETE ?policy was
+// authorized as s3:GetBucketPolicy. The names are the AWS ones, including where
+// AWS deletes a configuration under its Put action.
+var bucketActions = []subresourceAction{
+	{"policy", map[string]string{http.MethodPut: "s3:PutBucketPolicy", http.MethodGet: "s3:GetBucketPolicy", http.MethodDelete: "s3:DeleteBucketPolicy"}},
+	{"notification", map[string]string{http.MethodPut: "s3:PutBucketNotification", http.MethodGet: "s3:GetBucketNotification", http.MethodDelete: "s3:PutBucketNotification"}},
+	{"lambda", map[string]string{http.MethodPut: "s3:PutBucketNotification", http.MethodGet: "s3:GetBucketNotification", http.MethodDelete: "s3:PutBucketNotification"}},
+	{"cors", map[string]string{http.MethodPut: "s3:PutBucketCORS", http.MethodGet: "s3:GetBucketCORS", http.MethodDelete: "s3:PutBucketCORS"}},
+	{"website", map[string]string{http.MethodPut: "s3:PutBucketWebsite", http.MethodGet: "s3:GetBucketWebsite", http.MethodDelete: "s3:DeleteBucketWebsite"}},
+	{"lifecycle", map[string]string{http.MethodPut: "s3:PutLifecycleConfiguration", http.MethodGet: "s3:GetLifecycleConfiguration", http.MethodDelete: "s3:PutLifecycleConfiguration"}},
+	{"versioning", map[string]string{http.MethodPut: "s3:PutBucketVersioning", http.MethodGet: "s3:GetBucketVersioning"}},
+	{"versions", map[string]string{http.MethodGet: "s3:ListBucketVersions"}},
+	{"object-lock", map[string]string{http.MethodPut: "s3:PutBucketObjectLockConfiguration", http.MethodGet: "s3:GetBucketObjectLockConfiguration"}},
+	{"location", map[string]string{http.MethodGet: "s3:GetBucketLocation"}},
+	{"tagging", map[string]string{http.MethodPut: "s3:PutBucketTagging", http.MethodGet: "s3:GetBucketTagging", http.MethodDelete: "s3:PutBucketTagging"}},
+	{"acl", map[string]string{http.MethodPut: "s3:PutBucketAcl", http.MethodGet: "s3:GetBucketAcl"}},
+	{"encryption", map[string]string{http.MethodPut: "s3:PutEncryptionConfiguration", http.MethodGet: "s3:GetEncryptionConfiguration", http.MethodDelete: "s3:PutEncryptionConfiguration"}},
+	{"publicAccessBlock", map[string]string{http.MethodPut: "s3:PutBucketPublicAccessBlock", http.MethodGet: "s3:GetBucketPublicAccessBlock", http.MethodDelete: "s3:PutBucketPublicAccessBlock"}},
+	{"replication", map[string]string{http.MethodPut: "s3:PutReplicationConfiguration", http.MethodGet: "s3:GetReplicationConfiguration", http.MethodDelete: "s3:PutReplicationConfiguration"}},
+	{"logging", map[string]string{http.MethodPut: "s3:PutBucketLogging", http.MethodGet: "s3:GetBucketLogging"}},
+	{"uploads", map[string]string{http.MethodGet: "s3:ListBucketMultipartUploads"}},
+	// VaultS3's own sub-resources have no AWS action. They get names of their
+	// own, so only a policy granting them by name or by wildcard reaches them.
+	{"durability", map[string]string{http.MethodPut: "s3:PutBucketDurability", http.MethodGet: "s3:GetBucketDurability"}},
+	{"quota", map[string]string{http.MethodPut: "s3:PutBucketQuota", http.MethodGet: "s3:GetBucketQuota"}},
+}
+
+// objectActions is the same for object sub-resources, in router order. The
+// second map is the action when the request names a ?versionId, which AWS
+// treats as a separate permission.
+var objectActions = []struct {
+	sub       string
+	actions   map[string]string
+	versioned map[string]string
+}{
+	{"legal-hold", map[string]string{http.MethodPut: "s3:PutObjectLegalHold", http.MethodGet: "s3:GetObjectLegalHold"}, nil},
+	{"retention", map[string]string{http.MethodPut: "s3:PutObjectRetention", http.MethodGet: "s3:GetObjectRetention"}, nil},
+	{"attributes", map[string]string{http.MethodGet: "s3:GetObjectAttributes"}, map[string]string{http.MethodGet: "s3:GetObjectVersionAttributes"}},
+	{"acl", map[string]string{http.MethodPut: "s3:PutObjectAcl", http.MethodGet: "s3:GetObjectAcl"},
+		map[string]string{http.MethodPut: "s3:PutObjectVersionAcl", http.MethodGet: "s3:GetObjectVersionAcl"}},
+	{"tagging", map[string]string{http.MethodPut: "s3:PutObjectTagging", http.MethodGet: "s3:GetObjectTagging", http.MethodDelete: "s3:DeleteObjectTagging"},
+		map[string]string{http.MethodPut: "s3:PutObjectVersionTagging", http.MethodGet: "s3:GetObjectVersionTagging", http.MethodDelete: "s3:DeleteObjectVersionTagging"}},
+}
+
 // mapMethodToAction maps an HTTP method + context to an S3 IAM action.
+//
+// It has to agree with the router about which operation a request is, because
+// the action it returns is the only thing authorized. Anything it cannot place
+// is "s3:*", which only a full grant satisfies, so an unknown shape fails closed.
 func mapMethodToAction(method, bucket, key string, query map[string][]string) string {
+	has := func(name string) bool { _, ok := query[name]; return ok }
+
 	if key != "" {
 		// A ?versionId names one specific version, which S3 treats as a separate
 		// action from operating on the current version. s3:DeleteObject creates a
@@ -1014,6 +1119,45 @@ func mapMethodToAction(method, bucket, key string, query map[string][]string) st
 		// s3:DeleteObjectVersion) protects nothing, because the allow alone would
 		// authorize the destructive call.
 		versioned := len(query["versionId"]) > 0
+		for _, oa := range objectActions {
+			if !has(oa.sub) {
+				continue
+			}
+			if versioned && oa.versioned != nil {
+				if a, ok := oa.versioned[method]; ok {
+					return a
+				}
+			}
+			if a, ok := oa.actions[method]; ok {
+				return a
+			}
+			return "s3:*"
+		}
+		// These three are POST-only in the router. Any other method falls
+		// through to the plain object operation, and so does the mapping. A POST
+		// on a key used to reach s3:* every time, so a user allowed s3:PutObject
+		// could not upload in parts at all.
+		if method == http.MethodPost {
+			switch {
+			case has("restore"):
+				return "s3:RestoreObject"
+			case has("select"):
+				return "s3:GetObject"
+			case has("uploads"):
+				return "s3:PutObject"
+			}
+		}
+		if len(query["uploadId"]) > 0 && query["uploadId"][0] != "" {
+			switch method {
+			case http.MethodGet:
+				return "s3:ListMultipartUploadParts"
+			case http.MethodPut, http.MethodPost:
+				return "s3:PutObject"
+			case http.MethodDelete:
+				return "s3:AbortMultipartUpload"
+			}
+			return "s3:*"
+		}
 		switch method {
 		case http.MethodGet, http.MethodHead:
 			if versioned {
@@ -1028,42 +1172,47 @@ func mapMethodToAction(method, bucket, key string, query map[string][]string) st
 			}
 			return "s3:DeleteObject"
 		}
+		return "s3:*"
 	}
 
-	if bucket != "" && key == "" {
-		// DeleteObjects names its objects in the body, so the route can only
-		// authorize the weakest thing it implies. It used to fall through to
-		// s3:*, which failed closed but meant a user holding s3:DeleteObject
-		// could not batch delete at all. BatchDelete now authorizes every entry
-		// individually, including s3:DeleteObjectVersion for entries naming a
-		// version, so requiring s3:DeleteObject here is the floor, not the whole
-		// check.
-		if _, ok := query["delete"]; ok && method == http.MethodPost {
-			return "s3:DeleteObject"
-		}
-		// Bucket-level operations
-		if _, ok := query["policy"]; ok {
-			if method == http.MethodPut {
-				return "s3:PutBucketPolicy"
+	if bucket != "" {
+		for _, ba := range bucketActions {
+			if !has(ba.sub) {
+				continue
 			}
-			return "s3:GetBucketPolicy"
+			if a, ok := ba.actions[method]; ok {
+				return a
+			}
+			return "s3:*"
 		}
 		switch method {
+		case http.MethodPost:
+			// DeleteObjects names its objects in the body, so the route can only
+			// authorize the weakest thing it implies. It used to fall through to
+			// s3:*, which failed closed but meant a user holding s3:DeleteObject
+			// could not batch delete at all. BatchDelete now authorizes every entry
+			// individually, including s3:DeleteObjectVersion for entries naming a
+			// version, so requiring s3:DeleteObject here is the floor, not the whole
+			// check.
+			if has("delete") {
+				return "s3:DeleteObject"
+			}
+			// A browser form upload names its key in the body too. PostUpload
+			// authorizes s3:PutObject on that key once it has read it.
+			return "s3:PutObject"
 		case http.MethodPut:
 			return "s3:CreateBucket"
 		case http.MethodDelete:
 			return "s3:DeleteBucket"
-		case http.MethodGet:
-			return "s3:ListBucket"
-		case http.MethodHead:
+		case http.MethodGet, http.MethodHead:
 			return "s3:ListBucket"
 		}
+		return "s3:*"
 	}
 
-	if bucket == "" && method == http.MethodGet {
+	if method == http.MethodGet {
 		return "s3:ListAllMyBuckets"
 	}
-
 	return "s3:*"
 }
 
@@ -1188,18 +1337,108 @@ func extractAccessKeyFromAuth(r *http.Request) string {
 	return ""
 }
 
-// copySourcePath normalises an X-Amz-Copy-Source header to "/bucket/key". The
-// header is URL-encoded and may or may not carry a leading slash.
-func copySourcePath(src string) string {
-	if decoded, err := url.PathUnescape(src); err == nil {
-		src = decoded
+// keyRateLimiter is a limiter that can charge an access key's allowance on its
+// own, without charging an address a second time.
+type keyRateLimiter interface {
+	AllowKey(accessKey string) bool
+}
+
+// allowKey charges the per-key allowance of an authenticated request. The
+// limiter's two-bucket Allow charges an address as well, so a key is charged
+// through a bucket named after it rather than the caller's address, which has
+// already been charged once.
+func (h *Handler) allowKey(accessKey string) bool {
+	if accessKey == "" {
+		return true
 	}
-	if !strings.HasPrefix(src, "/") {
-		src = "/" + src
+	if kl, ok := any(h.rateLimiter).(keyRateLimiter); ok {
+		return kl.AllowKey(accessKey)
 	}
-	// A versionId suffix names the same object; authorization is per key.
-	if i := strings.Index(src, "?"); i >= 0 {
-		src = src[:i]
+	return h.rateLimiter.Allow("access-key:"+accessKey, accessKey)
+}
+
+// requestConditionContext is the context an authenticated request's IAM
+// conditions evaluate against. It is the anonymous context, built from the TCP
+// peer rather than any header, so the two paths cannot disagree about who is
+// asking.
+func requestConditionContext(r *http.Request) map[string]string {
+	return anonymousPolicyContext(r)
+}
+
+// websiteRouteKey is the key a request is routed by on a cluster. A website
+// request for a directory names no object itself, it names the index document
+// under it, and that is the object whose holder can answer. Routed by the bare
+// path, the request for the site root looked like a bucket listing and went to
+// the leader, which answered 404 whenever the page lived on another node.
+func (h *Handler) websiteRouteKey(r *http.Request, bucket, key string) string {
+	if bucket == "" || (key != "" && !strings.HasSuffix(key, "/")) || !servesAsWebsite(r) {
+		return key
 	}
-	return src
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return key
+	}
+	cfg, err := h.store.GetWebsiteConfig(bucket)
+	if err != nil || cfg == nil || cfg.IndexDocument == "" {
+		return key
+	}
+	return key + cfg.IndexDocument
+}
+
+// servesAsWebsite reports whether a request on a website bucket is a website
+// request rather than an S3 API call. It decides both who may make the request
+// anonymously and who serves it, so the two can never disagree. A request with
+// any query string, even an empty value such as ?policy, is an API call.
+func servesAsWebsite(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.RawQuery == ""
+}
+
+// objectKeyProblem says why a key cannot be stored, or "" when it can. Keys are
+// stored as paths, so a ".." segment or a leading "/" would reach outside the
+// bucket, and a NUL would cut the path short. The router checked only the key in
+// the request path, so a Snowball archive entry or a POST upload form field
+// named "../victim/a.txt" overwrote another bucket's object. Every way a key
+// enters must ask this.
+func objectKeyProblem(key string) string {
+	switch {
+	case key == "":
+		return "Key must not be empty"
+	case strings.ContainsRune(key, 0):
+		return "Key must not contain a NUL byte"
+	case strings.HasPrefix(key, "/"):
+		return "Key must not begin with '/'"
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == ".." {
+			return "Key must not contain '..' path segments"
+		}
+	}
+	return ""
+}
+
+// anonymousPolicyContext is the condition context a bucket policy is evaluated
+// against for an unsigned request. aws:SourceIp is the TCP peer, never the
+// client-supplied X-Forwarded-For, which anyone can set to whatever address a
+// policy allows. s3:prefix is present only when the request names a prefix, so
+// a policy that grants listing under a prefix does not grant a listing with none.
+func anonymousPolicyContext(r *http.Request) map[string]string {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	ctx := map[string]string{
+		"aws:SourceIp":        ip,
+		"aws:SecureTransport": strconv.FormatBool(r.TLS != nil),
+		"aws:CurrentTime":     time.Now().UTC().Format(time.RFC3339),
+	}
+	if ua := r.UserAgent(); ua != "" {
+		ctx["aws:UserAgent"] = ua
+	}
+	if ref := r.Referer(); ref != "" {
+		ctx["aws:Referer"] = ref
+	}
+	q := r.URL.Query()
+	if _, ok := q["prefix"]; ok {
+		ctx["s3:prefix"] = q.Get("prefix")
+	}
+	return ctx
 }

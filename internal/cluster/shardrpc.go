@@ -2,11 +2,13 @@ package cluster
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -189,14 +191,35 @@ func (r *ShardRouter) ApplyHandler() http.HandlerFunc {
 }
 
 func (r *ShardRouter) post(addr, path string, body []byte, timeout time.Duration) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s%s", addr, path), bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, interNodeURL(addr, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	r.setAuth(req)
-	return InterNodeClient(timeout).Do(req)
+	return (&http.Client{Transport: shardRPCTransport, Timeout: timeout}).Do(req)
 }
+
+// shardDialTimeout bounds connecting to a shard member, separately from the
+// request timeout. Shard calls try the members one at a time, and a member on a
+// stopped host does not refuse the connection, it drops the packets, so each one
+// used to cost the shared transport's 5 second dial (or the 10 second request
+// timeout) before the next was tried: a shard with every member down took about
+// 30 seconds to answer 503. Members are on the cluster network, where a connect
+// that has not finished in 2 seconds is not going to.
+// A var so tests can shorten it.
+var shardDialTimeout = 2 * time.Second
+
+// shardRPCTransport is the pooled transport for shard calls, with the short
+// connect timeout above. The dial reads shardDialTimeout on every connect.
+var shardRPCTransport = func() *http.Transport {
+	t := InterNodeTransport.Clone()
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := net.Dialer{Timeout: shardDialTimeout, KeepAlive: 30 * time.Second}
+		return d.DialContext(ctx, network, addr)
+	}
+	return t
+}()
 
 func (r *ShardRouter) postCall(addr string, shard int, request metadata.ShardRequest) (metadata.ShardResponse, error) {
 	body, err := json.Marshal(shardCallEnvelope{Shard: shard, Request: request})

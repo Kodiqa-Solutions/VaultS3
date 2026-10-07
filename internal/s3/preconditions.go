@@ -15,6 +15,13 @@ import (
 
 // checkGetPreconditions checks If-Modified-Since, If-Unmodified-Since,
 // If-Match, If-None-Match on GET/HEAD. Returns true if response was written (caller should return).
+//
+// RFC 7232 section 6 fixes the order: If-Match, and only when it is absent
+// If-Unmodified-Since; then If-None-Match, and only when it is absent
+// If-Modified-Since. The date conditions used to be applied on top of the ETag
+// ones, so If-Match true with If-Unmodified-Since false answered 412, and
+// If-None-Match false with If-Modified-Since false answered 304, where S3 and
+// the RFC both serve the object.
 func checkGetPreconditions(w http.ResponseWriter, r *http.Request, meta *metadata.ObjectMeta) bool {
 	if meta == nil {
 		return false
@@ -23,39 +30,35 @@ func checkGetPreconditions(w http.ResponseWriter, r *http.Request, meta *metadat
 	lastMod := time.Unix(meta.LastModified, 0).UTC()
 	etag := meta.ETag
 
-	// If-Match: 412 if ETag doesn't match
 	if im := r.Header.Get("If-Match"); im != "" {
+		// If-Match: 412 if ETag doesn't match
 		if !etagMatch(im, etag) {
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return true
 		}
-	}
-
-	// If-None-Match: 304 if ETag matches
-	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if etagMatch(inm, etag) {
-			w.Header().Set("ETag", etag)
-			w.WriteHeader(http.StatusNotModified)
-			return true
-		}
-	}
-
-	// If-Modified-Since: 304 if not modified
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		if t, err := http.ParseTime(ims); err == nil {
-			if !lastMod.After(t) {
-				w.Header().Set("ETag", etag)
-				w.WriteHeader(http.StatusNotModified)
+	} else if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
+		// If-Unmodified-Since: 412 if modified after
+		if t, err := http.ParseTime(ius); err == nil {
+			if lastMod.After(t) {
+				w.WriteHeader(http.StatusPreconditionFailed)
 				return true
 			}
 		}
 	}
 
-	// If-Unmodified-Since: 412 if modified after
-	if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
-		if t, err := http.ParseTime(ius); err == nil {
-			if lastMod.After(t) {
-				w.WriteHeader(http.StatusPreconditionFailed)
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		// If-None-Match: 304 if ETag matches
+		if etagMatch(inm, etag) {
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusNotModified)
+			return true
+		}
+	} else if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+		// If-Modified-Since: 304 if not modified
+		if t, err := http.ParseTime(ims); err == nil {
+			if !lastMod.After(t) {
+				w.Header().Set("ETag", etag)
+				w.WriteHeader(http.StatusNotModified)
 				return true
 			}
 		}
@@ -97,6 +100,10 @@ func checkPutPreconditions(w http.ResponseWriter, r *http.Request, store metadat
 
 // checkCopyPreconditions checks x-amz-copy-source-if-* headers.
 // Returns true if response was written (caller should return).
+//
+// The pairs follow the same precedence as a GET: S3 copies when if-match holds
+// even though if-unmodified-since does not, and refuses on if-none-match alone
+// when it is present.
 func checkCopyPreconditions(w http.ResponseWriter, r *http.Request, srcMeta *metadata.ObjectMeta) bool {
 	if srcMeta == nil {
 		return false
@@ -110,25 +117,23 @@ func checkCopyPreconditions(w http.ResponseWriter, r *http.Request, srcMeta *met
 			writeS3Error(w, "PreconditionFailed", "Copy source ETag does not match", http.StatusPreconditionFailed)
 			return true
 		}
+	} else if v := r.Header.Get("X-Amz-Copy-Source-If-Unmodified-Since"); v != "" {
+		if t, err := http.ParseTime(v); err == nil {
+			if lastMod.After(t) {
+				writeS3Error(w, "PreconditionFailed", "Copy source modified since specified time", http.StatusPreconditionFailed)
+				return true
+			}
+		}
 	}
 	if v := r.Header.Get("X-Amz-Copy-Source-If-None-Match"); v != "" {
 		if etagMatch(v, etag) {
 			writeS3Error(w, "PreconditionFailed", "Copy source ETag matches", http.StatusPreconditionFailed)
 			return true
 		}
-	}
-	if v := r.Header.Get("X-Amz-Copy-Source-If-Modified-Since"); v != "" {
+	} else if v := r.Header.Get("X-Amz-Copy-Source-If-Modified-Since"); v != "" {
 		if t, err := http.ParseTime(v); err == nil {
 			if !lastMod.After(t) {
 				writeS3Error(w, "PreconditionFailed", "Copy source not modified since specified time", http.StatusPreconditionFailed)
-				return true
-			}
-		}
-	}
-	if v := r.Header.Get("X-Amz-Copy-Source-If-Unmodified-Since"); v != "" {
-		if t, err := http.ParseTime(v); err == nil {
-			if lastMod.After(t) {
-				writeS3Error(w, "PreconditionFailed", "Copy source modified since specified time", http.StatusPreconditionFailed)
 				return true
 			}
 		}

@@ -65,7 +65,16 @@ func runHealthcheck(args []string) int {
 	}
 
 	base := strings.TrimSuffix(cfg.Server.BasePath, "/")
-	url := fmt.Sprintf("%s://127.0.0.1:%d%s/health", scheme, cfg.Server.Port, base)
+	// The loopback address only answers when the server listens on every
+	// interface. Bound to one address, the probe has to go there.
+	host := "127.0.0.1"
+	if a := cfg.Server.Address; a != "" && a != "0.0.0.0" && a != "::" && a != "[::]" {
+		host = a
+		if strings.Contains(a, ":") && !strings.HasPrefix(a, "[") {
+			host = "[" + a + "]"
+		}
+	}
+	url := fmt.Sprintf("%s://%s:%d%s/health", scheme, host, cfg.Server.Port, base)
 
 	resp, err := client.Get(url)
 	if err != nil {

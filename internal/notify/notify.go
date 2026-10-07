@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/netguard"
 )
 
 // S3Event matches the AWS S3 event notification JSON format.
@@ -61,23 +62,49 @@ type Dispatcher struct {
 	store      metadata.StoreAPI
 	client     *http.Client
 	workerCh   chan deliveryJob
+	backendCh  chan []byte
 	wg         sync.WaitGroup
 	maxWorkers int
 	maxRetries int
 	backoff    []time.Duration
 	backends   []Backend
-	mu         sync.Mutex
+	timeout    time.Duration
+
+	// mu guards backends and stopped. Every send on workerCh and backendCh
+	// happens under it, so Stop can close them without a late retry or a
+	// late event sending on a closed channel.
+	mu      sync.Mutex
+	stopped bool
 }
 
 func NewDispatcher(store metadata.StoreAPI, maxWorkers, queueSize, timeoutSecs, maxRetries int) *Dispatcher {
+	timeout := time.Duration(timeoutSecs) * time.Second
 	return &Dispatcher{
-		store:      store,
-		client:     &http.Client{Timeout: time.Duration(timeoutSecs) * time.Second},
+		store: store,
+		// Webhook endpoints are set by bucket owners, not only the operator, so
+		// the dial is checked against private, loopback and metadata addresses
+		// after DNS resolution. The URL check made when a configuration is
+		// saved sees only a literal address.
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: &http.Transport{DialContext: netguard.DialContext(10*time.Second, false)},
+			// A redirect could take the request anywhere after the dial check
+			// approved the first host.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 		workerCh:   make(chan deliveryJob, queueSize),
+		backendCh:  make(chan []byte, queueSize),
 		maxWorkers: maxWorkers,
 		maxRetries: maxRetries,
 		backoff:    []time.Duration{1 * time.Second, 5 * time.Second, 30 * time.Second},
+		timeout:    timeout,
 	}
+}
+
+// AllowPrivateWebhooks lets webhooks reach private and loopback addresses. For
+// tests and for an operator whose receivers live on their own network.
+func (d *Dispatcher) AllowPrivateWebhooks() {
+	d.client.Transport = &http.Transport{DialContext: netguard.DialContext(10*time.Second, true)}
 }
 
 func (d *Dispatcher) Start(ctx context.Context) {
@@ -98,6 +125,42 @@ func (d *Dispatcher) Start(ctx context.Context) {
 			}
 		}()
 	}
+	// Backends publish here, off the request path. They used to publish inside
+	// the S3 request with no deadline, so one slow or unreachable Kafka, NATS or
+	// PostgreSQL held up every PUT and DELETE on every bucket.
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case payload, ok := <-d.backendCh:
+				if !ok {
+					return
+				}
+				d.publishToBackends(payload)
+			}
+		}
+	}()
+}
+
+func (d *Dispatcher) publishToBackends(payload []byte) {
+	d.mu.Lock()
+	backends := make([]Backend, len(d.backends))
+	copy(backends, d.backends)
+	d.mu.Unlock()
+	timeout := d.timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	for _, b := range backends {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		if err := b.Publish(ctx, payload); err != nil {
+			slog.Error("notify backend publish error", "backend", b.Name(), "error", err)
+		}
+		cancel()
+	}
 }
 
 // AddBackend registers a notification backend.
@@ -109,7 +172,15 @@ func (d *Dispatcher) AddBackend(b Backend) {
 }
 
 func (d *Dispatcher) Stop() {
+	d.mu.Lock()
+	if d.stopped {
+		d.mu.Unlock()
+		return
+	}
+	d.stopped = true
 	close(d.workerCh)
+	close(d.backendCh)
+	d.mu.Unlock()
 	d.wg.Wait()
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -118,13 +189,30 @@ func (d *Dispatcher) Stop() {
 	}
 }
 
-// Dispatch checks notification configs for the bucket and fires matching webhooks.
-func (d *Dispatcher) Dispatch(bucket, key, eventType string, size int64, etag, versionID string) {
-	cfg, err := d.store.GetNotificationConfig(bucket)
-	if err != nil {
-		return // no config for this bucket
+// enqueue sends a webhook job unless the dispatcher has stopped or the queue
+// is full. It never blocks.
+func (d *Dispatcher) enqueue(job deliveryJob) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopped {
+		return false
 	}
+	select {
+	case d.workerCh <- job:
+		return true
+	default:
+		return false
+	}
+}
 
+// Dispatch sends an event to every registered backend and fires the bucket's
+// matching webhooks.
+//
+// It returned early for a bucket with no webhook configuration, before the
+// backends, so Kafka, NATS, Redis, AMQP, PostgreSQL and Elasticsearch received
+// events only from buckets that also had a webhook, where the documentation
+// says every event goes to every enabled backend.
+func (d *Dispatcher) Dispatch(bucket, key, eventType string, size int64, etag, versionID string) {
 	event := S3Event{
 		Records: []S3EventRecord{{
 			EventVersion: "2.1",
@@ -149,17 +237,21 @@ func (d *Dispatcher) Dispatch(bucket, key, eventType string, size int64, etag, v
 		return
 	}
 
-	// Publish to all registered backends
 	d.mu.Lock()
-	backends := make([]Backend, len(d.backends))
-	copy(backends, d.backends)
-	d.mu.Unlock()
-	for _, b := range backends {
-		if err := b.Publish(context.Background(), payload); err != nil {
-			slog.Error("notify backend publish error", "backend", b.Name(), "error", err)
+	haveBackends := len(d.backends) > 0
+	if haveBackends && !d.stopped {
+		select {
+		case d.backendCh <- payload:
+		default:
+			slog.Warn("notify backend queue full, dropping event", "event", eventType, "bucket", bucket, "key", key)
 		}
 	}
+	d.mu.Unlock()
 
+	cfg, err := d.store.GetNotificationConfig(bucket)
+	if err != nil {
+		return // no webhooks for this bucket
+	}
 	for _, wh := range cfg.Webhooks {
 		if !matchEvent(wh.Events, eventType) {
 			continue
@@ -167,18 +259,13 @@ func (d *Dispatcher) Dispatch(bucket, key, eventType string, size int64, etag, v
 		if !matchFilters(wh.Filters, key) {
 			continue
 		}
-
 		job := deliveryJob{
 			endpoint:   wh.Endpoint,
 			payload:    payload,
 			retryCount: 0,
 			maxRetries: d.maxRetries,
 		}
-
-		// Non-blocking send — drop if queue is full
-		select {
-		case d.workerCh <- job:
-		default:
+		if !d.enqueue(job) {
 			slog.Warn("notify queue full, dropping event", "event", eventType, "bucket", bucket, "key", key)
 		}
 	}
@@ -194,21 +281,27 @@ func (d *Dispatcher) deliverWebhook(job deliveryJob) {
 		err = &httpError{statusCode: resp.StatusCode}
 	}
 
-	// Retry
+	// Retry later without holding this worker. Sleeping here, up to 30 seconds
+	// per attempt, let one dead endpoint occupy every worker in turn, and the
+	// events of every other bucket queued behind it or were dropped.
 	if job.retryCount < job.maxRetries-1 {
 		backoffIdx := job.retryCount
 		if backoffIdx >= len(d.backoff) {
 			backoffIdx = len(d.backoff) - 1
 		}
-		time.Sleep(d.backoff[backoffIdx])
-
 		job.retryCount++
-		select {
-		case d.workerCh <- job:
-		default:
-			slog.Warn("notify queue full on retry, dropping webhook", "endpoint", job.endpoint)
-		}
+		time.AfterFunc(d.backoff[backoffIdx], func() {
+			if !d.enqueue(job) {
+				slog.Warn("notify queue full or stopped on retry, dropping webhook", "endpoint", job.endpoint)
+			}
+		})
 	} else {
+		if strings.Contains(err.Error(), "blocked destination") {
+			slog.Error("notify webhook refused: it resolves to a private, loopback or metadata address; "+
+				"set notifications.allow_private_webhooks to allow receivers on your own network",
+				"endpoint", job.endpoint, "error", err)
+			return
+		}
 		slog.Error("notify webhook failed after retries", "retries", job.maxRetries, "endpoint", job.endpoint, "error", err)
 	}
 }

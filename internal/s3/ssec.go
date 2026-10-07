@@ -53,20 +53,26 @@ type sseCustomerKey struct {
 // parseSSECHeaders extracts and validates the SSE-C headers. Returns (nil, nil)
 // when no SSE-C headers are present.
 func parseSSECHeaders(r *http.Request) (*sseCustomerKey, error) {
-	algo := r.Header.Get(hdrSSECAlgo)
+	return parseSSECHeadersNamed(r, hdrSSECAlgo, hdrSSECKey, hdrSSECKeyMD5)
+}
+
+// parseSSECHeadersNamed is parseSSECHeaders for a given set of header names, so
+// a copy can read its source's key from the copy-source headers.
+func parseSSECHeadersNamed(r *http.Request, algoHdr, keyHdr, md5Hdr string) (*sseCustomerKey, error) {
+	algo := r.Header.Get(algoHdr)
 	if algo == "" {
 		return nil, nil
 	}
 	if algo != "AES256" {
 		return nil, fmt.Errorf("unsupported SSE-C algorithm %q", algo)
 	}
-	key, err := base64.StdEncoding.DecodeString(r.Header.Get(hdrSSECKey))
+	key, err := base64.StdEncoding.DecodeString(r.Header.Get(keyHdr))
 	if err != nil || len(key) != 32 {
 		return nil, fmt.Errorf("SSE-C key must be base64 of 32 bytes")
 	}
 	sum := md5.Sum(key)
 	want := base64.StdEncoding.EncodeToString(sum[:])
-	if got := r.Header.Get(hdrSSECKeyMD5); got != "" && got != want {
+	if got := r.Header.Get(md5Hdr); got != "" && got != want {
 		return nil, fmt.Errorf("SSE-C key MD5 mismatch")
 	}
 	return &sseCustomerKey{key: key, keyMD5: want}, nil

@@ -90,6 +90,29 @@ func (l *Limiter) Allow(clientIP, accessKey string) bool {
 	return true
 }
 
+// AllowKey charges only the per-access-key bucket. The S3 handler calls it
+// after authentication: charging a key before its signature was checked let
+// anyone who knew an access key ID, which is not a secret, drain that key's
+// allowance with unsigned requests, and grow the key map with random IDs.
+func (l *Limiter) AllowKey(accessKey string) bool {
+	if accessKey == "" {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	kb, ok := l.keyBuckets[accessKey]
+	if !ok {
+		kb = &bucket{tokens: float64(l.keyBurst), lastTime: now, rps: l.keyRPS, burst: l.keyBurst}
+		l.keyBuckets[accessKey] = kb
+	}
+	if !kb.allow(now) {
+		l.rejected.Add(1)
+		return false
+	}
+	return true
+}
+
 func (l *Limiter) Status() map[string]interface{} {
 	l.mu.Lock()
 	ipCount := len(l.ipBuckets)

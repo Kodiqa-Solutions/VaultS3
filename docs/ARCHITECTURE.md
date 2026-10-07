@@ -12,7 +12,7 @@ VaultS3/
 ├── cmd/vaults3-cli/           — CLI tool (bucket, object, user, key, replication, cluster, storage commands)
 ├── internal/
 │   ├── config/                — YAML config loader
-│   ├── server/                — HTTP server, routing, and auto-TLS
+│   ├── server/                — HTTP server and routing
 │   ├── s3/                    — S3 API handlers (auth, buckets, objects, multipart, checksums, preconditions, replication config, restore, POST upload, snowball)
 │   ├── storage/               — Storage engine interface + filesystem + encryption + KMS + storage classes
 │   ├── metadata/              — BoltDB metadata store
@@ -21,21 +21,21 @@ VaultS3/
 │   ├── notify/                — Event notification dispatcher (webhook, Kafka, NATS, Redis, AMQP, PostgreSQL, Elasticsearch)
 │   ├── replication/           — Async + active-active replication (SigV4 signer, queue processor, vector-clock conflict resolution)
 │   ├── erasure/               — Reed-Solomon erasure coding + background healer (multi-disk shard placement)
-│   ├── cluster/               — Raft metadata, consistent-hash ring, failure detector, failover proxy, rebalancer
+│   ├── cluster/               — Raft metadata, consistent-hash ring, failure detector, failover proxy, replica repair
 │   ├── search/                — In-memory full-text search index
 │   ├── vector/                — Optional vector store: cosine kNN index + OpenAI-compatible embedder (semantic search / RAG)
 │   ├── migrate/               — Import from any S3-compatible source (MinIO/AWS/...): SigV4 source client + async migrator
 │   ├── snapshot/              — Bucket snapshots ("git-for-buckets"): commit / diff / restore on version pointers
 │   ├── scanner/               — Webhook virus scanning with quarantine
-│   ├── ratelimit/             — Token bucket rate limiter (per IP, per key, per bucket bandwidth)
+│   ├── ratelimit/             — Token bucket rate limiter (per IP, per key)
 │   ├── tiering/               — Hot/cold data tiering manager + remote S3-compatible tier
 │   ├── backup/                — Backup scheduler with local targets
 │   ├── versioning/            — Version diff (LCS), tagging, rollback
 │   ├── fuse/                  — FUSE filesystem mount (go-fuse/v2)
 │   ├── middleware/             — HTTP middleware (request ID, panic recovery, latency, security headers, PROXY protocol)
 │   ├── api/                   — Dashboard REST API (JWT auth, IAM, STS, audit, events, logs, trace, diagnostics, heal, speedtest)
-│   ├── batch/                 — Batch operations processor (bulk delete/copy)
-│   ├── inventory/             — S3 Inventory report generator (periodic CSV)
+│   ├── batch/                 — Batch operations processor (code exists but is not wired in, not available yet)
+│   ├── inventory/             — S3 Inventory report generator (code exists but is not wired in, not available yet)
 │   └── dashboard/             — Embedded React SPA
 ├── web/                       — React dashboard source (Vite + Tailwind)
 ├── configs/vaults3.yaml       — Default configuration
@@ -51,4 +51,4 @@ VaultS3/
 - **Tailwind CSS**: Dashboard styling
 - **BoltDB**: Embedded key-value store for metadata
 - **Local filesystem**: Object storage backend
-- **AES-256-GCM**: Server-side encryption (SSE-S3 and SSE-KMS with HashiCorp Vault)
+- **AES-256-GCM**: Server-side encryption (SSE-S3, per-bucket keys, and SSE-KMS with a local key provider)

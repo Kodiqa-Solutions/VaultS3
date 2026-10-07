@@ -117,6 +117,13 @@ s3.put_bucket_lifecycle_configuration(Bucket='my-bucket',
 
 The background worker scans periodically (configurable interval, default 1 hour) and deletes expired objects and aborts stale multipart uploads (removing both their metadata and their part files on disk). Locked objects (legal hold or retention) are skipped.
 
+What a rule can say is limited, and anything beyond it is refused with `501 NotImplemented` and not stored:
+
+- One rule per bucket, filtered by prefix (`Filter>Prefix`, or the older rule-level `Prefix`).
+- Tag filters, `And` filters, object size filters, several rules, `NoncurrentVersionExpiration`, transitions, expiration by `Date` and `ExpiredObjectDeleteMarker` are not supported.
+
+Before 5.0.0 those were accepted and silently dropped, so such a rule was stored as one that expires every object in the bucket. See `docs/UPGRADING.md` for how to check a bucket.
+
 ## Compression
 
 Enable zstd compression to reduce storage usage:

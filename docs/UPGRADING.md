@@ -39,9 +39,13 @@ The current/latest version is also exposed at `GET /api/v1/version`.
 
 ## Rolling back
 
-Two releases changed how bytes are laid out on disk, and an older server cannot
-read what a newer one wrote in those formats. Neither is a reason to avoid
-upgrading, but both are worth knowing before you plan a rollback.
+Some releases changed how bytes are laid out on disk, and an older server cannot
+read what a newer one wrote in those formats. None is a reason to avoid
+upgrading, but all are worth knowing before you plan a rollback.
+
+- **Encrypted objects, erasure coded objects and cluster Raft snapshots written
+  by 5.0.0** cannot be read by 4.4.79 or older. See
+  [Rolling back from 5.0.0](#rolling-back-from-500).
 
 - **SSE-C objects written after the release that introduced the chunked format**
   are refused by an older server with `403`. A clean refusal, not bad data.
@@ -58,6 +62,248 @@ ignores, so an older server reads those objects from the front correctly.
 
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
+
+## Upgrading to 5.0.0
+
+A security and durability release. There is no migration to run, but it changes
+how IAM actions are checked, writes formats 4.4.79 cannot read, and several of
+the bugs it fixes could have already exposed or damaged data. Read the whole
+section before upgrading. Data written by 4.4.79 is read by 5.0.0 as it is.
+
+### Before you upgrade: custom IAM policies
+
+Every S3 call is now authorized as its own AWS action. Before 5.0.0 bucket
+configuration writes were checked as `s3:CreateBucket`, configuration reads as
+`s3:ListBucket`, object sub-resource writes as `s3:PutObject`, their reads as
+`s3:GetObject`, and multipart part listing and abort as `s3:*`. **A custom policy
+that relied on that is refused after upgrading.** Add the actions your clients
+use:
+
+| Call | Action needed now |
+|------|-------------------|
+| Object tagging | `s3:PutObjectTagging`, `s3:GetObjectTagging`, `s3:DeleteObjectTagging` (the `...VersionTagging` forms with `versionId`) |
+| Object ACL | `s3:PutObjectAcl`, `s3:GetObjectAcl` (`...VersionAcl` with `versionId`) |
+| Retention, legal hold | `s3:PutObjectRetention`, `s3:GetObjectRetention`, `s3:PutObjectLegalHold`, `s3:GetObjectLegalHold` |
+| Shortening or removing GOVERNANCE | `s3:BypassGovernanceRetention`, plus the `x-amz-bypass-governance-retention: true` header |
+| `GetObjectAttributes` | `s3:GetObjectAttributes` (`s3:GetObjectVersionAttributes` with `versionId`) |
+| Multipart | `s3:PutObject` to start, upload and complete, `s3:ListMultipartUploadParts` to list parts, `s3:AbortMultipartUpload` to abort, `s3:ListBucketMultipartUploads` to list uploads |
+| Copy | `s3:GetObject` on the source, `s3:GetObjectVersion` when it names a `versionId` |
+| Versions, location | `s3:ListBucketVersions`, `s3:GetBucketLocation` |
+| Bucket configuration | `s3:Put...`/`s3:Get...` for each: `BucketPolicy` (and `DeleteBucketPolicy`), `BucketVersioning`, `LifecycleConfiguration`, `BucketCORS`, `EncryptionConfiguration`, `ReplicationConfiguration`, `BucketWebsite` (and `DeleteBucketWebsite`), `BucketNotification`, `BucketTagging`, `BucketAcl`, `BucketLogging`, `BucketPublicAccessBlock`, `BucketObjectLockConfiguration`, and VaultS3's own `BucketQuota` and `BucketDurability`. A configuration delete needs the `Put` action unless listed otherwise. |
+| `RestoreObject` | `s3:RestoreObject` |
+
+The built-in `ReadOnlyAccess` (now `s3:Get*`, `s3:List*`) and `ReadWriteAccess`
+(adds tagging, retention, legal hold, ACL, abort and restore) are updated at
+startup, but only if they still hold exactly the old built-in text. A copy you
+edited is left alone. Note that `ReadOnlyAccess` is now wider: it also reads
+bucket policies, ACLs, tags and other configuration. Policies using wildcards
+such as `s3:*` or `s3:Get*` need no change.
+
+### Before you upgrade: other changes that can stop a working setup
+
+- **Behind a reverse proxy.** `aws:SourceIp`, IP allowlists, per-IP rate limits
+  and logs now use the TCP peer, so behind nginx every client looks like the
+  proxy. List the proxy in `server.trusted_proxies` (IPs or CIDRs, or
+  `VAULTS3_TRUSTED_PROXIES` comma separated), and its `X-Forwarded-For` is
+  believed. Without it, a condition on client addresses refuses everyone.
+- **Webhooks and lambda functions on your own network.** Calls to loopback,
+  private, link-local and carrier-grade NAT (`100.64.0.0/10`) addresses are
+  refused, which includes a docker-compose service. Set
+  `notifications.allow_private_webhooks: true` (`VAULTS3_ALLOW_PRIVATE_WEBHOOKS`)
+  or `lambda.allow_private_endpoints: true`
+  (`VAULTS3_LAMBDA_ALLOW_PRIVATE_ENDPOINTS`). Cloud metadata addresses
+  (`169.254.0.0/16`, `fd00:ec2::254`) stay refused either way, checked on the
+  address actually dialled. Redirects are no longer followed.
+- **OIDC.** A login is refused unless the ID token says `email_verified: true`.
+  If your provider does not send the claim and only issues verified addresses,
+  set `oidc.accept_email_without_verified_claim: true`.
+- **Non-admin dashboard users** can reach only buckets and objects, and stats,
+  activity and cost filtered to their buckets. Creating a bucket needs
+  `s3:CreateBucket`. Their IP allowlist now applies to the dashboard too.
+- **New IAM user, group and policy names** must match `[\w+=,.@-]`, and policy
+  documents must parse. Existing names keep working.
+- **Lifecycle expiry in a versioned bucket** now writes a delete marker instead
+  of deleting the object. Versioned objects are no longer tiered.
+- **Dashboard rollback** needs versioning enabled on the bucket.
+- **Presigned URLs** need `X-Amz-Expires`, and every signed request needs a date
+  within 15 minutes and a signed `host`. Mainstream SDKs already do this.
+- **Multipart complete** refuses unsorted or duplicate parts and parts without
+  an ETag.
+- **`/cluster/status`** needs the `X-Cluster-Secret` header. Update external
+  monitoring, or use `vaults3-cli cluster status`.
+- **`/health` and `/ready`** now answer `503` when the metadata store does not
+  answer within 3 seconds.
+- **Message queue backends** (Kafka, NATS, Redis, AMQP, Postgres, Elasticsearch)
+  now get events from every bucket, not only buckets with a webhook. Expect more
+  volume. When the queue is full an event is dropped with a warning.
+- **Vault KMS.** A config with `encryption.kms.provider: vault` refuses to start.
+  It never worked, so no data was written with it. Use `local`.
+- **`vaults3-cli`**: `cluster leave` and `cluster decommission` need `--yes`
+  outside a terminal, `object get` needs `--force` to overwrite a file, and
+  `cluster rebalance` is retired.
+- **Self-update.** From 5.0.0 the updater installs a release only if
+  `checksums.txt.sig` verifies against the key built into the binary. Release
+  binaries carry it. A binary built from source does not, and refuses to update
+  itself: replace the binary or image instead.
+- **Self-update will not install 5.0.0 by itself.** The updater never crosses a
+  major version unless `auto_update.allow_major` is `true`, so a 4.4.x server
+  with `auto_update.apply` on stays on 4.4.x. That is on purpose: read this
+  section, then upgrade by hand (new binary, package or image). Docker and Helm
+  users pull or set the `5.0.0` tag.
+- **Small writes are slower.** Every object is now fsynced, and its directory
+  after the rename, so a write acknowledged with `200` survives a power loss.
+  There is no setting to turn it off. Measure your own small-object workload
+  before and after.
+
+### Rolling back from 5.0.0
+
+5.0.0 reads everything 4.4.79 wrote. The reverse is not true:
+
+- **Encrypted objects** written by 5.0.0 use stream format v2. 4.4.79 refuses
+  them with `unsupported stream format 2`. This covers every encryption mode:
+  the server key, per-bucket keys, SSE-KMS and SSE-C.
+- **Erasure coded objects** written by 5.0.0 keep their shards in a generation
+  directory (`.ec/<key>/gen-.../`). 4.4.79 looks for them in the old place,
+  finds none, and cannot read or heal the object.
+- **Raft snapshots** written by a 5.0.0 cluster node use format v2. A 4.4.79
+  node clears its whole metadata database before reading one, then fails. **Do
+  not downgrade a cluster node.** Rebuild it from the cluster instead.
+
+Once 5.0.0 has taken writes, roll forward rather than back, or restore a
+backup taken before the upgrade.
+
+### Clusters: rolling upgrade
+
+- **Upgrade every node of a cluster before creating or changing access keys or
+  IAM users.**
+- **Upgrade the followers first and the leader last.** A 5.0.0 leader sends
+  v2 snapshots, and a lagging 4.4.79 follower that receives one wipes its
+  metadata and cannot restore it. A 4.4.79 leader's v1 snapshots are read by
+  5.0.0.
+- **Keep the mixed period short and avoid versioned writes during it.** 5.0.0
+  demotes the previous latest version inside the replicated command, and 4.4.79
+  demoted it in the S3 handler. A versioned write while both run can leave two
+  latest versions on the old nodes, until the key is written again.
+- **Push replication** moved to a queue on each node. On a cluster, 4.4.79 and
+  earlier lost about half of all push replication events: an acknowledgement
+  from one node deleted an unrelated event on the others. In our test a 4.4.79
+  cluster delivered 22 of 45 objects to its peer, and 5.0.0 delivered 45 of 45.
+  Objects written while any node still runs the old release are exposed to the
+  same loss, and nothing sends a lost event again. After every node runs
+  5.0.0, copy each replicated bucket to its peer once, for example
+  `aws s3 sync s3://<bucket> s3://<bucket>` with the source and target
+  endpoints, or `rclone sync`. A single node was not affected.
+- **Client IP rules on forwarded requests.** An old node forwards requests
+  without the client address, so a policy or allowlist naming client addresses
+  can refuse requests forwarded by it until every node is upgraded.
+- **TLS between nodes.** With `server.tls.enabled`, 4.4.79 nodes called each
+  other over plain http on a port that only speaks TLS. In our test a 4.4.79
+  cluster could not form through `join_addr`, and S3 requests that one node
+  forwarded to another failed. 5.0.0 nodes call each other over https, and a
+  5.0.0 TLS cluster forms and serves every request. While versions are mixed,
+  5.0.0 nodes can join a 4.4.79 leader, but requests an old node forwards to a
+  new one still fail. Upgrade every node in one short window, and send clients
+  to upgraded nodes meanwhile. Clusters without `server.tls.enabled` are not
+  affected.
+- **Helm.** The chart now keeps a separate `cluster-secret` in its Secret. An
+  upgraded release keeps the value it was using (the admin secret), so nodes
+  keep agreeing. With `helm template`, Argo CD or anything that renders without
+  cluster access, the chart cannot read the existing Secret and generates a new
+  cluster secret on every render, so restarted pods disagree with the rest. Set
+  `auth.clusterSecret` (and `auth.secretKey`), or use `existingSecret`, for
+  those workflows.
+- **Rebalance is retired.** To remove a node: `vaults3-cli cluster decommission
+  <node>` (drains it), `vaults3-cli cluster leave <node> --yes`, then
+  `vaults3-cli cluster repair` and `cluster repair --status` until `repaired`
+  settles at 0. This needs `placement.replica_count` of 2 or more.
+- **Object lock on buckets created before 5.0.0.** The flag that marks a bucket
+  object-lock enabled was recorded only on the node that served the request.
+  Other nodes reported no object lock configuration for the bucket and skipped
+  the catch-up before a lock decision. Retention set on objects was replicated
+  and enforced. After every node runs 5.0.0, send each locked bucket's object
+  lock configuration again (`aws s3api put-object-lock-configuration`, the same
+  configuration it has) so every node records the flag.
+- **Node-local data on restart.** Before 5.0.0 a restart rolled a node's
+  multipart uploads, replication queue, audit trail, bucket snapshots and saved
+  admin credentials back to the last Raft snapshot. If a node's admin
+  credentials or in-flight uploads changed after a restart, that was why. 5.0.0
+  keeps them.
+
+### Check: stored admin credentials
+
+Saved admin credentials win over `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY`,
+so changing the environment never replaced them. If the server still uses an
+example or leaked secret, set the new pair together with
+`VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true` (or `auth.override_stored_credentials:
+true`) for one start, then remove the flag. Kubernetes users of
+`deploy/k8s/quickstart.yaml` started with the public example password, check it
+was changed.
+
+### Check: backups
+
+Backups before 5.0.0 held no `metadata.db` and nothing from versioned buckets.
+Take a new full backup after upgrading. It now includes `_vaults3/metadata.db`.
+
+### Check: lifecycle rules
+
+Before 5.0.0 a lifecycle rule with a tag filter, an `And` filter, a size filter
+or a rule-level `<Prefix>`, or a configuration with several rules, was accepted
+and stored as a single rule with **no filter**. Such a rule expires every object
+in the bucket once it is old enough.
+
+For every bucket with a lifecycle configuration, read it back:
+
+```bash
+aws --endpoint-url $EP s3api get-bucket-lifecycle-configuration --bucket <bucket>
+```
+
+A rule with an empty prefix that you did not write as "the whole bucket" is one
+of these. Delete it or put the intended rule again. 5.0.0 stores a prefix rule
+faithfully and refuses the other forms with `501 NotImplemented`.
+
+### Check: per-bucket encryption keys
+
+In per-bucket mode, sending `PutBucketEncryption` to a bucket that was already
+encrypted, or sending `DeleteBucketEncryption`, threw the bucket's key away.
+Terraform and other configuration tools send the first on every apply. Every
+object encrypted before that call is unreadable, and the key is gone, so **those
+objects cannot be recovered**. A GET of one fails partway through the response.
+
+To find them, read a few older objects in each encrypted bucket. Nothing can
+bring the key back, so restore those objects from a backup or from their source.
+From 5.0.0 a repeated call keeps the key, and removing the configuration keeps
+every object readable.
+
+### Check: website buckets
+
+A bucket with website hosting answered S3 API calls with no authentication:
+listings, old object versions, and its policy and other configuration. If such
+a bucket held anything you did not mean to publish, or older versions you
+deleted for a reason, treat it as exposed. If access logging (`logging.enabled`)
+was on, its log shows what was requested.
+
+### Check: Snowball imports and POST uploads
+
+Anyone allowed to write to one bucket could overwrite an object in any other by
+naming it `../<bucket>/<key>` in a Snowball archive or a POST upload form. If
+users you do not fully trust can write to any bucket, compare important objects
+with their sources.
+
+### What changed
+
+- **Deleting a bucket** refuses while it holds any object, version or delete
+  marker. A versioned bucket now has to be emptied first, as on AWS.
+- **Website buckets** answer only plain GET and HEAD anonymously.
+- **Bucket policy conditions** are enforced for anonymous requests. A policy that
+  granted more than its conditions said now grants exactly what they say.
+- **Lifecycle** refuses what it cannot apply instead of storing a wider rule.
+- **Lambda triggers** write their output only to their own bucket. Reconfigure a
+  trigger whose `output_bucket` names another bucket.
+- **The inter-node port** requires the cluster secret for `/_replication/sync`.
+- **Objects with a far-future Last-Modified** from Snowball or POST uploads are
+  repaired when read, nothing to do.
+- **The HashiCorp Vault KMS provider** is documented as not working. A server
+  configured with it never started, so no data was written with it.
 
 ## Upgrading to 4.4.79
 
@@ -503,7 +749,9 @@ Single-node deployments are unaffected.
 `vaults3-secret-change-me`.** 4.4.55 stopped shipping that secret, but an
 installation that already booted with it has it persisted, and persisted
 credentials win over configuration, so upgrading does not replace it. Change it
-from the dashboard, or set `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY`.
+from the dashboard. Setting `VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY` alone
+does not replace saved credentials: add `VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true`
+(available from 5.0.0) for one start, then remove it.
 
 **Everyone is logged out once.** The console signing key is now random per
 installation instead of derived from the admin secret, so existing dashboard

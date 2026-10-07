@@ -22,6 +22,12 @@ server:
     enabled: false
     cert_file: ""
     key_file: ""
+  # Reverse proxies (addresses or CIDRs) whose X-Forwarded-For is believed. Only
+  # a request arriving from one of these has its client address taken from that
+  # header, for rate limits, IP rules and aws:SourceIp conditions. Empty means
+  # the TCP peer is the client, so behind nginx every client shares the proxy's
+  # address. (env: VAULTS3_TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8)
+  trusted_proxies: []
   internode_address: ""    # separate bind address for inter-node traffic (empty = disabled)
   internode_port: 0        # separate port for inter-node traffic (0 = disabled)
 
@@ -53,9 +59,15 @@ auth:
   # Set VAULTS3_ACCESS_KEY / VAULTS3_SECRET_KEY to use credentials of your own.
   #
   # Credentials already saved by a previous start, or changed from the
-  # dashboard, always win over what is written here.
+  # dashboard, win over what is written here, unless override_stored_credentials
+  # is on.
   admin_access_key: "vaults3-admin"
   admin_secret_key: ""
+  # Replace the saved credentials with the ones above at every start. Use it to
+  # take back a server whose secret leaked or was left at an example value, then
+  # turn it off again so a change made in the dashboard survives a restart.
+  # (env: VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true)
+  override_stored_credentials: false
 
 encryption:
   # AES-256-GCM at rest. Objects are sealed in 1 MiB chunks, so a read costs a
@@ -111,6 +123,10 @@ security:
   sts_max_duration_secs: 43200  # max STS token duration (12 hours)
 
 notifications:
+  # Webhooks are set by bucket owners, so by default they cannot reach private,
+  # loopback, link-local or cloud metadata addresses. Turn this on if your
+  # receivers live on your own network.
+  allow_private_webhooks: false
   max_workers: 4       # webhook delivery goroutines
   queue_size: 256      # buffered event queue size
   timeout_secs: 10     # webhook HTTP timeout
@@ -135,7 +151,7 @@ notifications:
     routing_key: "s3.events"
   postgres:
     enabled: false
-    connection_string: "postgres://user:pass@localhost:5432/vaults3?sslmode=disable"
+    conn_str: "postgres://user:pass@localhost:5432/vaults3?sslmode=disable"  # also accepted as connection_string or dsn
     table: "s3_events"
   elasticsearch:
     enabled: false
@@ -221,6 +237,12 @@ oidc:
   # session. The authorization-code flow is unaffected and is what the dashboard
   # uses.
   allow_implicit_flow: false
+  # A login whose ID token says email_verified false is always refused, and one
+  # with no email_verified claim at all is refused too unless this is on. Some
+  # providers (Azure AD, some ADFS setups) never send the claim: turn it on only
+  # for a provider whose users cannot choose their own email address.
+  # (env: VAULTS3_OIDC_ACCEPT_EMAIL_WITHOUT_VERIFIED_CLAIM)
+  accept_email_without_verified_claim: false
   jwks_cache_secs: 3600    # JWKS key cache duration
 
 # External authorization webhook (issue #52). When enabled, VaultS3 asks an HTTP
@@ -269,6 +291,10 @@ external_auth:
 
 lambda:
   enabled: false
+  # Function URLs that resolve to private, loopback or link-local addresses are
+  # refused when called, because triggers are set per bucket. Turn this on for
+  # functions running next to the server, such as a docker-compose service.
+  allow_private_endpoints: false
   max_response_size: 10485760  # 10MB max response from function
   timeout_secs: 30
   max_workers: 4
@@ -367,9 +393,6 @@ cluster:
     suspect_after: 3
     down_after: 6
     probe_timeout_secs: 3
-  rebalance:
-    max_bandwidth_mbps: 50
-    batch_size: 100
   # Replica repair restores a bucket's replica count after a node is lost for
   # good. Copies are placed when an object is written, and until this existed
   # nothing re-made them: a node that died took its copies with it and every
@@ -386,20 +409,6 @@ cluster:
     interval_secs: 600         # gap between scans, 0 takes this default, negative disables the scan
     max_bandwidth_mbps: 50     # repair runs right after a node loss, when the network can least spare it
     batch_size: 100
-
-# S3 Inventory reports (optional)
-# inventory:
-#   enabled: false
-#   dest_bucket: ""            # destination bucket for reports (empty = same bucket)
-#   schedule: "daily"          # "daily" or "weekly"
-#   include_versions: false
-
-# Auto-TLS (optional, alternative to manual TLS config)
-# auto_tls:
-#   enabled: false
-#   domains: []                # domains for Let's Encrypt certificates
-#   cache_dir: "autocert-cache"
-#   self_signed: false         # use self-signed cert (for development)
 
 debug: false                   # enable /debug/pprof/* endpoints
 

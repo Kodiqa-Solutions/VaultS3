@@ -3,6 +3,7 @@ package metadata
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -179,13 +180,53 @@ func (d *DistributedStore) apply(cmdType uint16, payload interface{}) error {
 	if d.raft.IsLeader() {
 		return d.raft.Apply(cmdData)
 	}
-	return d.raft.ForwardToLeader(cmdData)
+	if err := d.raft.ForwardToLeader(cmdData); err != nil {
+		return err
+	}
+	// A configuration or identity write is followed, often at once and on the
+	// same node, by a request that depends on it: create a user then attach a
+	// policy, enable versioning then object lock, set retention then try to
+	// shorten it. A forwarded write used to return before this node applied
+	// it, so that next request saw the old state and failed, or made a lock
+	// decision on it. These rare writes wait for the local apply. Object data
+	// writes do not (issue #37, where waiting collapsed write throughput):
+	// their reads wait on a miss instead.
+	if catchUpAfter[cmdType] {
+		if b, ok := d.raft.(readBarrier); ok {
+			if err := b.ReadBarrier(ReadYourWritesTimeout); err != nil {
+				slog.Warn("metadata: a forwarded write committed but this node has not applied it yet", "error", err)
+			}
+		}
+	}
+	return nil
+}
+
+// catchUpAfter lists the commands a follower waits to apply after forwarding.
+var catchUpAfter = map[uint16]bool{
+	cmdCreateBucket: true, cmdDeleteBucket: true, cmdPutBucketPolicy: true, cmdDeleteBucketPolicy: true,
+	cmdUpdateBucketQuota: true, cmdPutBucketTags: true, cmdDeleteBucketTags: true, cmdDeleteBucketObjectMeta: true,
+	cmdSetBucketVersioning: true, cmdSetBucketDefaultRet: true, cmdPutLifecycleRule: true, cmdDeleteLifecycleRule: true,
+	cmdPutWebsiteConfig: true, cmdDeleteWebsiteConfig: true, cmdPutCORSConfig: true, cmdDeleteCORSConfig: true,
+	cmdPutNotificationConfig: true, cmdDeleteNotificationConfig: true, cmdPutLambdaConfig: true, cmdDeleteLambdaConfig: true,
+	cmdPutEncryptionConfig: true, cmdDeleteEncryptionConfig: true, cmdPutPublicAccessBlock: true, cmdDeletePublicAccessBlock: true,
+	cmdPutLoggingConfig: true, cmdDeleteLoggingConfig: true, cmdSetBucketDurability: true,
+	cmdUpdateObjectVersionMeta: true, cmdPutVersionTag: true, cmdDeleteVersionTag: true,
+	cmdCreateAccessKey: true, cmdDeleteAccessKey: true,
+	cmdCreateIAMUser: true, cmdUpdateIAMUser: true, cmdDeleteIAMUser: true,
+	cmdCreateIAMGroup: true, cmdUpdateIAMGroup: true, cmdDeleteIAMGroup: true,
+	cmdCreateIAMPolicy: true, cmdUpdateIAMPolicy: true, cmdDeleteIAMPolicy: true,
 }
 
 // --- Bucket operations (override Store methods to go through Raft) ---
 
+// CreateBucket stamps the creation time here, on the node proposing the write,
+// so every node applies the same one. An older node ignores the field and reads
+// its own clock, which is what every node did before.
 func (d *DistributedStore) CreateBucket(name string) error {
-	return d.apply(cmdCreateBucket, struct{ Name string }{name})
+	return d.apply(cmdCreateBucket, struct {
+		Name      string
+		CreatedAt int64 // unix nano
+	}{name, time.Now().UnixNano()})
 }
 
 func (d *DistributedStore) DeleteBucket(name string) error {
@@ -249,6 +290,26 @@ func (d *DistributedStore) SetBucketDefaultRetention(bucket, mode string, days i
 		Mode   string
 		Days   int
 	}{bucket, mode, days})
+}
+
+// SetBucketObjectLockEnabled marks a bucket object-lock enabled on every node.
+//
+// It used to reach the embedded local store, so only the node that served the
+// request recorded the flag. Every other node then skipped the catch-up before
+// a lock decision and answered GET ?object-lock with "not found", and a Raft
+// snapshot restore dropped the flag on the serving node too. Applying the
+// default retention command sets the flag in the replicated state, and needs no
+// new command, so a node still on an older release applies it as well.
+// Object lock cannot be switched off, so only enabling is replicated.
+func (d *DistributedStore) SetBucketObjectLockEnabled(bucket string, enabled bool) error {
+	if !enabled {
+		return fmt.Errorf("object lock cannot be disabled")
+	}
+	info, err := d.GetBucket(bucket)
+	if err != nil {
+		return err
+	}
+	return d.SetBucketDefaultRetention(bucket, info.DefaultRetentionMode, info.DefaultRetentionDays)
 }
 
 func (d *DistributedStore) PutLifecycleRule(bucket string, rule LifecycleRule) error {
@@ -422,12 +483,34 @@ func (d *DistributedStore) DeleteAccessKey(accessKey string) error {
 	return d.apply(cmdDeleteAccessKey, struct{ AccessKey string }{accessKey})
 }
 
+// DeleteExpiredAccessKeys sends the cut-off with the command, so every node
+// removes the same keys however late it applies or replays the entry.
 func (d *DistributedStore) DeleteExpiredAccessKeys() (int, error) {
-	err := d.apply(cmdDeleteExpiredAccessKeys, struct{}{})
+	err := d.apply(cmdDeleteExpiredAccessKeys, struct{ Now int64 }{time.Now().Unix()})
 	return 0, err // count not available through Raft
 }
 
 // --- IAM operations ---
+
+// readBarrier is what the cluster node provides to catch a follower up with
+// what the leader has applied.
+type readBarrier interface {
+	ReadBarrier(timeout time.Duration) error
+}
+
+// ReadBarrier brings this node up to what the leader has applied. A caller that
+// reads a record and decides on it (an object's lock state before allowing a
+// change) needs the latest copy, not whatever this node has applied so far.
+// A no-op on the leader.
+func (d *DistributedStore) ReadBarrier() error {
+	if d.raft.IsLeader() {
+		return nil
+	}
+	if b, ok := d.raft.(readBarrier); ok {
+		return b.ReadBarrier(ReadYourWritesTimeout)
+	}
+	return nil
+}
 
 func (d *DistributedStore) CreateIAMUser(user IAMUser) error {
 	return d.apply(cmdCreateIAMUser, user)
@@ -478,7 +561,13 @@ func (d *DistributedStore) PruneAuditEntries(olderThan time.Time) (int, error) {
 
 // --- Replication operations ---
 
+// EnqueueReplication stamps the creation time before proposing, so every node
+// stores the same event. The ID is assigned by the state machine from the log
+// entry, which makes applying the entry twice harmless.
 func (d *DistributedStore) EnqueueReplication(event ReplicationEvent) error {
+	if event.CreatedAt == 0 {
+		event.CreatedAt = time.Now().Unix()
+	}
 	return d.apply(cmdEnqueueReplication, event)
 }
 

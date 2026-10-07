@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useInFlight } from '../hooks/useInFlight'
 import { listKeys, createKey, deleteKey, type AccessKey, type CreatedKey } from '../api/keys'
 import { listBuckets, type Bucket } from '../api/buckets'
 import { useToast } from '../hooks/useToast'
@@ -19,6 +20,7 @@ export default function AccessKeysPage() {
   const [selectedBuckets, setSelectedBuckets] = useState<string[]>([])
   const [newKey, setNewKey] = useState<CreatedKey | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleting, runDelete] = useInFlight()
   const [copied, setCopied] = useState('')
   const { addToast } = useToast()
 
@@ -77,7 +79,7 @@ export default function AccessKeysPage() {
     )
   }
 
-  const handleDelete = async (accessKey: string) => {
+  const handleDelete = (accessKey: string) => runDelete(async () => {
     setError('')
     try {
       await deleteKey(accessKey)
@@ -87,7 +89,7 @@ export default function AccessKeysPage() {
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('keys.failedToDeleteKey'))
     }
-  }
+  })
 
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text)
@@ -281,13 +283,15 @@ export default function AccessKeysPage() {
             <div className="flex gap-2 justify-end">
               <button
                 onClick={() => setDeleteTarget(null)}
-                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                disabled={deleting}
+                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50"
               >
                 {t('accesskeys.cancel')}
               </button>
               <button
                 onClick={() => handleDelete(deleteTarget)}
-                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors"
+                disabled={deleting}
+                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50"
               >
                 {t('accesskeys.revoke')}
               </button>

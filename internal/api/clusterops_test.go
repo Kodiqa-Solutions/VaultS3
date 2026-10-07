@@ -182,11 +182,12 @@ func TestClusterStatusAndMembership(t *testing.T) {
 		t.Fatal("undrain did not set the writable flag")
 	}
 
-	// rebalance triggers the callback
-	if rr := doRequest(h, "POST", "/cluster/rebalance", nil, tok); rr.Code != http.StatusAccepted {
+	// Rebalance is retired: it says so and points at repair, and moves nothing.
+	if rr := doRequest(h, "POST", "/cluster/rebalance", nil, tok); rr.Code != http.StatusOK ||
+		!strings.Contains(rr.Body.String(), "retired") || !strings.Contains(rr.Body.String(), "repair") {
 		t.Fatalf("rebalance: %d %s", rr.Code, rr.Body.String())
 	}
-	if !rebalanced {
-		t.Fatal("rebalance callback not invoked")
+	if rebalanced {
+		t.Fatal("the retired rebalance still triggered data movement")
 	}
 }

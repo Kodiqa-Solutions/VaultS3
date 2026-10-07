@@ -187,6 +187,10 @@ type BucketEncryptionConfig struct {
 	// maps each version to its KEK-wrapped data key. Only wrapped keys are stored.
 	KeyVersion  int            `json:"key_version,omitempty"`
 	WrappedDEKs map[int][]byte `json:"wrapped_deks,omitempty"`
+	// Shredded records that the bucket's keys were destroyed (crypto-shred).
+	// Objects written before it are unreadable for good, and the bucket's
+	// default encryption is off until it is enabled again.
+	Shredded bool `json:"shredded,omitempty"`
 }
 
 type PublicAccessBlockConfig struct {
@@ -332,7 +336,15 @@ type ObjectMeta struct {
 }
 
 func NewStore(path string) (*Store, error) {
-	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	// InitialMmapSize reserves address space (not memory) up front. bbolt must
+	// remap to grow the file, and a remap waits for every open read
+	// transaction, so a Raft snapshot dumping a large store stalled every
+	// write until it finished, FSM applies included.
+	mmap := 1 << 30
+	if fi, err := os.Stat(path); err == nil && int(fi.Size())*2 > mmap {
+		mmap = int(fi.Size()) * 2
+	}
+	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second, InitialMmapSize: mmap})
 	if err != nil {
 		return nil, fmt.Errorf("open metadata db: %w", err)
 	}
@@ -558,7 +570,7 @@ func (s *Store) DeleteBucketPolicy(bucket string) error {
 // per-object question, answered by IsObjectPublicRead, which matches the
 // caller's key against the statement's Resource.
 func (s *Store) HasPublicReadPolicy(bucket string) bool {
-	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, anyKey: true}, "s3:GetObject")
+	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, anyKey: true}, "s3:GetObject", nil)
 }
 
 // IsObjectPublicRead reports whether the bucket policy lets an anonymous caller
@@ -566,16 +578,16 @@ func (s *Store) HasPublicReadPolicy(bucket string) bool {
 // statement scoped to "arn:aws:s3:::bucket/public/*" publishes that prefix and
 // nothing else. Evaluating the bucket alone once made every object in a bucket
 // with any public-read policy anonymously readable.
-func (s *Store) IsObjectPublicRead(bucket, key string) bool {
-	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, key: key}, "s3:GetObject")
+func (s *Store) IsObjectPublicRead(bucket, key string, ctx map[string]string) bool {
+	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, key: key}, "s3:GetObject", ctx)
 }
 
 // IsBucketPublicList reports whether the bucket policy lets an anonymous caller
 // list the bucket's contents (s3:ListBucket). This is deliberately separate from
 // IsObjectPublicRead: listing a bucket and reading its objects are different
 // permissions in S3, and a policy that grants only one must not imply the other.
-func (s *Store) IsBucketPublicList(bucket string) bool {
-	return s.policyAllowsAnonymous(policyTarget{bucket: bucket}, "s3:ListBucket")
+func (s *Store) IsBucketPublicList(bucket string, ctx map[string]string) bool {
+	return s.policyAllowsAnonymous(policyTarget{bucket: bucket}, "s3:ListBucket", ctx)
 }
 
 // policyAllowsAnonymous evaluates the bucket policy for an unsigned (anonymous)
@@ -584,7 +596,14 @@ func (s *Store) IsBucketPublicList(bucket string) bool {
 // (in any of the spellings AWS accepts), the action must match, and the resource
 // must refer to this bucket. Public Access Block, if configured, overrides the
 // policy and blocks anonymous access outright.
-func (s *Store) policyAllowsAnonymous(target policyTarget, action string) bool {
+//
+// ctx carries the request's condition keys (aws:SourceIp, s3:prefix, ...). A
+// statement's Condition used to be dropped while parsing, so a conditional
+// Allow granted to everyone: a grant limited to one IP range made the object
+// public to the internet. Conditions are now evaluated with the same code IAM
+// policies use. When one cannot be decided, because ctx lacks the key or the
+// operator is not implemented, an Allow does not grant and a Deny still blocks.
+func (s *Store) policyAllowsAnonymous(target policyTarget, action string, ctx map[string]string) bool {
 	bucket := target.bucket
 	// A bucket with Public Access Block enabled is never anonymously accessible,
 	// regardless of what its policy says — that is the point of the setting, which
@@ -601,10 +620,11 @@ func (s *Store) policyAllowsAnonymous(target policyTarget, action string) bool {
 	}
 	var policy struct {
 		Statement []struct {
-			Effect    string      `json:"Effect"`
-			Principal interface{} `json:"Principal"`
-			Action    interface{} `json:"Action"`
-			Resource  interface{} `json:"Resource"`
+			Effect    string                                `json:"Effect"`
+			Principal interface{}                           `json:"Principal"`
+			Action    interface{}                           `json:"Action"`
+			Resource  interface{}                           `json:"Resource"`
+			Condition map[string]map[string]conditionValues `json:"Condition"`
 		} `json:"Statement"`
 	}
 	if err := json.Unmarshal(policyJSON, &policy); err != nil {
@@ -621,6 +641,25 @@ func (s *Store) policyAllowsAnonymous(target policyTarget, action string) bool {
 		}
 		if !policyResourceCovers(stmt.Resource, target) {
 			continue
+		}
+		if len(stmt.Condition) > 0 {
+			conds := make(map[string]map[string][]string, len(stmt.Condition))
+			for op, kvs := range stmt.Condition {
+				conds[op] = make(map[string][]string, len(kvs))
+				for k, v := range kvs {
+					conds[op][k] = v
+				}
+			}
+			ok, determined := iam.ConditionsHold(conds, ctx)
+			if !determined {
+				if strings.EqualFold(stmt.Effect, "Deny") {
+					return false
+				}
+				continue
+			}
+			if !ok {
+				continue
+			}
 		}
 		// Explicit Deny wins over any Allow, exactly as in AWS.
 		if strings.EqualFold(stmt.Effect, "Deny") {
@@ -1351,15 +1390,7 @@ func (s *Store) DeleteMultipartUpload(uploadID string) error {
 			return err
 		}
 		// Also delete all parts for this upload
-		pb := tx.Bucket(partsBucket)
-		prefix := []byte(uploadID + "/")
-		c := pb.Cursor()
-		for k, _ := c.Seek(prefix); k != nil && len(k) >= len(prefix) && string(k[:len(prefix)]) == string(prefix); k, _ = c.Next() {
-			if err := pb.Delete(k); err != nil {
-				return err
-			}
-		}
-		return nil
+		return deletePrefix(tx.Bucket(partsBucket), []byte(uploadID+"/"))
 	})
 }
 
@@ -1453,15 +1484,30 @@ func (s *Store) DeleteBucketTags(bucket string) error {
 	return s.PutBucketTags(bucket, nil)
 }
 
+// deletePrefix removes every key that starts with prefix. It collects the keys
+// first and deletes after the walk, because bbolt does not promise a cursor
+// stays valid across a delete: once a leaf has been materialised as a node in
+// the same transaction, a delete shifts the next key into the cursor's slot and
+// Next() then skips it, leaving about half the records behind.
+func deletePrefix(b *bolt.Bucket, prefix []byte) error {
+	var keys [][]byte
+	c := b.Cursor()
+	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+		keys = append(keys, append([]byte(nil), k...))
+	}
+	for _, k := range keys {
+		if err := b.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) DeleteBucketObjectMeta(bucket string) error {
 	prefix := []byte(bucket + "/")
 	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(objectsBucket)
-		c := b.Cursor()
-		for k, _ := c.Seek(prefix); k != nil && len(k) >= len(prefix) && string(k[:len(prefix)]) == string(prefix); k, _ = c.Next() {
-			if err := b.Delete(k); err != nil {
-				return err
-			}
+		if err := deletePrefix(tx.Bucket(objectsBucket), prefix); err != nil {
+			return err
 		}
 		// All objects gone → reset the cached counters to zero.
 		if sb := tx.Bucket(bucketStatsBucket); sb != nil {
@@ -1518,6 +1564,9 @@ func (s *Store) SetBucketObjectLockEnabled(bucket string, enabled bool) error {
 }
 
 // SetBucketDefaultRetention sets the default object retention for a bucket.
+// Only an object lock configuration sets one, so it also marks the bucket
+// object-lock enabled. On a cluster this is the replicated way to set that
+// flag (see DistributedStore.SetBucketObjectLockEnabled).
 func (s *Store) SetBucketDefaultRetention(bucket, mode string, days int) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketsBucket)
@@ -1531,6 +1580,7 @@ func (s *Store) SetBucketDefaultRetention(bucket, mode string, days int) error {
 		}
 		info.DefaultRetentionMode = mode
 		info.DefaultRetentionDays = days
+		info.ObjectLockEnabled = true
 		updated, err := json.Marshal(info)
 		if err != nil {
 			return err
@@ -1558,12 +1608,46 @@ func versionPrefix(bucket, key string) []byte {
 	return []byte(bucket + "\x00" + key + "\x00")
 }
 
+// PutObjectVersion stores a version. A version stored as the latest demotes any
+// other version of the key still marked latest, in the same transaction.
+//
+// Demoting used to be the caller's job: read the current latest, then write it
+// back demoted. On a cluster that read is this node's copy, which can lag the
+// leader by a write, so two quick writes of one key through a follower both
+// found no newer latest and the key ended with two latest versions. Here the
+// demotion is part of the applied command, so every node does it the same way.
 func (s *Store) PutObjectVersion(meta ObjectMeta) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectVersionsBucket)
 		data, err := json.Marshal(meta)
 		if err != nil {
 			return err
+		}
+		if meta.IsLatest {
+			prefix := versionPrefix(meta.Bucket, meta.Key)
+			type demotion struct {
+				k []byte
+				m ObjectMeta
+			}
+			var demote []demotion
+			c := b.Cursor()
+			for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+				var other ObjectMeta
+				if err := json.Unmarshal(v, &other); err != nil || other.VersionID == meta.VersionID || !other.IsLatest {
+					continue
+				}
+				other.IsLatest = false
+				demote = append(demote, demotion{append([]byte{}, k...), other})
+			}
+			for _, d := range demote {
+				dd, err := json.Marshal(d.m)
+				if err != nil {
+					return err
+				}
+				if err := b.Put(d.k, dd); err != nil {
+					return err
+				}
+			}
 		}
 		return b.Put(versionKey(meta.Bucket, meta.Key, meta.VersionID), data)
 	})
@@ -1639,7 +1723,12 @@ func (s *Store) ListObjectVersions(bucket, prefix, keyMarker, versionMarker stri
 			if versionMarker != "" {
 				startKey = versionKey(bucket, keyMarker, versionMarker)
 			} else {
-				startKey = versionPrefix(bucket, keyMarker)
+				// A key-marker on its own means "after this key", every version
+				// of it included, as AWS defines it. Seeking to the key's prefix
+				// returned all its versions again, so a client paging by key
+				// marker saw them twice. Version ids never contain 0xff, so
+				// this sorts after every version of the key and before the next.
+				startKey = append(versionPrefix(bucket, keyMarker), 0xff)
 			}
 		}
 
@@ -2257,11 +2346,16 @@ func (s *Store) GetUserPolicies(userName string) ([]IAMPolicy, error) {
 		policyNames[arn] = true
 	}
 
-	// Add policies from groups
+	// A group or policy that no longer exists grants nothing and is skipped.
+	// One that exists but cannot be read is an error: skipping it used to drop
+	// whatever it said, a Deny included, and the identity went on with the rest.
 	for _, groupName := range user.Groups {
 		group, err := s.GetIAMGroup(groupName)
 		if err != nil {
-			continue
+			if strings.Contains(err.Error(), "not found") {
+				continue
+			}
+			return nil, fmt.Errorf("read group %s: %w", groupName, err)
 		}
 		for _, arn := range group.PolicyARNs {
 			policyNames[arn] = true
@@ -2272,7 +2366,10 @@ func (s *Store) GetUserPolicies(userName string) ([]IAMPolicy, error) {
 	for name := range policyNames {
 		policy, err := s.GetIAMPolicy(name)
 		if err != nil {
-			continue
+			if strings.Contains(err.Error(), "not found") {
+				continue
+			}
+			return nil, fmt.Errorf("read policy %s: %w", name, err)
 		}
 		policies = append(policies, *policy)
 	}
@@ -2600,6 +2697,22 @@ func (s *Store) PutBackupRecord(record BackupRecord) error {
 	})
 }
 
+// BackupDB writes a consistent copy of the whole metadata database to w, in
+// bbolt's own file format, so the copy can be put in place of metadata.db to
+// restore. It runs inside one read transaction (Tx.WriteTo), which sees a
+// single point in time while writers carry on. A long copy does delay a writer
+// that needs to grow the database file, so callers should write to fast local
+// storage.
+func (s *Store) BackupDB(w io.Writer) (int64, error) {
+	var n int64
+	err := s.db.View(func(tx *bolt.Tx) error {
+		var err error
+		n, err = tx.WriteTo(w)
+		return err
+	})
+	return n, err
+}
+
 func (s *Store) ListBackupRecords(limit int) ([]BackupRecord, error) {
 	var records []BackupRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -2669,26 +2782,7 @@ func (s *Store) ListVersionTags(prefix string) ([][]byte, error) {
 
 // DeleteExpiredAccessKeys removes STS keys that have expired.
 func (s *Store) DeleteExpiredAccessKeys() (int, error) {
-	now := time.Now().Unix()
-	deleted := 0
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(keysBucket)
-		c := b.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var key AccessKey
-			if err := json.Unmarshal(v, &key); err != nil {
-				continue
-			}
-			if key.ExpiresAt > 0 && key.ExpiresAt <= now {
-				if err := b.Delete(k); err != nil {
-					return err
-				}
-				deleted++
-			}
-		}
-		return nil
-	})
-	return deleted, err
+	return s.DeleteExpiredAccessKeysAt(time.Now().Unix())
 }
 
 // Lambda trigger operations
@@ -3038,4 +3132,23 @@ func (s *Store) SetJWTSigningKey(key []byte) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(serverSettingsBucket).Put(jwtSigningKeyKey, key)
 	})
+}
+
+// conditionValues is a condition's value list. AWS accepts a single string as
+// well as an array ("aws:SourceIp": "203.0.113.0/24"), and both must parse:
+// failing here would drop the whole policy and with it every Deny.
+type conditionValues []string
+
+func (c *conditionValues) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*c = conditionValues{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return err
+	}
+	*c = many
+	return nil
 }

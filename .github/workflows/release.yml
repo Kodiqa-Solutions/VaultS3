@@ -4,10 +4,12 @@ on:
   push:
     tags: ['v*']
 
+# Read-only by default. Only the publish job, which creates the release and
+# signs the provenance attestations, gets write and OIDC tokens. They used to be
+# granted to every job, including the build jobs that run third-party install
+# scripts and container images.
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   release:
@@ -55,12 +57,16 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          # Public half of the release signing key, a repository variable. The
+          # self-updater verifies checksums.txt.sig against it and refuses to
+          # install anything when it is empty.
+          RELEASE_PUBKEY: ${{ vars.RELEASE_SIGNING_PUBKEY }}
         run: |
           VERSION=${GITHUB_REF_NAME}
           EXT=""
           if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
 
-          CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \
+          CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION} -X github.com/Kodiqa-Solutions/VaultS3/internal/selfupdate.releaseSigningKey=${RELEASE_PUBKEY}" \
             -o vaults3-${GOOS}-${GOARCH}${EXT} ./cmd/vaults3
 
           CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \
@@ -73,8 +79,10 @@ jobs:
       # that ships in both that platform's tarball and its packages.
       - name: Install syft
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b /usr/local/bin
+          # Pinned: the installer from a release tag installing that release,
+          # never whatever the main branch serves on the day of the build.
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.54.1/install.sh \
+            | sh -s -- -b /usr/local/bin v1.54.1
 
       - name: Generate the SBOM for this binary
         run: |
@@ -149,7 +157,7 @@ jobs:
           mkdir -p out
           for pkg in deb rpm apk; do
             docker run --rm -v "$PWD:/w" -w /w -e ARCH -e VERSION \
-              goreleaser/nfpm:latest package --config packaging/nfpm.yaml --target /w/out --packager "$pkg"
+              goreleaser/nfpm:v2.47.0 package --config packaging/nfpm.yaml --target /w/out --packager "$pkg"
           done
           ls -l out/
 
@@ -162,6 +170,10 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: [release, packages]
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v6
@@ -177,6 +189,24 @@ jobs:
           cd artifacts
           sha256sum *.tar.gz *.deb *.rpm *.apk > checksums.txt
           cat checksums.txt
+
+      - name: Set up Go for signing
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Signs checksums.txt so the self-updater can verify who published the
+      # release. Skipped when the secret is not configured, and then the
+      # updater refuses to apply this release.
+      - name: Sign checksums
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "RELEASE_SIGNING_KEY is not set: checksums.txt is not signed, self-update apply will refuse this release"
+            exit 0
+          fi
+          go run ./scripts/signrelease artifacts/checksums.txt
 
       # Build provenance ties every artifact to the workflow run and commit that
       # produced it, signed through Sigstore.
@@ -233,6 +263,7 @@ jobs:
             artifacts/*.sbom.json
             artifacts/vaults3-provenance.sigstore.json
             artifacts/checksums.txt
+            artifacts/checksums.txt.sig
           body: |
             ${{ steps.changelog.outputs.notes }}
 

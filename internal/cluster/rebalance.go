@@ -1,267 +1,68 @@
 package cluster
 
 import (
-	"bytes"
-	"context"
-	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
-// Rebalancer handles background migration of objects when cluster membership changes.
-// When a node joins or leaves, some objects need to move to their new primary node.
+// Rebalancer used to move objects to their hash-ring primary after a membership
+// change. It no longer moves anything, and replica repair does that job.
+//
+// The old pass was wrong in both of the ways it could run. As shipped it sent
+// each object to the new owner as an unsigned S3 PUT, which every node refuses
+// with 403, after reading the whole object into memory, for every object this
+// node held but was not primary for. With three replicas that is two thirds of
+// a node's data, and the failure detector started a pass on every down and
+// recover transition, so the cost was real and nothing ever moved. Had the PUT
+// been accepted it would have been worse: the pass then deleted the local copy,
+// which on a secondary holder is a legitimate replica, and called the Raft
+// backed DeleteObjectMeta, which removes the object from the whole cluster.
+// While it ran it also held off replica repair, the one mechanism that places
+// copies correctly.
+//
+// The type and its methods stay so the admin API and CLI endpoint keep
+// answering, now with a message saying what to use instead.
 type Rebalancer struct {
-	store        metadata.StoreAPI
-	engine       storage.Engine
-	ring         *HashRing
-	proxy        *Proxy
-	selfID       string
-	maxBandwidth int64 // bytes/sec throttle (0 = unlimited)
-	batchSize    int
-
-	mu         sync.Mutex
-	running    atomic.Bool
-	cancelFunc context.CancelFunc
+	once sync.Once
 }
 
 // RebalanceConfig is an alias for config.RebalanceConfig.
 type RebalanceConfig = config.RebalanceConfig
 
-func applyRebalanceDefaults(c *RebalanceConfig) {
-	if c.MaxBandwidthMBps <= 0 {
-		c.MaxBandwidthMBps = 50
-	}
-	if c.BatchSize <= 0 {
-		c.BatchSize = 100
-	}
-}
+// RebalanceRetiredMessage is what a rebalance request is answered with.
+const RebalanceRetiredMessage = "rebalance no longer moves data: replica repair restores every object's " +
+	"placement and copy count (POST /api/v1/cluster/repair, or wait for the next scheduled scan)"
 
-// NewRebalancer creates a new rebalancer.
+// NewRebalancer creates the retired rebalancer. The arguments are accepted and
+// ignored so existing callers keep compiling.
 func NewRebalancer(
-	store metadata.StoreAPI,
-	engine storage.Engine,
-	ring *HashRing,
-	proxy *Proxy,
-	selfID string,
-	cfg RebalanceConfig,
+	_ metadata.StoreAPI,
+	_ storage.Engine,
+	_ *HashRing,
+	_ *Proxy,
+	_ string,
+	_ RebalanceConfig,
 ) *Rebalancer {
-	applyRebalanceDefaults(&cfg)
-	return &Rebalancer{
-		store:        store,
-		engine:       engine,
-		ring:         ring,
-		proxy:        proxy,
-		selfID:       selfID,
-		maxBandwidth: int64(cfg.MaxBandwidthMBps) * 1024 * 1024,
-		batchSize:    cfg.BatchSize,
-	}
+	return &Rebalancer{}
 }
 
-// Trigger starts a rebalance scan in the background.
-// Safe to call multiple times — only one scan runs at a time.
+// Trigger does nothing but say, once per process, that replica repair handles
+// placement.
 func (r *Rebalancer) Trigger() {
-	if r.running.Load() {
-		slog.Info("rebalance: already running, skipping trigger")
-		return
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.running.Load() {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	r.cancelFunc = cancel
-	r.running.Store(true)
-
-	go func() {
-		defer r.running.Store(false)
-		r.run(ctx)
-	}()
+	r.once.Do(func() {
+		slog.Info("rebalance: " + RebalanceRetiredMessage)
+	})
 }
 
-// Stop cancels any in-progress rebalance.
-func (r *Rebalancer) Stop() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.cancelFunc != nil {
-		r.cancelFunc()
-		r.cancelFunc = nil
-	}
-}
+// Stop is a no-op, kept for callers.
+func (r *Rebalancer) Stop() {}
 
-// IsRunning returns true if a rebalance is in progress.
-func (r *Rebalancer) IsRunning() bool {
-	return r.running.Load()
-}
-
-func (r *Rebalancer) run(ctx context.Context) {
-	slog.Info("rebalance: starting scan")
-	start := time.Now()
-
-	migrated := 0
-	scanned := 0
-	var bytesTransferred int64
-
-	buckets, _ := r.store.ListBuckets()
-	for _, bucket := range buckets {
-		if ctx.Err() != nil {
-			break
-		}
-
-		startAfter := ""
-		for {
-			if ctx.Err() != nil {
-				break
-			}
-
-			objects, truncated, err := r.engine.ListObjects(bucket.Name, "", startAfter, r.batchSize)
-			if err != nil {
-				slog.Warn("rebalance: list objects failed",
-					"bucket", bucket.Name, "error", err,
-				)
-				break
-			}
-
-			for _, obj := range objects {
-				if ctx.Err() != nil {
-					break
-				}
-				scanned++
-
-				// Check if this object still belongs to us
-				primaryNode := r.ring.GetNode(bucket.Name, obj.Key)
-				if primaryNode == r.selfID || primaryNode == "" {
-					continue // object belongs here
-				}
-
-				// Object needs to move — transfer via proxy
-				if err := r.transferObject(ctx, bucket.Name, obj.Key, primaryNode); err != nil {
-					slog.Warn("rebalance: transfer failed",
-						"bucket", bucket.Name, "key", obj.Key,
-						"target", primaryNode, "error", err,
-					)
-					continue
-				}
-
-				migrated++
-				bytesTransferred += obj.Size
-
-				// Throttle bandwidth
-				if r.maxBandwidth > 0 && bytesTransferred > 0 {
-					elapsed := time.Since(start).Seconds()
-					if elapsed > 0 {
-						currentRate := float64(bytesTransferred) / elapsed
-						if currentRate > float64(r.maxBandwidth) {
-							sleepTime := time.Duration(float64(obj.Size) / float64(r.maxBandwidth) * float64(time.Second))
-							select {
-							case <-ctx.Done():
-								return
-							case <-time.After(sleepTime):
-							}
-						}
-					}
-				}
-
-				startAfter = obj.Key
-			}
-
-			if !truncated || len(objects) == 0 {
-				break
-			}
-			if len(objects) > 0 {
-				startAfter = objects[len(objects)-1].Key
-			}
-		}
-	}
-
-	slog.Info("rebalance: scan complete",
-		"scanned", scanned,
-		"migrated", migrated,
-		"bytes", bytesTransferred,
-		"duration", time.Since(start).Round(time.Millisecond),
-	)
-}
-
-// transferObject copies an object to the target node via the S3 API,
-// then deletes the local copy.
-func (r *Rebalancer) transferObject(ctx context.Context, bucket, key, targetNodeID string) error {
-	// Read the object locally
-	reader, size, err := r.engine.GetObject(bucket, key)
-	if err != nil {
-		return fmt.Errorf("read local object: %w", err)
-	}
-	defer reader.Close()
-
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return fmt.Errorf("read object data: %w", err)
-	}
-
-	// Put to the target node via the proxy
-	r.proxy.mu.RLock()
-	addr, ok := r.proxy.nodeAddrs[targetNodeID]
-	r.proxy.mu.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("unknown target node: %s", targetNodeID)
-	}
-
-	// Use direct HTTP PUT to the target node's S3 endpoint
-	url := fmt.Sprintf("http://%s/%s/%s", addr, bucket, key)
-	req, err := newRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.ContentLength = size
-	req.Header.Set("X-VaultS3-Rebalance", r.selfID) // mark as internal rebalance
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("PUT to target: %w", err)
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("target returned HTTP %d", resp.StatusCode)
-	}
-
-	// Delete local copy after successful transfer
-	if err := r.engine.DeleteObject(bucket, key); err != nil {
-		slog.Warn("rebalance: delete local copy failed (object was transferred)",
-			"bucket", bucket, "key", key, "error", err,
-		)
-	}
-
-	// Also delete metadata for the object locally
-	r.store.DeleteObjectMeta(bucket, key)
-
-	slog.Debug("rebalance: transferred object",
-		"bucket", bucket, "key", key,
-		"target", targetNodeID, "size", size,
-	)
-	return nil
-}
-
-// newRequestWithContext creates an HTTP request with context.
-func newRequestWithContext(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	return req, nil
-}
+// IsRunning is always false: there is nothing to run.
+func (r *Rebalancer) IsRunning() bool { return false }
 
 // RebalanceStatus reports the current state.
 type RebalanceStatus struct {
@@ -269,9 +70,7 @@ type RebalanceStatus struct {
 	Message string `json:"message,omitempty"`
 }
 
-// Status returns the current rebalance status.
+// Status reports that rebalance is retired.
 func (r *Rebalancer) Status() RebalanceStatus {
-	return RebalanceStatus{
-		Running: r.running.Load(),
-	}
+	return RebalanceStatus{Running: false, Message: RebalanceRetiredMessage}
 }

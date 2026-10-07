@@ -1,25 +1,47 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 import { NavLink } from 'react-router-dom'
 import { getVersion, type VersionStatus } from '../api/version'
 import { useI18n } from '../i18n'
+import { useAuth } from '../hooks/useAuth'
+import { isAdminSession } from '../api/auth'
 
-const navItems = [
+// adminOnly marks pages a non-admin session cannot use. Most call routes the
+// server answers with 403 for anyone but "admin", the rest show server wide
+// activity and settings, so listing them for a non-admin only leads to errors.
+export interface NavItem {
+  to: string
+  labelKey: string
+  icon: () => ReactElement
+  adminOnly?: boolean
+}
+
+export const navItems: NavItem[] = [
   { to: '/', labelKey: 'nav.home', icon: homeIcon },
   { to: '/buckets', labelKey: 'nav.buckets', icon: bucketIcon },
-  { to: '/search', labelKey: 'nav.search', icon: searchIcon },
-  { to: '/access-keys', labelKey: 'nav.accessKeys', icon: keyIcon },
-  { to: '/iam', labelKey: 'nav.iam', icon: iamIcon },
-  { to: '/audit', labelKey: 'nav.audit', icon: auditIcon },
-  { to: '/notifications', labelKey: 'nav.notifications', icon: notifIcon },
-  { to: '/lambda', labelKey: 'nav.lambda', icon: lambdaIcon },
-  { to: '/replication', labelKey: 'nav.replication', icon: replicationIcon },
-  { to: '/migrate', labelKey: 'nav.migrate', icon: migrateIcon },
-  { to: '/backup', labelKey: 'nav.backups', icon: backupIcon },
-  { to: '/activity', labelKey: 'nav.activity', icon: activityIcon },
-  { to: '/stats', labelKey: 'nav.stats', icon: statsIcon },
-  { to: '/cost', labelKey: 'nav.cost', icon: costIcon },
-  { to: '/settings', labelKey: 'nav.settings', icon: settingsIcon },
+  { to: '/search', labelKey: 'nav.search', icon: searchIcon, adminOnly: true },
+  { to: '/access-keys', labelKey: 'nav.accessKeys', icon: keyIcon, adminOnly: true },
+  { to: '/iam', labelKey: 'nav.iam', icon: iamIcon, adminOnly: true },
+  { to: '/audit', labelKey: 'nav.audit', icon: auditIcon, adminOnly: true },
+  { to: '/notifications', labelKey: 'nav.notifications', icon: notifIcon, adminOnly: true },
+  { to: '/lambda', labelKey: 'nav.lambda', icon: lambdaIcon, adminOnly: true },
+  { to: '/replication', labelKey: 'nav.replication', icon: replicationIcon, adminOnly: true },
+  { to: '/migrate', labelKey: 'nav.migrate', icon: migrateIcon, adminOnly: true },
+  { to: '/backup', labelKey: 'nav.backups', icon: backupIcon, adminOnly: true },
+  { to: '/activity', labelKey: 'nav.activity', icon: activityIcon, adminOnly: true },
+  { to: '/stats', labelKey: 'nav.stats', icon: statsIcon, adminOnly: true },
+  { to: '/cost', labelKey: 'nav.cost', icon: costIcon, adminOnly: true },
+  { to: '/settings', labelKey: 'nav.settings', icon: settingsIcon, adminOnly: true },
 ]
+
+export function visibleNavItems(isAdmin: boolean): NavItem[] {
+  return isAdmin ? navItems : navItems.filter(item => !item.adminOnly)
+}
+
+// isAdminOnlyPath lets other pages that link to these routes, such as the home
+// page quick actions, hide the same links the sidebar hides.
+export function isAdminOnlyPath(to: string): boolean {
+  return navItems.some(item => item.to === to && item.adminOnly)
+}
 
 interface Props {
   onClose?: () => void
@@ -29,6 +51,8 @@ interface Props {
 
 export default function Sidebar({ onClose, isCollapsed, onToggleCollapse }: Props) {
   const { t } = useI18n()
+  const { user } = useAuth()
+  const items = visibleNavItems(isAdminSession(user))
   return (
     <aside className="w-full h-full bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col transition-all duration-300 overflow-hidden">
       <div className={`h-14 px-4 border-b border-gray-200 dark:border-gray-700 flex items-center ${isCollapsed ? 'justify-center' : 'justify-between'} shrink-0`}>
@@ -69,7 +93,7 @@ export default function Sidebar({ onClose, isCollapsed, onToggleCollapse }: Prop
         )}
       </div>
       <nav className="flex-1 p-3 space-y-1 overflow-y-auto overflow-x-hidden">
-        {navItems.map((item) => (
+        {items.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}

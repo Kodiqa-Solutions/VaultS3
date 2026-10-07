@@ -230,11 +230,11 @@ func (n *Node) ReadBarrier(timeout time.Duration) error {
 // leaderAppliedIndex asks the leader for its current FSM applied index over the
 // cluster channel (GET /cluster/readindex).
 func (n *Node) leaderAppliedIndex(timeout time.Duration) (uint64, error) {
-	leaderRaft := n.LeaderAddr()
-	if leaderRaft == "" {
+	leaderAPI, err := n.leaderAPIAddr()
+	if err != nil {
 		return 0, fmt.Errorf("cluster: no leader for read barrier")
 	}
-	url := fmt.Sprintf("http://%s/cluster/readindex", apiAddrFromRaft(leaderRaft, n.cfg.APIPort))
+	url := interNodeURL(leaderAPI, "/cluster/readindex")
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
@@ -344,7 +344,7 @@ func (n *Node) peerReachedIndex(addr string, target uint64, deadline time.Time) 
 
 // peerAppliedIndex reads one peer's FSM applied index over the cluster channel.
 func (n *Node) peerAppliedIndex(addr string) (uint64, error) {
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/cluster/readindex", addr), nil)
+	req, err := http.NewRequest(http.MethodGet, interNodeURL(addr, "/cluster/readindex"), nil)
 	if err != nil {
 		return 0, err
 	}

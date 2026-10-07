@@ -44,9 +44,10 @@ func (h *APIHandler) handleListKeys(w http.ResponseWriter, _ *http.Request) {
 	items := make([]keyListItem, 0, len(keys)+1)
 
 	// Include admin key
+	adminAK, adminSK := h.adminCredentials()
 	items = append(items, keyListItem{
-		AccessKey:    h.cfg.Auth.AdminAccessKey,
-		MaskedSecret: maskSecret(h.cfg.Auth.AdminSecretKey),
+		AccessKey:    adminAK,
+		MaskedSecret: maskSecret(adminSK),
 		CreatedAt:    "",
 		IsAdmin:      true,
 	})
@@ -154,8 +155,13 @@ func (h *APIHandler) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Auto-create the IAM user if it doesn't exist. It is marked as existing only
-	// for its keys, so deleting its last key removes it again.
+	// for its keys, so deleting its last key removes it again. The name gets the
+	// same rule as POST /iam/users, which this used to bypass.
 	if !userExists {
+		if err := validateIAMName("user", reqBody.UserID, maxIAMUserNameLen); err != nil {
+			writeError(w, http.StatusBadRequest, "userId: "+err.Error())
+			return
+		}
 		if err := h.store.CreateIAMUser(metadata.IAMUser{
 			Name:       reqBody.UserID,
 			CreatedAt:  now,
@@ -228,7 +234,7 @@ func (h *APIHandler) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) handleDeleteKey(w http.ResponseWriter, _ *http.Request, accessKey string) {
-	if accessKey == h.cfg.Auth.AdminAccessKey {
+	if adminAK, _ := h.adminCredentials(); accessKey == adminAK {
 		writeError(w, http.StatusForbidden, "cannot delete admin key")
 		return
 	}
@@ -243,6 +249,7 @@ func (h *APIHandler) handleDeleteKey(w http.ResponseWriter, _ *http.Request, acc
 		writeError(w, http.StatusInternalServerError, "failed to delete key")
 		return
 	}
+	h.deleteSTSArtifacts(*key)
 
 	if key.PolicyName != "" {
 		_ = h.store.DeleteIAMPolicy(key.PolicyName)
@@ -407,11 +414,15 @@ func (h *APIHandler) splitLegacyKeyPolicy(user string, now time.Time) error {
 	return h.store.DeleteIAMPolicy(legacyName)
 }
 
+// maskSecret shows just enough of a secret to tell two apart. It used to show
+// the first and last four characters, eight in all, which for the admin secret
+// (eight characters is the minimum) was the whole of it. Now at most two from
+// each end, and nothing at all for a secret shorter than 16.
 func maskSecret(secret string) string {
-	if len(secret) <= 8 {
+	if len(secret) < 16 {
 		return "****"
 	}
-	return secret[:4] + "****" + secret[len(secret)-4:]
+	return secret[:2] + "****" + secret[len(secret)-2:]
 }
 
 func randomHex(n int) (string, error) {

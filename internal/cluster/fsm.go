@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -57,10 +58,50 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	defer f.appliedIndex.Store(log.Index)
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
-		slog.Error("fsm: failed to unmarshal command", "error", err)
+		slog.Error("fsm: failed to unmarshal command", "index", log.Index, "error", err)
 		return fmt.Errorf("unmarshal command: %w", err)
 	}
-	return f.applyCommand(cmd)
+	resp := f.applyCommand(cmd, log)
+	reportApplyResult(cmd.Type, log.Index, resp)
+	return resp
+}
+
+// reportApplyResult logs a command the state machine did not apply cleanly.
+//
+// Raft hands an apply's result only to the future of the node that proposed the
+// entry, which is the leader. On every other node it went nowhere, so a follower
+// whose bolt write failed (a full disk, an I/O error) still advanced its applied
+// index past the entry and carried on without the record, permanently, and
+// nothing anywhere said so. Logging here is the only place that failure can be
+// seen.
+//
+// Results that are an answer rather than a failure, a bucket that already exists
+// or a key that is not there, are what the leader returns to the client, and are
+// logged at debug so a busy cluster does not log every one of them per node.
+func reportApplyResult(t CommandType, index uint64, resp interface{}) {
+	err, ok := resp.(error)
+	if !ok || err == nil {
+		return
+	}
+	if isSemanticApplyError(err) {
+		slog.Debug("fsm: command not applied", "type", t, "index", index, "reason", err)
+		return
+	}
+	slog.Error("fsm: apply failed, this node does not hold the record the cluster committed",
+		"type", t, "index", index, "error", err)
+}
+
+// isSemanticApplyError reports whether an apply error describes the request
+// (the thing it names is missing or already there) rather than a failure of
+// this node's store.
+func isSemanticApplyError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{"not found", "already exists", "does not exist", "no such"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // ApplyBatch applies a batch of committed entries, satisfying raft.BatchingFSM.
@@ -91,7 +132,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		}
 		var cmd Command
 		if err := json.Unmarshal(l.Data, &cmd); err != nil {
-			slog.Error("fsm: failed to unmarshal command", "error", err)
+			slog.Error("fsm: failed to unmarshal command", "index", l.Index, "error", err)
 			resps[i] = fmt.Errorf("unmarshal command: %w", err)
 			continue
 		}
@@ -110,7 +151,8 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	for i := 0; i < len(logs); {
 		if batchable[i] == nil {
 			if cmds[i] != nil {
-				resps[i] = f.applyCommand(*cmds[i])
+				resps[i] = f.applyCommand(*cmds[i], logs[i])
+				reportApplyResult(cmds[i].Type, logs[i].Index, resps[i])
 			}
 			i++
 			continue
@@ -129,6 +171,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				"error", err, "count", len(metas))
 			for k := range metas {
 				resps[i+k] = f.store.PutObjectMeta(metas[k])
+				reportApplyResult(CmdPutObjectMeta, logs[i+k].Index, resps[i+k])
 			}
 		}
 		i = j
@@ -187,9 +230,19 @@ func (f *FSM) currentShardMap() (*ShardMap, error) {
 	return &m, nil
 }
 
-// Snapshot returns a snapshot of the current state for Raft snapshotting.
+// Snapshot captures the current state for Raft snapshotting.
+//
+// Raft calls this on the goroutine that applies entries and records the last
+// applied index as the snapshot's index, then writes the snapshot out on another
+// goroutine while applying carries on. The read transaction is therefore opened
+// here, so what is written is the state at that index and not whatever the
+// store holds by the time the write gets to it.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
-	return &fsmSnapshot{store: f.store}, nil
+	sn, err := f.store.BeginRaftSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return &fsmSnapshot{snap: sn}, nil
 }
 
 // Restore replaces the store state from a snapshot.
@@ -198,7 +251,21 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	return f.store.RestoreSnapshot(rc)
 }
 
-func (f *FSM) applyCommand(cmd Command) interface{} {
+// applyTime is the time a command was proposed at, for commands that carry one,
+// and otherwise the time the leader appended the entry. Both are the same on
+// every node and on every replay, which the local clock is not. The clock is the
+// last resort, for an entry that has neither.
+func applyTime(proposed int64, l *raft.Log) time.Time {
+	if proposed != 0 {
+		return time.Unix(0, proposed)
+	}
+	if l != nil && !l.AppendedAt.IsZero() {
+		return l.AppendedAt
+	}
+	return time.Now()
+}
+
+func (f *FSM) applyCommand(cmd Command, l *raft.Log) interface{} {
 	if f.objectsOnly && !isObjectCommand(cmd.Type) {
 		return fmt.Errorf("cluster: command type %d does not belong in a metadata shard", cmd.Type)
 	}
@@ -206,11 +273,14 @@ func (f *FSM) applyCommand(cmd Command) interface{} {
 
 	// --- Bucket operations ---
 	case CmdCreateBucket:
-		var p struct{ Name string }
+		var p struct {
+			Name      string
+			CreatedAt int64 // unix nano, set by the proposer
+		}
 		if err := json.Unmarshal(cmd.Data, &p); err != nil {
 			return err
 		}
-		return f.store.CreateBucket(p.Name)
+		return f.store.CreateBucketAt(p.Name, applyTime(p.CreatedAt, l))
 
 	case CmdDeleteBucket:
 		var p struct{ Name string }
@@ -565,7 +635,17 @@ func (f *FSM) applyCommand(cmd Command) interface{} {
 		return f.store.DeleteAccessKey(p.AccessKey)
 
 	case CmdDeleteExpiredAccessKeys:
-		_, err := f.store.DeleteExpiredAccessKeys()
+		var p struct{ Now int64 } // unix seconds, set by the proposer
+		if len(cmd.Data) > 0 {
+			if err := json.Unmarshal(cmd.Data, &p); err != nil {
+				return err
+			}
+		}
+		now := p.Now
+		if now == 0 {
+			now = applyTime(0, l).Unix()
+		}
+		_, err := f.store.DeleteExpiredAccessKeysAt(now)
 		return err
 
 	// --- IAM operations ---
@@ -654,7 +734,18 @@ func (f *FSM) applyCommand(cmd Command) interface{} {
 		if err := json.Unmarshal(cmd.Data, &p); err != nil {
 			return err
 		}
-		return f.store.EnqueueReplication(p)
+		if p.CreatedAt == 0 {
+			p.CreatedAt = applyTime(0, l).Unix()
+		}
+		// The event's ID is the index of the log entry that enqueued it. That is
+		// unique, identical on every node, and the same when the entry is applied
+		// again after a restart, so a replay rewrites the event instead of adding a
+		// second copy under a fresh number. An ID chosen by the proposer would need
+		// a counter that survives leader changes, which the log index already is.
+		if l == nil || l.Index == 0 {
+			return f.store.EnqueueReplication(p)
+		}
+		return f.store.EnqueueReplicationWithID(p, l.Index)
 
 	case CmdAckReplication:
 		var p struct{ ID uint64 }
@@ -703,15 +794,19 @@ func (f *FSM) applyCommand(cmd Command) interface{} {
 
 // fsmSnapshot implements raft.FSMSnapshot.
 type fsmSnapshot struct {
-	store *metadata.Store
+	snap *metadata.RaftSnapshot
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	if err := s.store.WriteSnapshot(sink); err != nil {
+	// Release as soon as the bytes are out rather than waiting for Raft to call
+	// Release, since the open transaction holds up any write that needs the file
+	// to grow.
+	defer s.snap.Release()
+	if err := s.snap.Encode(sink); err != nil {
 		sink.Cancel()
 		return err
 	}
 	return sink.Close()
 }
 
-func (s *fsmSnapshot) Release() {}
+func (s *fsmSnapshot) Release() { s.snap.Release() }

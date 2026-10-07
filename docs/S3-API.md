@@ -87,7 +87,7 @@ Every S3 API call VaultS3 implements.
 | Cluster Join | `POST /cluster/join`, `POST /api/v1/cluster/join` | Done |
 | Cluster Leave | `POST /cluster/leave`, `POST /api/v1/cluster/leave` | Done |
 | Cluster Drain / Undrain | `POST /api/v1/cluster/{drain,undrain}` | Done |
-| Cluster Rebalance | `POST /api/v1/cluster/rebalance` | Done |
+| Cluster Rebalance | `POST /api/v1/cluster/rebalance` | Retired in 5.0.0, use repair |
 | Replication Sync | `POST /_replication/sync` | Done |
 | List Objects V1 | `GET /{bucket}?marker=` | Done |
 | Replication Config | `PUT/GET/DELETE /{bucket}?replication` | Done |
@@ -100,5 +100,3 @@ Every S3 API call VaultS3 implements.
 | Health Diagnostics | `GET /api/v1/diagnostics` | Done |
 | Manual Heal | `POST /api/v1/heal` | Done |
 | Speedtest | `POST /api/v1/speedtest` | Done |
-| Batch Operations | `POST /api/v1/batch` | Done |
-| Inventory Reports | `GET /api/v1/inventory` | Done |

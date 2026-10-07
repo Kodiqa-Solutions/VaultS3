@@ -22,11 +22,10 @@ const parityStripeBytes = 1 << 20
 // object plus its parity, and concurrent PUTs multiplied that. Large uploads at
 // concurrency were reported as OOM kills.
 //
-// The on-disk layout is unchanged, which matters because the read path depends
-// on it: Split writes the original bytes into equal-sized contiguous data shards
-// (the last zero-padded), so plaintext offset o lives in data shard o/perShard.
-// Preserving that means shardStream, the degraded reader and the healer need no
-// changes and existing objects stay readable.
+// The shard contents match the buffering path exactly, which matters because
+// the read path depends on it: Split writes the original bytes into equal-sized
+// contiguous data shards (the last zero-padded), so plaintext offset o lives in
+// data shard o/perShard. Only where the shards live differs (see ShardMeta).
 //
 // It takes two passes because parity at offset o needs every data shard at
 // offset o, and in a sequential stream those bytes arrive far apart: shard 0's
@@ -37,6 +36,31 @@ func (e *Engine) putObjectStreaming(bucket, key string, reader io.Reader, size i
 	k := e.cfg.DataShards
 	m := e.cfg.ParityShards
 	perShard := (size + int64(k) - 1) / int64(k)
+
+	// Every shard of this write goes under a fresh generation directory, so the
+	// version already stored, and any reader streaming it, is untouched until
+	// meta.json is switched at the very end. Writing over the old shard paths
+	// one by one meant a failed or concurrent overwrite left the stored object
+	// a mix of two versions.
+	meta := &ShardMeta{
+		OriginalSize: size,
+		DataShards:   k,
+		ParityShards: m,
+		BlockSize:    e.cfg.BlockSize,
+		ShardSizes:   make([]int64, k+m),
+		CreatedAt:    time.Now().UTC(),
+		Generation:   newGeneration(),
+		ShardCRC:     make([]string, k+m),
+		CRCStripe:    crcStripeBytes,
+	}
+	for i := range meta.ShardSizes {
+		meta.ShardSizes[i] = perShard
+	}
+	written := 0
+	fail := func(err error) (int64, string, error) {
+		e.removeShards(bucket, key, meta, written)
+		return 0, "", err
+	}
 
 	hasher := md5.New()
 	// Tee the source so every real byte is hashed exactly once. Padding is
@@ -58,50 +82,40 @@ func (e *Engine) putObjectStreaming(bucket, key string, reader io.Reader, size i
 		if pad := perShard - n; pad > 0 {
 			body = io.MultiReader(body, zeroReader(pad))
 		}
-		if _, _, err := e.backendFor(i).PutObject(bucket, shardKey(key, i), body, perShard); err != nil {
-			return 0, "", fmt.Errorf("store data shard %d: %w", i, err)
+		sum := newStripeSummer(crcStripeBytes)
+		written = i + 1
+		if _, _, err := e.backendFor(i).PutObject(bucket, meta.shardPath(key, i), io.TeeReader(body, sum), perShard); err != nil {
+			return fail(fmt.Errorf("store data shard %d: %w", i, err))
 		}
+		meta.ShardCRC[i] = sum.encoded()
 		remaining -= n
 	}
 	if remaining > 0 {
-		return 0, "", fmt.Errorf("erasure: source ended %d bytes short of the declared %d", remaining, size)
+		return fail(fmt.Errorf("erasure: source ended %d bytes short of the declared %d", remaining, size))
 	}
 
 	// Pass 2: parity, one shard at a time, generated on demand from the data
 	// shards rather than from a copy of the object.
 	for j := 0; j < m; j++ {
-		pr, err := e.newParityReader(bucket, key, perShard, j)
+		pr, err := e.newParityReader(bucket, key, meta, perShard, j)
 		if err != nil {
-			return 0, "", err
+			return fail(err)
 		}
-		_, _, err = e.backendFor(k+j).PutObject(bucket, shardKey(key, k+j), pr, perShard)
+		sum := newStripeSummer(crcStripeBytes)
+		written = k + j + 1
+		_, _, err = e.backendFor(k+j).PutObject(bucket, meta.shardPath(key, k+j), io.TeeReader(pr, sum), perShard)
 		pr.Close()
 		if err != nil {
-			return 0, "", fmt.Errorf("store parity shard %d: %w", j, err)
+			return fail(fmt.Errorf("store parity shard %d: %w", j, err))
 		}
+		meta.ShardCRC[k+j] = sum.encoded()
 	}
 
-	etag := hex.EncodeToString(hasher.Sum(nil))
-	meta := &ShardMeta{
-		OriginalSize: size,
-		DataShards:   k,
-		ParityShards: m,
-		BlockSize:    e.cfg.BlockSize,
-		ShardSizes:   make([]int64, k+m),
-		ETag:         etag,
-		CreatedAt:    time.Now().UTC(),
+	meta.ETag = hex.EncodeToString(hasher.Sum(nil))
+	if err := e.commitMeta(bucket, key, meta); err != nil {
+		return fail(err)
 	}
-	for i := range meta.ShardSizes {
-		meta.ShardSizes[i] = perShard
-	}
-	metaBytes, err := meta.Marshal()
-	if err != nil {
-		return 0, "", fmt.Errorf("marshal shard meta: %w", err)
-	}
-	if _, _, err := e.backendFor(0).PutObject(bucket, metaKey(key), byteReader(metaBytes), int64(len(metaBytes))); err != nil {
-		return 0, "", fmt.Errorf("store shard meta: %w", err)
-	}
-	return size, etag, nil
+	return size, meta.ETag, nil
 }
 
 // parityReader produces one parity shard on demand by encoding the data shards a
@@ -118,7 +132,7 @@ type parityReader struct {
 	blocks  [][]byte // reused stripe buffers
 }
 
-func (e *Engine) newParityReader(bucket, key string, perShard int64, index int) (*parityReader, error) {
+func (e *Engine) newParityReader(bucket, key string, meta *ShardMeta, perShard int64, index int) (*parityReader, error) {
 	k := e.cfg.DataShards
 	enc, err := NewEncoder(k, e.cfg.ParityShards)
 	if err != nil {
@@ -130,7 +144,7 @@ func (e *Engine) newParityReader(bucket, key string, perShard int64, index int) 
 		blocks:  make([][]byte, k+e.cfg.ParityShards),
 	}
 	for i := 0; i < k; i++ {
-		rc, _, err := e.backendFor(i).GetObject(bucket, shardKey(key, i))
+		rc, _, err := e.backendFor(i).GetObject(bucket, meta.shardPath(key, i))
 		if err != nil {
 			p.Close()
 			return nil, fmt.Errorf("reopen data shard %d for parity: %w", i, err)

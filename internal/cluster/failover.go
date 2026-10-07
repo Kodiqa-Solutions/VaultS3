@@ -1,9 +1,24 @@
 package cluster
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 )
+
+// countingBody counts the bytes read from a request body, so the caller can
+// tell whether a failed hop consumed any of it.
+type countingBody struct {
+	io.ReadCloser
+	read atomic.Int64
+}
+
+func (c *countingBody) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	c.read.Add(int64(n))
+	return n, err
+}
 
 // FailoverProxy extends the basic Proxy with failure-aware routing.
 // When the primary node is down, requests are forwarded to the next
@@ -17,7 +32,14 @@ type FailoverProxy struct {
 }
 
 // NewFailoverProxy creates a failover-aware proxy.
+//
+// The detector is subscribed to the proxy's membership sync, so it probes the
+// nodes the cluster has now, at the addresses they have now, rather than the set
+// it was given at startup.
 func NewFailoverProxy(proxy *Proxy, detector *FailureDetector) *FailoverProxy {
+	if proxy != nil && detector != nil {
+		proxy.setMembershipObserver(detector.Reconcile)
+	}
 	return &FailoverProxy{
 		Proxy:    proxy,
 		detector: detector,
@@ -109,8 +131,24 @@ func (f *FailoverProxy) ForwardWithRetry(w http.ResponseWriter, r *http.Request,
 		return false // handle locally
 	}
 
+	// A hop that fails before answering may still have read part of the request
+	// body. Sending what is left of it to the next holder would store a truncated
+	// object, and with a chunked upload, which declares no length, that holder
+	// cannot tell and answers 200. Once any byte of the body has gone, the only
+	// safe answer is to fail the request so the client sends it again whole.
+	var body *countingBody
+	if r.Body != nil && r.Body != http.NoBody {
+		body = &countingBody{ReadCloser: r.Body}
+		r.Body = body
+	}
 	for _, node := range f.forwardCandidates(bucket, key, target) {
 		if f.forwardOnce(w, r, node) {
+			return true
+		}
+		if body != nil && body.read.Load() > 0 {
+			slog.Error("proxy: hop failed after reading part of the request body, not retrying on another holder",
+				"bucket", bucket, "key", key, "node", node, "body_bytes_sent", body.read.Load())
+			WriteUnavailable(w)
 			return true
 		}
 	}

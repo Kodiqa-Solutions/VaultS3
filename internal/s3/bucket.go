@@ -18,7 +18,12 @@ import (
 )
 
 // validateEndpointURL prevents SSRF by blocking private/internal URLs.
-func validateEndpointURL(rawURL string) error {
+// validateEndpointURL checks a webhook or function URL when it is saved. With
+// allowPrivate (the operator's notifications.allow_private_webhooks or
+// lambda.allow_private_endpoints) only the metadata service is refused, so the
+// save-time check agrees with the dial-time guard the operator relaxed. It used
+// to refuse private addresses regardless, so the option could not be used.
+func validateEndpointURL(rawURL string, allowPrivate bool) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL")
@@ -27,6 +32,12 @@ func validateEndpointURL(rawURL string) error {
 		return fmt.Errorf("URL scheme must be http or https")
 	}
 	host := u.Hostname()
+	if allowPrivate {
+		if strings.HasPrefix(host, "169.254.") || host == "metadata.google.internal" || host == "fd00:ec2::254" {
+			return fmt.Errorf("URL must not point to metadata service")
+		}
+		return nil
+	}
 	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
 		return fmt.Errorf("URL must not point to localhost")
 	}
@@ -49,9 +60,11 @@ func validateEndpointURL(rawURL string) error {
 }
 
 type BucketHandler struct {
-	store  metadata.StoreAPI
-	engine storage.Engine
-	keyMgr *bucketcrypto.Manager // per-bucket encryption keys (nil if unconfigured)
+	allowPrivateWebhooks bool
+	allowPrivateLambda   bool
+	store                metadata.StoreAPI
+	engine               storage.Engine
+	keyMgr               *bucketcrypto.Manager // per-bucket encryption keys (nil if unconfigured)
 	// perBucketMode is encryption.per_bucket, the only mode in which this server
 	// encrypts per bucket rather than server-wide.
 	perBucketMode bool
@@ -140,8 +153,16 @@ func (h *BucketHandler) CreateBucket(w http.ResponseWriter, r *http.Request, buc
 	// on automatically. Enable it and record the object-lock state so retention is
 	// stored on versions and GetObjectLockConfiguration reports the true state.
 	if strings.EqualFold(r.Header.Get("X-Amz-Bucket-Object-Lock-Enabled"), "true") {
-		h.store.SetBucketVersioning(bucket, "Enabled")
-		h.store.SetBucketObjectLockEnabled(bucket, true)
+		if err := h.store.SetBucketVersioning(bucket, "Enabled"); err != nil {
+			slog.Error("create bucket: could not enable versioning for object lock", "bucket", bucket, "error", err)
+			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+			return
+		}
+		if err := h.store.SetBucketObjectLockEnabled(bucket, true); err != nil {
+			slog.Error("create bucket: could not enable object lock", "bucket", bucket, "error", err)
+			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Header().Set("Location", "/"+bucket)
@@ -155,7 +176,20 @@ func (h *BucketHandler) DeleteBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	// Check if bucket is empty
+	// A bucket is empty only when the metadata store holds no object, version
+	// or delete marker for it AND nothing is left on disk. The disk walk alone
+	// skips .vs/, so a versioning enabled bucket always looked empty and was
+	// deleted with every object in it, locked ones included.
+	hasData, err := metadata.BucketHasData(h.store, bucket)
+	if err != nil {
+		slog.Error("could not tell whether a bucket is empty, refusing to delete it", "bucket", bucket, "error", err)
+		writeS3Error(w, "ServiceUnavailable", "Could not confirm the bucket is empty, retry the request", http.StatusServiceUnavailable)
+		return
+	}
+	if hasData {
+		writeS3Error(w, "BucketNotEmpty", "The bucket you tried to delete is not empty. Delete every object version and delete marker first", http.StatusConflict)
+		return
+	}
 	objects, _, err := h.engine.ListObjects(bucket, "", "", 1)
 	if err != nil {
 		slog.Error("internal error", "error", err)
@@ -381,19 +415,37 @@ func (h *BucketHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Every element the server cannot honour is parsed so it can be refused.
+	// Parsing only Filter>Prefix and Expiration>Days used to drop the rest in
+	// silence: a rule-level <Prefix>, a Tag, an And or a size filter all came
+	// out as an empty filter, so a rule meant for "logs/" or for one tag was
+	// stored as "expire every object in the bucket", and only the first of
+	// several rules was kept. A refusal is a 501 the caller can see. A widened
+	// rule deletes data nobody asked to delete.
 	var req struct {
 		XMLName xml.Name `xml:"LifecycleConfiguration"`
 		Rules   []struct {
-			Expiration struct {
-				Days int `xml:"Days"`
+			ID         string  `xml:"ID"`
+			Prefix     *string `xml:"Prefix"`
+			Expiration *struct {
+				Days                      int    `xml:"Days"`
+				Date                      string `xml:"Date"`
+				ExpiredObjectDeleteMarker *bool  `xml:"ExpiredObjectDeleteMarker"`
 			} `xml:"Expiration"`
 			AbortIncompleteMultipartUpload struct {
 				DaysAfterInitiation int `xml:"DaysAfterInitiation"`
 			} `xml:"AbortIncompleteMultipartUpload"`
-			Filter struct {
-				Prefix string `xml:"Prefix"`
+			Filter *struct {
+				Prefix                *string   `xml:"Prefix"`
+				Tag                   *struct{} `xml:"Tag"`
+				And                   *struct{} `xml:"And"`
+				ObjectSizeGreaterThan *int64    `xml:"ObjectSizeGreaterThan"`
+				ObjectSizeLessThan    *int64    `xml:"ObjectSizeLessThan"`
 			} `xml:"Filter"`
-			Status string `xml:"Status"`
+			NoncurrentVersionExpiration  *struct{}  `xml:"NoncurrentVersionExpiration"`
+			Transitions                  []struct{} `xml:"Transition"`
+			NoncurrentVersionTransitions []struct{} `xml:"NoncurrentVersionTransition"`
+			Status                       string     `xml:"Status"`
 		} `xml:"Rule"`
 	}
 	if err := xml.NewDecoder(io.LimitReader(r.Body, 256*1024)).Decode(&req); err != nil {
@@ -405,20 +457,73 @@ func (h *BucketHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Reques
 		writeS3Error(w, "InvalidArgument", "At least one rule is required", http.StatusBadRequest)
 		return
 	}
-
-	// Store the first rule (simplified — one rule per bucket). A rule is valid if
-	// it specifies at least one action: object expiration or aborting incomplete
-	// multipart uploads (AWS allows a rule with only AbortIncompleteMultipartUpload).
+	notImplemented := func(what string) {
+		writeS3Error(w, "NotImplemented", "Lifecycle "+what+" is not supported by this server, so the configuration was not stored", http.StatusNotImplemented)
+	}
+	if len(req.Rules) > 1 {
+		notImplemented("configurations with more than one rule are")
+		return
+	}
 	rule := req.Rules[0]
-	if rule.Expiration.Days <= 0 && rule.AbortIncompleteMultipartUpload.DaysAfterInitiation <= 0 {
+	if rule.Status != "Enabled" && rule.Status != "Disabled" {
+		writeS3Error(w, "MalformedXML", "Rule Status must be Enabled or Disabled", http.StatusBadRequest)
+		return
+	}
+	prefix := ""
+	switch {
+	case rule.Filter != nil && rule.Prefix != nil:
+		writeS3Error(w, "MalformedXML", "A rule cannot have both a Prefix and a Filter", http.StatusBadRequest)
+		return
+	case rule.Prefix != nil:
+		prefix = *rule.Prefix
+	case rule.Filter != nil:
+		f := rule.Filter
+		switch {
+		case f.Tag != nil:
+			notImplemented("Tag filters are")
+			return
+		case f.And != nil:
+			notImplemented("And filters are")
+			return
+		case f.ObjectSizeGreaterThan != nil || f.ObjectSizeLessThan != nil:
+			notImplemented("object size filters are")
+			return
+		}
+		if f.Prefix != nil {
+			prefix = *f.Prefix
+		}
+	}
+	switch {
+	case rule.NoncurrentVersionExpiration != nil:
+		notImplemented("NoncurrentVersionExpiration is")
+		return
+	case len(rule.Transitions) > 0 || len(rule.NoncurrentVersionTransitions) > 0:
+		notImplemented("transitions are")
+		return
+	case rule.Expiration != nil && rule.Expiration.Date != "":
+		notImplemented("expiration by Date is")
+		return
+	case rule.Expiration != nil && rule.Expiration.ExpiredObjectDeleteMarker != nil:
+		notImplemented("ExpiredObjectDeleteMarker is")
+		return
+	}
+	days := 0
+	if rule.Expiration != nil {
+		days = rule.Expiration.Days
+	}
+	// A rule is valid if it specifies at least one action: object expiration
+	// or aborting incomplete multipart uploads (AWS allows a rule with only
+	// AbortIncompleteMultipartUpload).
+	if days <= 0 && rule.AbortIncompleteMultipartUpload.DaysAfterInitiation <= 0 {
 		writeS3Error(w, "InvalidArgument", "A rule must specify Expiration or AbortIncompleteMultipartUpload", http.StatusBadRequest)
 		return
 	}
 
 	if err := h.store.PutLifecycleRule(bucket, metadata.LifecycleRule{
-		ExpirationDays:               rule.Expiration.Days,
+		ID:                           rule.ID,
+		ExpirationDays:               days,
 		AbortIncompleteMultipartDays: rule.AbortIncompleteMultipartUpload.DaysAfterInitiation,
-		Prefix:                       rule.Filter.Prefix,
+		Prefix:                       prefix,
 		Status:                       rule.Status,
 	}); err != nil {
 		slog.Error("internal error", "error", err)
@@ -437,7 +542,10 @@ func (h *BucketHandler) GetBucketLifecycle(w http.ResponseWriter, r *http.Reques
 	}
 
 	rule, err := h.store.GetLifecycleRule(bucket)
-	if err != nil {
+	// The store answers (nil, nil) for a bucket with no rule. Checking only err
+	// dereferenced that nil, so every GET ?lifecycle on such a bucket panicked
+	// and the client saw the connection drop.
+	if err != nil || rule == nil {
 		writeS3Error(w, "NoSuchLifecycleConfiguration", "No lifecycle configuration", http.StatusNotFound)
 		return
 	}
@@ -784,7 +892,7 @@ func (h *BucketHandler) PutBucketNotification(w http.ResponseWriter, r *http.Req
 			writeS3Error(w, "InvalidArgument", "Topic (endpoint URL) is required", http.StatusBadRequest)
 			return
 		}
-		if err := validateEndpointURL(tc.Topic); err != nil {
+		if err := validateEndpointURL(tc.Topic, h.allowPrivateWebhooks); err != nil {
 			writeS3Error(w, "InvalidArgument", fmt.Sprintf("Invalid endpoint URL: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -923,10 +1031,21 @@ func (h *BucketHandler) PutBucketEncryption(w http.ResponseWriter, r *http.Reque
 			http.StatusBadRequest)
 		return
 	}
-	if err := h.store.PutEncryptionConfig(bucket, metadata.BucketEncryptionConfig{
+	// The bucket's data keys live in this same record. Writing a fresh record
+	// dropped them, so sending this request again to a bucket that was already
+	// encrypted, as Terraform and other config tools do on every apply,
+	// replaced its key with a new one and left every object encrypted before
+	// that permanently unreadable. The key material is carried over, so the
+	// call only changes what it names.
+	next := metadata.BucketEncryptionConfig{
 		SSEAlgorithm: rule.DefaultEncryption.SSEAlgorithm,
 		KMSKeyID:     rule.DefaultEncryption.KMSKeyID,
-	}); err != nil {
+	}
+	if prev, err := h.store.GetEncryptionConfig(bucket); err == nil && prev != nil {
+		next.KeyVersion = prev.KeyVersion
+		next.WrappedDEKs = prev.WrappedDEKs
+	}
+	if err := h.store.PutEncryptionConfig(bucket, next); err != nil {
 		slog.Error("internal error", "error", err)
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 		return
@@ -964,7 +1083,9 @@ func (h *BucketHandler) GetBucketEncryption(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	cfg, err := h.store.GetEncryptionConfig(bucket)
-	if err != nil {
+	// A record with no algorithm is one whose default encryption was removed
+	// while its keys were kept for the objects already encrypted.
+	if err != nil || cfg == nil || cfg.SSEAlgorithm == "" {
 		writeS3Error(w, "ServerSideEncryptionConfigurationNotFoundError", "No encryption configuration", http.StatusNotFound)
 		return
 	}
@@ -994,7 +1115,28 @@ func (h *BucketHandler) DeleteBucketEncryption(w http.ResponseWriter, r *http.Re
 		writeS3Error(w, "NoSuchBucket", "Bucket does not exist", http.StatusNotFound)
 		return
 	}
-	h.store.DeleteEncryptionConfig(bucket)
+	// Removing the default encryption stops new objects being encrypted. It must
+	// not remove the keys the existing objects were encrypted with: deleting the
+	// whole record did, so this call crypto-shredded the bucket. On AWS the
+	// objects stay readable, and here too the keys are kept with the algorithm
+	// cleared. Destroying them is the explicit crypto-shred operation.
+	cfg, err := h.store.GetEncryptionConfig(bucket)
+	if err == nil && cfg != nil && len(cfg.WrappedDEKs) > 0 {
+		cfg.SSEAlgorithm = ""
+		cfg.KMSKeyID = ""
+		if err := h.store.PutEncryptionConfig(bucket, *cfg); err != nil {
+			slog.Error("internal error", "error", err)
+			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := h.store.DeleteEncryptionConfig(bucket); err != nil {
+		slog.Error("internal error", "error", err)
+		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1189,12 +1331,21 @@ func (h *BucketHandler) PutBucketLambda(w http.ResponseWriter, r *http.Request, 
 			writeS3Error(w, "InvalidArgument", "function_url is required", http.StatusBadRequest)
 			return
 		}
-		if err := validateEndpointURL(t.FunctionURL); err != nil {
+		if err := validateEndpointURL(t.FunctionURL, h.allowPrivateLambda); err != nil {
 			writeS3Error(w, "InvalidArgument", fmt.Sprintf("Invalid function URL: %v", err), http.StatusBadRequest)
 			return
 		}
 		if len(t.Events) == 0 {
 			writeS3Error(w, "InvalidArgument", "events is required", http.StatusBadRequest)
+			return
+		}
+		// The function's response is written to OutputBucket by the server
+		// itself, with no IAM check, no object lock and no quota. Naming any
+		// bucket used to be accepted, so a caller who could configure a trigger
+		// on their own bucket could overwrite objects in anyone's. The output now
+		// stays in the bucket the trigger belongs to.
+		if t.OutputBucket != "" && t.OutputBucket != bucket {
+			writeS3Error(w, "InvalidArgument", "output_bucket must be this bucket", http.StatusBadRequest)
 			return
 		}
 		if t.ID == "" {

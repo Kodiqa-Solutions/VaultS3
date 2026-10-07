@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
 import { useParams, useSearchParams, Link } from 'react-router-dom'
-import { listObjects, searchObjectsInPrefix, deleteObject, bulkDeleteObjects, getDownloadUrl, getDownloadZipUrl, type ObjectItem } from '../api/objects'
+import { listObjects, searchObjectsInPrefix, deleteObject, bulkDeleteObjects, summarizeBulkDelete, getDownloadUrl, getDownloadZipUrl, fetchObjectText, type ObjectItem } from '../api/objects'
+import { isAddressableKey } from '../api/paths'
+import { bulkDeleteMessage } from './bulkDeleteMessage'
 import { getBucketVersioning } from '../api/buckets'
 import { listVersions, getVersionTags, createVersionTag, deleteVersionTag, rollbackVersion, type Version, type VersionTag } from '../api/versions'
 import UploadDropzone from '../components/UploadDropzone'
@@ -10,6 +12,7 @@ import VersionDiffViewer from '../components/VersionDiffViewer'
 import FileTypeIcon from '../components/FileTypeIcon'
 import FileGridView from '../components/FileGridView'
 import { useToast } from '../hooks/useToast'
+import { useInFlight } from '../hooks/useInFlight'
 
 type SortField = 'name' | 'size' | 'type' | 'modified'
 type SortDir = 'asc' | 'desc'
@@ -40,6 +43,8 @@ export default function FileBrowserPage() {
   const [nextCursor, setNextCursor] = useState('')
   const [error, setError] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleting, runDelete] = useInFlight()
+  const [rollingBack, runRollback] = useInFlight()
   const { addToast } = useToast()
 
   // Sort state
@@ -67,7 +72,7 @@ export default function FileBrowserPage() {
 
   // Multi-select
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
-  const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [bulkDeleting, runBulkDelete] = useInFlight()
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false)
 
   // Versioning
@@ -102,7 +107,7 @@ export default function FileBrowserPage() {
       .finally(() => setVersionsLoading(false))
   }, [bucket, selectedFile, sideTab])
 
-  const handleRollback = async (versionId: string) => {
+  const handleRollback = (versionId: string) => runRollback(async () => {
     if (!bucket || !selectedFile) return
     setError('')
     try {
@@ -120,7 +125,7 @@ export default function FileBrowserPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : t('files.rollbackFailed'))
     }
-  }
+  })
 
   const handleAddTag = async (versionId: string) => {
     if (!bucket || !selectedFile || !newTagName.trim()) return
@@ -194,7 +199,7 @@ export default function FileBrowserPage() {
   // Reset selection when navigating
   useEffect(() => { setSelectedFile(null); setPreviewContent(null); setSelectedKeys(new Set()) }, [prefix])
 
-  const handleDelete = async (key: string) => {
+  const handleDelete = (key: string) => runDelete(async () => {
     if (!bucket) return
     setError('')
     try {
@@ -206,29 +211,28 @@ export default function FileBrowserPage() {
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('files.deleteObjectFailed'))
     }
-  }
+  })
 
-  const handleBulkDelete = async () => {
+  const handleBulkDelete = () => runBulkDelete(async () => {
     if (!bucket || selectedKeys.size === 0) return
-    setBulkDeleting(true)
     setError('')
     try {
-      const count = selectedKeys.size
-      await bulkDeleteObjects(bucket, Array.from(selectedKeys))
+      const keys = Array.from(selectedKeys)
+      const results = await bulkDeleteObjects(bucket, keys)
+      const summary = summarizeBulkDelete(keys, results)
       setShowBulkDeleteModal(false)
       setSelectedKeys(new Set())
       if (selectedFile && selectedKeys.has(selectedFile.key)) {
         setSelectedFile(null)
         setPreviewContent(null)
       }
-      addToast('success', `${count} object${count !== 1 ? 's' : ''} deleted`)
+      const { type, text } = bulkDeleteMessage(summary, t)
+      addToast(type, text)
       fetchObjects()
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('files.bulkDeleteFailed'))
-    } finally {
-      setBulkDeleting(false)
     }
-  }
+  })
 
   // Entering a folder drops the filter: it was about the folder we are leaving.
   // Other params stay; only prefix and q are ours.
@@ -317,6 +321,9 @@ export default function FileBrowserPage() {
     setSelectedFile(obj)
     setPreviewContent(null)
 
+    // A key a URL path cannot carry would preview a different object.
+    if (!isAddressableKey(obj.key)) return
+
     const ct = obj.contentType || ''
     const ext = obj.key.split('.').pop()?.toLowerCase() || ''
 
@@ -334,12 +341,8 @@ export default function FileBrowserPage() {
     if (isText && obj.size < 512 * 1024) {
       setPreviewLoading(true)
       try {
-        const url = getDownloadUrl(bucket!, obj.key)
-        const resp = await fetch(url)
-        if (resp.ok) {
-          const text = await resp.text()
-          setPreviewContent(text)
-        }
+        const text = await fetchObjectText(bucket!, obj.key)
+        if (text !== null) setPreviewContent(text)
       } catch {
         setPreviewContent(null)
       } finally {
@@ -405,7 +408,7 @@ export default function FileBrowserPage() {
                   : 'text-gray-500 dark:text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400'
               }`}
             >
-              files
+              {t('files.title')}
             </button>
             {breadcrumbs.map((bc, i) => (
               <span key={bc.prefix} className="flex items-center gap-1">
@@ -506,7 +509,7 @@ export default function FileBrowserPage() {
         {selectedKeys.size > 0 && (
           <div className="mb-4 flex items-center gap-3 px-4 py-2.5 rounded-lg bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800">
             <span className="text-sm font-medium text-indigo-700 dark:text-indigo-300">
-              {selectedKeys.size} selected
+              {t('files.nSelected', { n: selectedKeys.size })}
             </span>
             <button
               onClick={() => setShowBulkDeleteModal(true)}
@@ -546,15 +549,17 @@ export default function FileBrowserPage() {
               <div className="flex gap-2 justify-end">
                 <button
                   onClick={() => setDeleteTarget(null)}
-                  className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                  disabled={deleting}
+                  className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50"
                 >
                   {t('common.cancel')}
                 </button>
                 <button
                   onClick={() => handleDelete(deleteTarget)}
-                  className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors"
+                  disabled={deleting}
+                  className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50"
                 >
-                  {t('common.delete')}
+                  {deleting ? t('files.deleting') : t('common.delete')}
                 </button>
               </div>
             </div>
@@ -687,13 +692,16 @@ export default function FileBrowserPage() {
                         {!obj.isPrefix && (
                           <div className="flex items-center justify-end gap-2">
                             <CopyButton text={`s3://${bucket}/${obj.key}`} />
-                            <a
-                              href={getDownloadUrl(bucket, obj.key)}
-                              className="text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
-                              title={t('common.download')}
-                            >
-                              <DownloadIcon />
-                            </a>
+                            {/* No link for a key a URL path cannot carry, see isAddressableKey. */}
+                            {isAddressableKey(obj.key) && (
+                              <a
+                                href={getDownloadUrl(bucket, obj.key) ?? undefined}
+                                className="text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+                                title={t('common.download')}
+                              >
+                                <DownloadIcon />
+                              </a>
+                            )}
                             <button
                               onClick={() => setDeleteTarget(obj.key)}
                               className="text-gray-400 hover:text-red-600 dark:hover:text-red-400 transition-colors"
@@ -730,8 +738,8 @@ export default function FileBrowserPage() {
             {(totalPages > 1 || truncated) && (
               <div className="flex items-center justify-between mt-3 text-sm text-gray-500 dark:text-gray-400">
                 <span>
-                  {sortedObjects.length}{truncated ? '+' : ''} items
-                  {totalPages > 1 && <> &middot; Page {page + 1} of {totalPages}</>}
+                  {t('files.itemCount', { n: `${sortedObjects.length}${truncated ? '+' : ''}` })}
+                  {totalPages > 1 && <> &middot; {t('files.pageOf', { page: page + 1, total: totalPages })}</>}
                 </span>
                 <div className="flex gap-1">
                   {truncated && (
@@ -786,13 +794,15 @@ export default function FileBrowserPage() {
             <div className="flex gap-2 justify-end">
               <button
                 onClick={() => setRollbackTarget(null)}
-                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                disabled={rollingBack}
+                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50"
               >
                 {t('common.cancel')}
               </button>
               <button
                 onClick={() => handleRollback(rollbackTarget)}
-                className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium transition-colors"
+                disabled={rollingBack}
+                className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium transition-colors disabled:opacity-50"
               >
                 {t('files.rollback')}
               </button>
@@ -867,12 +877,14 @@ export default function FileBrowserPage() {
                 </div>
 
                 <div className="flex gap-2 mb-4">
-                  <a
-                    href={getDownloadUrl(bucket, selectedFile.key)}
-                    className="flex-1 text-center px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium transition-colors"
-                  >
-                    {t('common.download')}
-                  </a>
+                  {isAddressableKey(selectedFile.key) && (
+                    <a
+                      href={getDownloadUrl(bucket, selectedFile.key) ?? undefined}
+                      className="flex-1 text-center px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium transition-colors"
+                    >
+                      {t('common.download')}
+                    </a>
+                  )}
                   <button
                     onClick={() => setDeleteTarget(selectedFile.key)}
                     className="px-3 py-1.5 rounded-lg border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 text-xs font-medium transition-colors"
@@ -890,7 +902,7 @@ export default function FileBrowserPage() {
                 {previewContent === '__image__' && (
                   <div className="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden mb-4 shadow-sm bg-gray-50 dark:bg-gray-900/50 flex items-center justify-center p-2">
                     <img
-                      src={getDownloadUrl(bucket, selectedFile.key)}
+                      src={getDownloadUrl(bucket, selectedFile.key) ?? undefined}
                       alt={selectedFile.key}
                       className="w-full h-auto max-h-64 object-contain rounded-lg"
                     />

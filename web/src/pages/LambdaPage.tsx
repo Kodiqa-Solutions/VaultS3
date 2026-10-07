@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useInFlight } from '../hooks/useInFlight'
 import { getLambdaStatus, listLambdaTriggers, deleteBucketTriggers, type LambdaStatus, type BucketTriggers } from '../api/lambda'
 import { useToast } from '../hooks/useToast'
 
@@ -13,6 +14,7 @@ export default function LambdaPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleting, runDelete] = useInFlight()
   const { addToast } = useToast()
   const [lSortField, setLSortField] = useState<LSortField>('bucket')
   const [lSortDir, setLSortDir] = useState<LSortDir>('asc')
@@ -35,7 +37,7 @@ export default function LambdaPage() {
 
   useEffect(() => { fetchData() }, [fetchData])
 
-  const handleDeleteTriggers = async (bucket: string) => {
+  const handleDeleteTriggers = (bucket: string) => runDelete(async () => {
     setError('')
     try {
       await deleteBucketTriggers(bucket)
@@ -45,7 +47,7 @@ export default function LambdaPage() {
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('lambda.deleteFailed'))
     }
-  }
+  })
 
   const handleLSort = (field: LSortField) => {
     if (lSortField === field) {
@@ -190,10 +192,10 @@ export default function LambdaPage() {
               {t('lambda.removeAllFor')} <strong>{deleteTarget}</strong>?
             </p>
             <div className="flex gap-2 justify-end">
-              <button onClick={() => setDeleteTarget(null)}
-                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">{t('lambda.cancel')}</button>
-              <button onClick={() => handleDeleteTriggers(deleteTarget)}
-                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors">{t('lambda.delete')}</button>
+              <button onClick={() => setDeleteTarget(null)} disabled={deleting}
+                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50">{t('lambda.cancel')}</button>
+              <button onClick={() => handleDeleteTriggers(deleteTarget)} disabled={deleting}
+                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50">{t('lambda.delete')}</button>
             </div>
           </div>
         </div>

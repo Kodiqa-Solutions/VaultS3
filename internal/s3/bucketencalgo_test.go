@@ -1,6 +1,8 @@
 package s3
 
 import (
+	"errors"
+
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"net/http"
 	"net/http/httptest"
@@ -53,3 +55,12 @@ func (s *encAlgoStore) PutEncryptionConfig(_ string, c metadata.BucketEncryption
 	s.cfg = c
 	return nil
 }
+func (s *encAlgoStore) GetEncryptionConfig(string) (*metadata.BucketEncryptionConfig, error) {
+	if s.cfg.SSEAlgorithm == "" && s.cfg.KeyVersion == 0 {
+		return nil, errNotFoundForTest
+	}
+	c := s.cfg
+	return &c, nil
+}
+
+var errNotFoundForTest = errors.New("not found")

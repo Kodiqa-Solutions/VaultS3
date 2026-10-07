@@ -6,7 +6,22 @@ export interface LoginResponse {
 
 export interface MeResponse {
   user: string
+  // The masked admin access key. The server fills it for the admin session only
+  // and sends "" for everyone else.
   accessKey: string
+}
+
+// isAdminSession mirrors the server's rule: only the "admin" subject may use the
+// admin routes (keys, IAM, settings and the rest), every other session gets 403.
+export function isAdminSession(me: MeResponse | null | undefined): boolean {
+  return me?.user === 'admin'
+}
+
+// sessionLabel is what the top bar shows for the signed-in session. A non-admin
+// session has no access key in the answer, so it falls back to the user name
+// rather than showing nothing.
+export function sessionLabel(me: MeResponse | null | undefined): string {
+  return me?.accessKey || me?.user || ''
 }
 
 export function login(accessKey: string, secretKey: string): Promise<LoginResponse> {

@@ -44,6 +44,7 @@ func (m *mockBackend) Close() error {
 func TestNewDispatcher(t *testing.T) {
 	store := newTestStore(t)
 	d := NewDispatcher(store, 2, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 	if d == nil {
 		t.Fatal("expected non-nil dispatcher")
 	}
@@ -58,6 +59,7 @@ func TestNewDispatcher(t *testing.T) {
 func TestDispatcher_StartStop(t *testing.T) {
 	store := newTestStore(t)
 	d := NewDispatcher(store, 2, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 	ctx, cancel := context.WithCancel(context.Background())
 	d.Start(ctx)
 	cancel()
@@ -67,6 +69,7 @@ func TestDispatcher_StartStop(t *testing.T) {
 func TestDispatcher_AddBackend(t *testing.T) {
 	store := newTestStore(t)
 	d := NewDispatcher(store, 1, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 
 	b := &mockBackend{name: "test-backend"}
 	d.AddBackend(b)
@@ -79,6 +82,7 @@ func TestDispatcher_AddBackend(t *testing.T) {
 func TestDispatcher_BackendClose(t *testing.T) {
 	store := newTestStore(t)
 	d := NewDispatcher(store, 1, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 
 	b := &mockBackend{name: "test"}
 	d.AddBackend(b)
@@ -102,6 +106,7 @@ func TestDispatcher_DispatchToBackend(t *testing.T) {
 	})
 
 	d := NewDispatcher(store, 1, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 	b := &mockBackend{name: "test"}
 	d.AddBackend(b)
 
@@ -142,6 +147,7 @@ func TestDispatcher_WebhookDelivery(t *testing.T) {
 	})
 
 	d := NewDispatcher(store, 2, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 	ctx, cancel := context.WithCancel(context.Background())
 	d.Start(ctx)
 
@@ -177,6 +183,7 @@ func TestDispatcher_EventFiltering(t *testing.T) {
 	})
 
 	d := NewDispatcher(store, 1, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 	ctx, cancel := context.WithCancel(context.Background())
 	d.Start(ctx)
 
@@ -216,6 +223,7 @@ func TestDispatcher_KeyFilter(t *testing.T) {
 	})
 
 	d := NewDispatcher(store, 1, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 	ctx, cancel := context.WithCancel(context.Background())
 	d.Start(ctx)
 
@@ -324,6 +332,7 @@ func TestDispatcher_NoBucketConfig(t *testing.T) {
 	store := newTestStore(t)
 	// Don't create bucket or notification config
 	d := NewDispatcher(store, 1, 10, 5, 3)
+	d.AllowPrivateWebhooks() // the test receivers listen on 127.0.0.1
 	// Should not panic
 	d.Dispatch("nonexistent", "file.txt", "s3:ObjectCreated:Put", 100, "etag", "")
 }
@@ -331,4 +340,73 @@ func TestDispatcher_NoBucketConfig(t *testing.T) {
 // Ensure temp dir doesn't leak
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
+}
+
+// Backends received events only from buckets that also had a webhook, because
+// Dispatch returned before them when a bucket had no notification config.
+func TestBackendsGetEventsFromBucketsWithoutWebhooks(t *testing.T) {
+	store := newTestStore(t)
+	d := NewDispatcher(store, 1, 10, 5, 3)
+	mb := &mockBackend{name: "m"}
+	d.AddBackend(mb)
+	ctx, cancel := context.WithCancel(context.Background())
+	d.Start(ctx)
+	d.Dispatch("no-webhooks", "k", "s3:ObjectCreated:Put", 1, "e", "")
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	d.Stop()
+	if len(mb.messages) != 1 {
+		t.Errorf("backend got %d events from a bucket with no webhook, want 1", len(mb.messages))
+	}
+}
+
+type slowBackend struct{ mockBackend }
+
+func (s *slowBackend) Publish(ctx context.Context, p []byte) error {
+	select {
+	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+// Backends published inside the S3 request with no deadline, so a slow one
+// held up every PUT.
+func TestASlowBackendDoesNotBlockDispatch(t *testing.T) {
+	store := newTestStore(t)
+	d := NewDispatcher(store, 1, 10, 1, 3)
+	d.AddBackend(&slowBackend{mockBackend{name: "slow"}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		d.Dispatch("b", "k", "s3:ObjectCreated:Put", 1, "e", "")
+	}
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Errorf("5 dispatches took %s with a slow backend, the request path must not wait for it", took)
+	}
+}
+
+// Webhook endpoints come from bucket owners. A loopback receiver must be
+// refused unless the operator allowed private webhooks.
+func TestWebhookToLoopbackIsRefusedByDefault(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	defer srv.Close()
+	store := newTestStore(t)
+	store.CreateBucket("b")
+	store.PutNotificationConfig("b", metadata.BucketNotificationConfig{Webhooks: []metadata.NotificationEndpointConfig{
+		{ID: "w", Endpoint: srv.URL, Events: []string{"s3:ObjectCreated:*"}},
+	}})
+	d := NewDispatcher(store, 1, 10, 5, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	d.Start(ctx)
+	d.Dispatch("b", "k", "s3:ObjectCreated:Put", 1, "e", "")
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	d.Stop()
+	if hits.Load() != 0 {
+		t.Error("a webhook to a loopback address was delivered")
+	}
 }

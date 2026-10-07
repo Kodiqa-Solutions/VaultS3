@@ -78,6 +78,7 @@ func (cl *ChangeLog) ChangesSince(sinceSeq uint64, limit int) ([]ChangeEntry, ui
 		if err := json.Unmarshal(raw.Value, &entry); err != nil {
 			continue // skip corrupt entries
 		}
+		entry.Seq = seq
 		entries = append(entries, entry)
 	}
 

@@ -4,6 +4,501 @@ All notable changes to VaultS3 are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
+## [Unreleased]
+
+## [5.0.0] - 2026-10-07
+A major version because it changes behaviour a working setup can depend on:
+custom IAM policies need the per-action names, data written by 5.0.0 cannot be
+read by 4.4.x, and several defaults are stricter. Nothing needs migrating, but
+read `docs/UPGRADING.md` before upgrading. Self-update does not cross a major
+version unless `auto_update.allow_major` is set, so upgrade by hand.
+
+### Security
+Found by a full code review of 4.4.79. Every item was reproduced against the
+released 4.4.79 image before it was fixed.
+
+- **A bucket with static website hosting answered S3 API calls to anyone.**
+  Website hosting waived authentication for every GET and HEAD on the bucket,
+  while the website handler only serves requests with no query string. Anyone
+  could list the bucket (`?list-type=2`), list and read old versions (`?versions`,
+  `?versionId=`), and read its policy, notification targets, CORS and other
+  configuration. Only plain website requests are anonymous now.
+
+- **A Snowball archive or a POST upload could overwrite objects in any other
+  bucket.** A tar entry or a form `key` such as `../victim/a.txt` resolved to
+  another bucket's object, because keys from those two paths were never checked
+  and the storage engine only kept paths inside the data directory. Anyone with
+  `s3:PutObject` on one bucket could replace data in every other. Keys are now
+  refused at both doors, and the engine keeps every key inside its own bucket.
+  Keys listed by a migration source are checked the same way.
+
+- **Anonymous bucket policies ignored `Condition`.** A statement such as "allow
+  `s3:GetObject` from 203.0.113.0/24" published the objects to everyone.
+  Conditions are now evaluated with the IAM evaluator, `aws:SourceIp` is the
+  connection's address, never `X-Forwarded-For` (unless the connection comes from
+  a proxy listed in the new `server.trusted_proxies`), and a condition that cannot
+  be decided grants nothing while a conditional `Deny` still applies.
+
+- **The inter-node listener served the replication change log without the
+  cluster secret.** With `internode_port` set and active-active replication on,
+  anyone who could reach that port could read every bucket, key, ETag and size.
+  The public port already required the secret, now both do.
+
+- **A lambda trigger could write its output into any bucket.** The output is
+  written by the server itself, past IAM, object lock and quotas. It must now be
+  the trigger's own bucket, a trigger saved earlier that names another is
+  refused when it fires, and the function call no longer follows redirects.
+
+- **S3 sub-resources were authorized as the wrong IAM action.** Every bucket
+  configuration write (`?policy`, `?lifecycle`, `?cors`, `?encryption`,
+  `?replication` and the rest) was checked as `s3:CreateBucket`, every read as
+  `s3:ListBucket`, every object sub-resource write (tagging, ACL, retention,
+  legal hold) as `s3:PutObject`, and multipart part listing and abort as `s3:*`.
+  A user allowed to create buckets could replace any bucket's policy, and a user
+  allowed to upload could shorten retention. Each call is now authorized as its
+  own AWS action, for example `s3:PutBucketPolicy`, `s3:PutObjectRetention`,
+  `s3:GetObjectTagging`, `s3:ListMultipartUploadParts` and
+  `s3:AbortMultipartUpload`. A copy is authorized on its source as
+  `s3:GetObject`, or `s3:GetObjectVersion` when it names a version. See
+  Changed for the built-in policies, and `docs/UPGRADING.md` for custom ones.
+
+- **Object lock could be removed.** A COMPLIANCE retention could be changed to
+  GOVERNANCE with the same date and then removed. The
+  `x-amz-bypass-governance-retention` header alone was enough to shorten or
+  remove a GOVERNANCE retention, or delete the object. COMPLIANCE can now only
+  be extended, and bypassing GOVERNANCE needs the header and the
+  `s3:BypassGovernanceRetention` permission. Overwrites through PUT, copy,
+  multipart complete, POST and Snowball now respect locks in unversioned and
+  suspended buckets, FIFO quota eviction skips locked objects, and a lock state
+  that cannot be read answers `503` instead of allowing the change. On a cluster
+  the lock decision first catches up with the leader.
+
+- **IAM `aws:SourceIp` conditions and IP allowlists trusted `X-Forwarded-For`.**
+  Any client could send the header and pass an IP condition. The address is now
+  the TCP peer. Behind a reverse proxy, list the proxy in `server.trusted_proxies`
+  and the client address is restored from `X-Forwarded-For`, read from the right.
+  Between cluster nodes the client address travels in `X-VaultS3-Client-IP`,
+  which is believed only on a request that carries the cluster secret and is
+  stripped otherwise.
+
+- **Signature checks had gaps.** A request with no `X-Amz-Date` or `Date` skipped
+  the clock skew check, so a captured request could be replayed forever. A
+  presigned URL with no `X-Amz-Expires` was valid for 7 days. `host` did not have
+  to be signed, and the credential scope date did not have to match the request
+  date. Now a date is required and must be within 15 minutes
+  (`RequestTimeTooSkewed`), `X-Amz-Expires` is required, `host` must be signed,
+  and a mismatched scope is `AuthorizationHeaderMalformed`. Refusals say only
+  "Access Denied" where they used to echo the policy reason and the allowed CIDR
+  ranges.
+
+- **A session token could reach more than the user it was issued from.** An STS
+  session with a session policy got that policy alone. It now gets the
+  intersection of the session policy and the user's policies, keeps the user's
+  IP allowlist, and ends when the user is deleted.
+
+- **A Deny could be skipped.** A user's group or policy that existed but could
+  not be read was skipped, so a `Deny` in it never applied. It now denies the
+  identity. Policies with a single-object `Statement`, or with string, bool or
+  number condition values written the short way, failed to parse and denied
+  everything. They now parse.
+
+- **Webhooks and lambda functions could reach private addresses.** Webhook and
+  function URLs are set by bucket owners, and the server called them from inside
+  your network, including cloud metadata services. Calls to loopback, private,
+  link-local, carrier-grade NAT and metadata addresses are now refused, checked
+  on the address actually dialled after DNS, and redirects are not followed.
+  Turn this off with `notifications.allow_private_webhooks` and
+  `lambda.allow_private_endpoints`. Cloud metadata addresses stay refused either
+  way, at call time too, so a host that resolves to one after it was saved is
+  still refused.
+
+- **Non-admin dashboard users could call admin API routes**, among them the live
+  logs, events and trace, notifications, system and diagnostics, vectors, and
+  cluster status, info and repair. Non-admin sessions now reach only their own
+  identity, the version, buckets and objects, and stats, activity and cost
+  filtered to the buckets they can list. Creating a bucket now needs
+  `s3:CreateBucket`. A user's IP allowlist and the global allow and block lists
+  now apply to dashboard requests, and IAM conditions there are evaluated instead
+  of failing closed. A `?token=` in the URL is accepted only on the two download
+  routes, where any path containing `/download` used to accept it.
+
+- **The dashboard ignored object-level Deny rules in bulk operations.** Bulk
+  delete, multi-file upload and zip download checked the bucket only. Each key is
+  now checked as `s3:DeleteObject`, `s3:PutObject` or `s3:GetObject`.
+
+- **OIDC logins were accepted on an unverified email.** An identity provider
+  that lets users set any email made it possible to log in as another user.
+  `email_verified: false` is refused, and a missing claim is refused unless
+  `oidc.accept_email_without_verified_claim` is set.
+
+- **`/cluster/status` answered anyone.** It now requires `X-Cluster-Secret`.
+
+- **With `server.tls.enabled`, nodes still talked to each other over plain
+  http**, including the proxied S3 requests that carry the cluster secret, on a
+  port that only speaks TLS. A 4.4.79 TLS cluster could not form through
+  `join_addr`, and forwarded requests failed. Node to node calls now use https,
+  the inter-node listener serves TLS, and a 3-node TLS cluster forms and serves
+  every request. Peer certificates are not verified yet.
+
+- **The Helm chart used the admin secret as the cluster secret**, so anyone who
+  could read inter-node traffic or a node's environment had the admin password.
+  The chart now keeps a separate `cluster-secret` in its Secret (set it with
+  `auth.clusterSecret`). An upgraded release keeps the value it was using so
+  nodes keep agreeing. `deploy/k8s/quickstart.yaml` no longer ships the public
+  example password, the server generates one on first start.
+
+- **Self-update trusted whatever the release said.** It checked the download
+  against `checksums.txt` from the same release. It now also verifies
+  `checksums.txt.sig`, an Ed25519 signature, against a public key built into the
+  binary, and refuses to install anything when either is missing.
+
+- **The per-key rate limit was charged before the signature was checked**, so
+  anyone who knew an access key ID could exhaust that key's allowance.
+
+- `vaults3 setup` now writes its config file with mode `0600` even when it
+  overwrites one, and a new access log file is created `0600`. The release
+  workflow runs read-only except for the publish job, and pins the tools it
+  downloads.
+
+### Fixed
+- **Deleting a versioning enabled bucket deleted everything in it, including
+  objects under COMPLIANCE retention or legal hold.** Both the S3
+  `DeleteBucket` and the dashboard decided "empty" from a walk of the bucket's
+  directory, which skips `.vs/`, where a versioned bucket keeps every object.
+  They now ask the metadata store, and refuse while any object, version or
+  delete marker remains, as AWS does.
+
+- **Sending a bucket's encryption configuration again destroyed its key.** In
+  per-bucket mode the bucket's data keys live in the same record as its
+  encryption setting, and `PutBucketEncryption` replaced the whole record. A
+  second call, as Terraform makes on every apply, generated a new key and left
+  every object encrypted before it permanently unreadable.
+  `DeleteBucketEncryption` deleted the keys outright, a silent crypto-shred.
+  Now a repeated call keeps the key, and removing the configuration stops new
+  objects being encrypted while every existing one stays readable. **Objects hit
+  by this before upgrading cannot be recovered**, `docs/UPGRADING.md` says how
+  to tell.
+
+- **A lifecycle rule could be stored wider than it was written and expire the
+  whole bucket.** Only `Filter>Prefix` was read. A rule-level `<Prefix>`, a tag,
+  an `And` or a size filter came out as an empty filter, and only the first of
+  several rules was kept, all with a 200. The rule-level `<Prefix>` is now
+  honoured, and everything the worker cannot apply is refused with
+  `501 NotImplemented`. **Check rules stored before upgrading**, see
+  `docs/UPGRADING.md`.
+
+- **In per-bucket encryption mode a `.gz` or `.zst` file came back
+  decompressed.** In a bucket that had not opted into encryption, any object
+  starting with a gzip or zstd magic was unwrapped on read, so the client got
+  different bytes from the ones it stored, and a checksum it rejects. The data on
+  disk was never changed, so every such object reads correctly after upgrading.
+
+- **Every `GET ?lifecycle` on a bucket with no lifecycle rule crashed the
+  request**, and the client saw the connection drop.
+
+- **Objects imported through Snowball or a POST upload had a Last-Modified some
+  50 billion years ahead**, stored in nanoseconds where every reader expects
+  seconds. boto3 could not parse it, so listing a bucket that held one failed.
+  New imports store seconds, and existing records are repaired when read.
+
+- A `Deny` written with a condition operator VaultS3 does not implement never
+  applied. It now blocks, while an `Allow` with one still grants nothing.
+
+- The docs said a key without a user and website hosting behaved differently
+  from the code. Both now say what the code does, and the HashiCorp Vault KMS
+  provider is documented as not working: it reads Vault's key in the wrong
+  encoding, so a server configured with it refuses to start, and no data can
+  have been written with it.
+
+- **A write acknowledged with `200` could be lost on power failure.** Nothing
+  was fsynced, so after a crash the metadata could point at an empty or missing
+  file. Each object is now fsynced before it is renamed into place, and its
+  directory after. Small writes are slower for it.
+
+- **A rejected overwrite destroyed the object it was meant to replace.** A PUT
+  with a wrong `Content-MD5` or `x-amz-checksum-*`, or one over the bucket quota,
+  deleted the old object before failing. The check now fails inside the upload
+  and the old object stays. Writing a version in a suspended bucket also
+  truncated the existing null version before the new one was complete.
+
+- **Erasure coded overwrites could mix two versions.** Shards were overwritten in
+  place and `meta.json` was written first, so a failed or concurrent overwrite
+  served parts of both. Each write now goes to its own generation directory and
+  `meta.json` switches last. Shards carry CRC32C checksums, so a corrupt shard is
+  rebuilt from parity and healed instead of served. Also fixed: delete reported
+  success on every error, an overwrite without erasure coding kept serving the
+  old erasure coded copy, listing with no limit returned nothing (so a backup
+  over erasure coding copied zero objects), and the healer stopped after about
+  2,000 objects.
+
+- **Packed volumes:** a failed large overwrite removed the old object first, and
+  deleting a bucket skipped about half its keys and ignored errors, so a bucket
+  created again with the same name brought old objects back. Both are fixed, and
+  compaction reports errors.
+
+- **The lifecycle worker could expire an object written after it looked.** It
+  deleted by key, so a PUT between the scan and the delete was destroyed. It now
+  deletes only if the object is unchanged. It also called back into the metadata
+  store during its scan, which can deadlock it, and now collects first and acts
+  after. Noncurrent version expiry now honours legal hold and retention.
+
+- **Backups missed data.** The metadata database (`metadata.db`) was never backed
+  up, versioned buckets were not backed up at all, and every incremental backup
+  copied everything. Unreadable objects were skipped without a word. Backups now
+  include a consistent copy of `metadata.db` at `_vaults3/metadata.db`, list
+  objects from the metadata store, start incrementals from the last completed
+  run, fail with a count when objects cannot be read, and write files `0600`.
+  Backup copies are written decrypted.
+
+- **After a crypto-shred other nodes kept the bucket's key** until they
+  restarted, and the bucket refused every write with `503` forever. Every use of
+  a cached key is now checked against the store, and a shredded bucket is marked
+  `shredded` and stores new objects without encryption until it is encrypted
+  again.
+
+- **A PUT during a tiering migration lost its bytes**: the hot copy was deleted
+  and the old one marked cold. Migration now checks again before and after it
+  switches the tier and gives up if the object changed. Promotion no longer
+  overwrites a newer object.
+
+- **Restoring a bucket snapshot orphaned objects created after it**, which the
+  space reclaimer could then delete. They are now hidden behind a delete marker,
+  and failures are reported as failures instead of "skipped".
+
+- **Compressed objects over 1 GiB were refused with a `500`.** The limit came
+  from an older format, so it is gone.
+
+- **Encrypted objects are written in stream format v2.** Format v1 sealed every
+  object under the bucket or server key directly, with only a 7 byte random
+  nonce prefix to tell objects apart, so nonce reuse across many writes was
+  possible. v2 derives a key per object with HKDF from a random salt. v1 objects
+  still read. **4.4.79 cannot read v2**, see `docs/UPGRADING.md`.
+
+- **Restarting a cluster node wiped its node-local data.** A Raft snapshot held
+  every metadata bucket, and restoring it, which Raft does on every start,
+  replaced them all. A restart rolled back the node's multipart uploads,
+  replication queue and status, audit trail, bucket snapshots and its saved
+  admin credentials, and a follower took the leader's copies. Snapshots now hold
+  only the replicated state, and their format is now v2. Snapshots were also
+  read when written out rather than when taken, so entries could be applied
+  twice on top of one.
+
+- **Nodes disagreed about the same state.** A bucket's creation date and the
+  access key expiry cut-off came from each node's own clock, and replication
+  queue IDs from each node's counter. They now come from the proposer.
+
+- **A follower could answer with state older than a write it had just made.**
+  After it forwards a configuration or identity change to the leader, a follower
+  now waits until it has applied it.
+
+- **On a cluster only one node knew a bucket had object lock.** The flag was
+  written to the local store of the node that served the request, outside Raft.
+  Every other node skipped the catch-up before a lock decision, a snapshot
+  restore dropped the flag on the first node too, and when the request went
+  through a follower, `GET ?object-lock` answered
+  `ObjectLockConfigurationNotFoundError` from every node. It is now set through
+  the replicated default retention command. On a 3-node cluster 4.4.79 failed 6
+  of 6 such reads and 5.0.0 none. Buckets locked before upgrading need their
+  configuration sent once more, see `docs/UPGRADING.md`.
+
+- **A key could end up with two latest versions.** The demotion of the previous
+  latest version ran in the S3 handler, outside the replicated command. It now
+  happens inside it, on every node.
+
+- **On a cluster, push replication lost about half of its events.** One node
+  acknowledging an event deleted an unrelated event on every other node. A
+  3-node 4.4.79 cluster delivered 22 of 45 objects to its peer, 5.0.0 delivers
+  45 of 45. The push queue is now local to each node. A local read error is
+  retried instead of dropped, and keys with `?` or `#` reach the right object
+  on the peer. **Objects lost before upgrading are not sent again**, see
+  `docs/UPGRADING.md`.
+
+- Deleting many metadata records at once (a multipart upload's parts, a bucket's
+  objects) skipped about half of them. The failover proxy retried a request after
+  part of its body had been sent, it now answers `503`. A forwarded write never
+  retries. A malformed drain request drained the node receiving it. The
+  active-active sync advanced past changes it had not applied. Expired STS
+  sessions left their internal user and policy behind.
+
+- **Multipart uploads were not tied to their object.** An upload ID worked
+  against any bucket and key. It now answers `NoSuchUpload` elsewhere. Complete
+  refuses an empty list (`MalformedXML`), duplicate or unsorted parts
+  (`InvalidPartOrder`) and a missing or wrong ETag (`InvalidPart`). Complete and
+  Abort of the same upload no longer race, and UploadPart checks `Content-MD5`
+  and checksums.
+
+- **Copying a versioned object, or a version, copied the wrong thing.** The copy
+  source was parsed in three places, unescaped before its query was split, and
+  `?versionId=` was ignored. One parser now handles it, the source is read through
+  the metadata store, and `x-amz-copy-source-version-id` is returned. Copy,
+  multipart complete, POST and Snowball now create versions in a versioned
+  bucket, and an object from before versioning becomes the `null` version
+  instead of being lost.
+
+- **Copying an SSE-C object needed no key** and stored its ciphertext as the new
+  object's plaintext. The source key headers are now required.
+
+- **Tagging and website pages did not work on versioned objects**, and tagging
+  only answered on the node holding the bytes. Both now go through the metadata
+  store, and website directory requests on a cluster are routed by the index
+  document's key.
+
+- An unknown access key now answers `InvalidAccessKeyId` and a bad signature
+  `SignatureDoesNotMatch`. Token errors are revealed only after the signature
+  checks.
+
+- An invalid `Range` (`bytes=5-2`, several ranges, another unit) is ignored and
+  the whole object served, as on AWS. Conditional GET and copy headers are
+  evaluated in RFC 7232 order. `ListObjectVersions` returns `NextKeyMarker` and
+  `NextVersionIdMarker`, and a key marker alone no longer repeats that key. A POST
+  upload's ETag is no longer quoted twice. A presigned URL with a size limit
+  requires `Content-Length`.
+
+- **Names with `?`, `#`, `%` or dot segments acted on the wrong object.** The
+  dashboard put bucket, object, user, policy, key, lambda and snapshot names into
+  URLs unescaped. They are now encoded, and names that cannot be addressed are
+  refused.
+- **Bulk delete in a versioned bucket deleted objects outright** and ignored
+  legal hold and retention. It now writes delete markers and honours locks, and
+  on a cluster each key goes to its owner. The result now says how many were
+  deleted and names the failures, where it used to report every key deleted.
+- Delete, detach, rollback, restore and snapshot buttons no longer send twice on
+  a double click.
+- **Changing the admin credentials reported success when saving failed**, and the
+  old ones came back on restart. A failed save is now a `500` and changes nothing.
+- A partial snapshot restore answers `500` with counts and errors, speed tests
+  and re-encryption runs refuse to overlap (`409`), zip downloads list skipped
+  keys in `errors.txt`, and deleting a group removes it from its members.
+- The dashboard's live log and event streams answered `503` forever. They work.
+
+- **`vaults3-cli` put object and bucket names into URLs unescaped**, so `object rm
+  'a?b'` deleted `a`. Every bucket, object and presign command now escapes them.
+  `object put` streams the file instead of loading it into memory, and `presign
+  --expires` must be 1 to 604800 seconds.
+- **`vaults3-cli mount` hung at full CPU** on an unknown flag or a flag without a
+  value. Through the mount, `rm 'a?b'` deleted `a`, an S3 error body was served
+  and cached as file contents, a refused delete reported success, writes ignored
+  their offset, and a directory with a space in its name could not be listed.
+  All fixed.
+
+- **Notifications slowed down every write.** The Kafka, NATS, Redis, AMQP,
+  Postgres and Elasticsearch backends published inside the S3 request with no
+  deadline. They now run from a queue (`notifications.queue_size`), with
+  `notifications.timeout_secs` per publish, and webhook retries no longer hold a
+  worker while they wait. They also receive events from every bucket, where
+  they only saw buckets that had a webhook.
+- **The Elasticsearch backend could not be turned on**, nothing read its
+  settings, and **the Postgres backend never started when configured as
+  documented**: `connection_string` and `dsn` were not read. Both work now.
+- `/health` and `/ready` now check that the metadata store answers within 3
+  seconds, so a node whose store hangs reports `503`. The container healthcheck
+  probes `server.address` when it is bound to one address.
+- The unauthenticated `/metrics` endpoint walked every bucket on every scrape.
+  Bucket sizes are cached for a minute.
+- Inventory reports dated every object 1970.
+- Images built from `main` (`:latest`) reported version `main`, which the
+  updater saw as older than every release. They now report the nearest tag and
+  the commits since it.
+
+Tested on Docker against the released 4.4.79 image first. An end-to-end S3
+script of 24 checks covering this release (IAM actions, `aws:SourceIp`, object
+lock, rejected overwrites, multipart, versioned copy and tagging, SSE-C copy,
+auth errors, ranges, versioned websites) fails on 4.4.79 and passes here, on a
+single node and through each follower of a 3-node cluster. The earlier security
+script of 28 checks failed 21 times on 4.4.79 and none here, on a single node
+and through both followers. Byte identity across per-bucket mode, with and
+without compression, failed 4 of 12 there and none here. The encryption
+configuration sequence failed 3 of 7 there and none here. The inter-node port
+answered without the secret there (`200`) and refuses here (`403`). Data
+written by 4.4.79 with per-bucket encryption, server-wide encryption, erasure
+coding and packing (sizes 0 to 5 MiB, tags, ranges, versions, multipart and
+SSE-C) reads back byte for byte after upgrading, and can be overwritten, copied
+and deleted. The full Go suite passes with `-race`, and each new test fails when
+its fix is reverted.
+
+### Changed
+Several of these can stop a working setup. `docs/UPGRADING.md` lists what to
+check.
+
+- **Custom IAM policies need the per-action names.** A policy granting only
+  `s3:PutObject` no longer covers tagging, ACL, retention, legal hold or aborting
+  a multipart upload, and `s3:GetObject` and `s3:ListBucket` no longer cover
+  reading those or any bucket configuration. The built-in `ReadOnlyAccess` is
+  now `s3:Get*` and `s3:List*`, and `ReadWriteAccess` adds the tagging,
+  retention, legal hold, ACL, abort and restore actions. Each is updated at
+  startup only if it is still exactly the old built-in text, so a copy you
+  edited is left alone.
+- **Behind a reverse proxy, set `server.trusted_proxies`** (or
+  `VAULTS3_TRUSTED_PROXIES`) for IP conditions, IP allowlists, per-IP rate
+  limits and logs to see the client address instead of the proxy's.
+- **Webhooks and lambda functions on private networks need opt-in**,
+  `notifications.allow_private_webhooks` and `lambda.allow_private_endpoints`.
+  This includes a function running as a docker-compose service. A webhook or
+  function URL whose host does not resolve is refused when it is saved.
+- **OIDC logins need `email_verified`**, or
+  `oidc.accept_email_without_verified_claim: true`. Policies mapped from the
+  provider's groups are now attached on every login, not only the first. None
+  are removed.
+- **Non-admin dashboard users see less**: only buckets and objects, and the
+  admin pages are hidden. They need `s3:CreateBucket` to create a bucket.
+- **IAM names** for new users, groups and policies must match AWS's
+  `[\w+=,.@-]`, and a policy document must parse as a policy. Existing names
+  are kept. An STS request with a policy but no `userId` is a `400`, where the
+  policy used to be dropped.
+- **Lifecycle expiry in a versioned bucket writes a delete marker**, as on AWS,
+  where it used to delete the object outright. Versioned objects are no longer
+  moved to the cold tier.
+- **Rollback in the dashboard writes a new version** and needs versioning
+  enabled (`409` otherwise). Rolling back to a delete marker is a `400`.
+- **Rebalance is retired.** Its transfers were refused by every node, so it
+  never moved anything, and had they worked it would have deleted valid copies.
+  `vaults3-cli cluster rebalance` and `POST /api/v1/cluster/rebalance` now only
+  say so. Replica repair does the job. `cluster decommission` only drains the
+  node and prints the next steps, `cluster leave` and then `cluster repair`. The
+  `cluster.rebalance` settings do nothing.
+- **`vaults3-cli cluster leave` and `cluster decommission` ask for
+  confirmation**, and need `--yes` (`-y`) when not run from a terminal.
+- **`vaults3-cli object get` refuses to overwrite an existing file** without
+  `--force` (`-f`), and writes to stdout when the destination is `-`.
+- **`vaults3-cli key create` refuses** when any node reports a version it cannot
+  compare (`main`, `dev`, or unreachable), unless `--force` is given.
+- **Self-update needs a signed release and a build that carries the signing
+  key.** A binary built without it, from source for example, refuses to apply
+  any update and says to replace the binary or image instead.
+- **A server configured with the HashiCorp Vault KMS provider refuses to start**
+  with a message saying to use `local`. It never worked.
+- **Encrypted objects, erasure coded objects and Raft snapshots written by 5.0.0
+  cannot be read by 4.4.79.** See the rollback notes in `docs/UPGRADING.md`.
+- **`/cluster/status` needs `X-Cluster-Secret`.** Point external monitoring at it
+  with the header, or use `vaults3-cli cluster status`.
+- Push replication peers on private or loopback addresses are accepted. Cloud
+  metadata addresses are still refused.
+- A config key that matches no setting is logged as a warning at startup, and a
+  non-numeric port or count in an environment variable is logged instead of
+  dropped silently.
+- The Docker image builds its dashboard on Node 22, and `make` uses `npm ci`.
+
+### Added
+- `server.trusted_proxies` (`VAULTS3_TRUSTED_PROXIES`, comma separated): IPs or
+  CIDRs of reverse proxies whose `X-Forwarded-For` is believed.
+- `notifications.allow_private_webhooks` (`VAULTS3_ALLOW_PRIVATE_WEBHOOKS`) and
+  `lambda.allow_private_endpoints` (`VAULTS3_LAMBDA_ALLOW_PRIVATE_ENDPOINTS`).
+- `oidc.accept_email_without_verified_claim`
+  (`VAULTS3_OIDC_ACCEPT_EMAIL_WITHOUT_VERIFIED_CLAIM`).
+- `auth.override_stored_credentials` (`VAULTS3_ADMIN_CREDENTIALS_OVERRIDE`):
+  saved admin credentials normally win over the configured ones, so a leaked or
+  example secret could not be replaced from the environment. Set this for one
+  start to replace them. The new ones are saved, so remove it afterwards or
+  later dashboard changes are lost on restart.
+- `notifications.postgres` accepts `connection_string` and `dsn` as well as
+  `conn_str`, and `notifications.elasticsearch` (`enabled`, `url`, `index`) is
+  read.
+- `checksums.txt.sig` on every release, and `scripts/signrelease` to make it.
+- `auth.clusterSecret` in the Helm chart, and a CI job that renders and lints
+  the chart.
+- `X-Amz-Snowball-Refused-Count` on a Snowball import reports entries skipped
+  for a bad key or missing permission.
+
 ## [4.4.79] - 2026-10-06
 ### Fixed
 - **Issuing a second access key for a user changed what the first key could

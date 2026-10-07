@@ -45,8 +45,9 @@ func (h *APIHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Use constant-time comparison to prevent timing attacks
-	akMatch := hmac.Equal([]byte(req.AccessKey), []byte(h.cfg.Auth.AdminAccessKey))
-	skMatch := hmac.Equal([]byte(req.SecretKey), []byte(h.cfg.Auth.AdminSecretKey))
+	adminAK, adminSK := h.adminCredentials()
+	akMatch := hmac.Equal([]byte(req.AccessKey), []byte(adminAK))
+	skMatch := hmac.Equal([]byte(req.SecretKey), []byte(adminSK))
 	if !akMatch || !skMatch {
 		h.logins.fail(ip)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
@@ -54,7 +55,7 @@ func (h *APIHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logins.succeed(ip)
 
-	token, err := h.jwt.Generate("admin", 24*time.Hour)
+	token, err := h.jwtService().Generate("admin", 24*time.Hour)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate token")
 		return
@@ -77,7 +78,7 @@ func (h *APIHandler) handleMe(w http.ResponseWriter, r *http.Request) {
 	resp := meResponse{User: user}
 	if user == "admin" {
 		// Mask access key — only show first 4 and last 4 chars
-		ak := h.cfg.Auth.AdminAccessKey
+		ak, _ := h.adminCredentials()
 		masked := ak
 		if len(ak) > 8 {
 			masked = ak[:4] + strings.Repeat("*", len(ak)-8) + ak[len(ak)-4:]
@@ -154,14 +155,35 @@ func (h *APIHandler) issueOIDCSession(w http.ResponseWriter, claims *OIDCClaims)
 		userName = claims.Sub
 	}
 
+	// The email becomes the IAM identity, so it has to be one the provider
+	// checked. It used to be taken as given, and on a provider that lets anyone
+	// sign up with an unverified address, registering victim@corp.com there was
+	// enough to sign in here as that user, with that user's policies. A
+	// provider that sends no email_verified claim is refused too, since nothing
+	// says the address was ever proven.
+	if claims.Email != "" {
+		verified, present := claims.EmailIsVerified()
+		if !present && !h.cfg.OIDC.AcceptEmailWithoutVerifiedClaim {
+			slog.Warn("oidc: refusing a login whose email has no email_verified claim", "email", claims.Email)
+			writeError(w, http.StatusForbidden, "the identity provider did not say this email address is verified (no email_verified claim)")
+			return
+		}
+		if present && !verified {
+			writeError(w, http.StatusForbidden, "the identity provider says this email address is not verified")
+			return
+		}
+	}
+
 	// Prevent OIDC users from claiming the reserved "admin" username
 	if userName == "admin" {
 		writeError(w, http.StatusForbidden, "username 'admin' is reserved")
 		return
 	}
 
+	mapped := h.oidcMappedPolicies(claims.Groups)
+
 	// Look up or auto-create IAM user
-	if _, err := h.store.GetIAMUser(userName); err != nil {
+	if existing, err := h.store.GetIAMUser(userName); err != nil {
 		if !h.cfg.OIDC.AutoCreateUsers {
 			writeError(w, http.StatusForbidden, "user not found and auto-create disabled")
 			return
@@ -169,23 +191,30 @@ func (h *APIHandler) issueOIDCSession(w http.ResponseWriter, claims *OIDCClaims)
 
 		// Auto-create user with role mapping
 		newUser := metadata.IAMUser{
-			Name:      userName,
-			CreatedAt: time.Now().UTC(),
-		}
-		if len(h.cfg.OIDC.RoleMapping) > 0 && len(claims.Groups) > 0 {
-			for _, group := range claims.Groups {
-				if policyName, ok := h.cfg.OIDC.RoleMapping[group]; ok {
-					newUser.PolicyARNs = append(newUser.PolicyARNs, policyName)
-				}
-			}
+			Name:       userName,
+			CreatedAt:  time.Now().UTC(),
+			PolicyARNs: mapped,
 		}
 		if createErr := h.store.CreateIAMUser(newUser); createErr != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create user")
 			return
 		}
+	} else if added := addMissing(existing.PolicyARNs, mapped); len(added) > len(existing.PolicyARNs) {
+		// Role mapping used to apply only when the user was first created, so
+		// someone added to a mapped group at the provider never got its policy
+		// here. Policies mapped from the groups in this token are attached on
+		// every login. Ones mapped earlier are left in place: telling them
+		// apart from a policy an admin attached by hand needs a record of which
+		// came from the mapping, which the user does not keep.
+		existing.PolicyARNs = added
+		if err := h.store.UpdateIAMUser(*existing); err != nil {
+			slog.Error("oidc: could not apply role mapping to user", "user", userName, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to apply role mapping")
+			return
+		}
 	}
 
-	token, err := h.jwt.Generate(userName, 24*time.Hour)
+	token, err := h.jwtService().Generate(userName, 24*time.Hour)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate token")
 		return
@@ -196,6 +225,39 @@ func (h *APIHandler) issueOIDCSession(w http.ResponseWriter, claims *OIDCClaims)
 		User:  userName,
 		Email: claims.Email,
 	})
+}
+
+// oidcMappedPolicies returns the policies role_mapping assigns to a set of
+// provider groups, without duplicates.
+func (h *APIHandler) oidcMappedPolicies(groups []string) []string {
+	if len(h.cfg.OIDC.RoleMapping) == 0 {
+		return nil
+	}
+	var out []string
+	for _, group := range groups {
+		if policyName, ok := h.cfg.OIDC.RoleMapping[group]; ok {
+			out = addMissing(out, []string{policyName})
+		}
+	}
+	return out
+}
+
+// addMissing returns have with every entry of want it lacks appended.
+func addMissing(have, want []string) []string {
+	out := append([]string(nil), have...)
+	for _, w := range want {
+		found := false
+		for _, h := range out {
+			if h == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // OIDCFlow reports the OAuth flow in use, for startup logging.
@@ -337,7 +399,7 @@ func (h *APIHandler) authenticateUser(r *http.Request) (string, error) {
 		if token == auth {
 			return "", fmt.Errorf("invalid authorization format")
 		}
-		claims, err := h.jwt.Validate(token)
+		claims, err := h.jwtService().Validate(token)
 		if err != nil {
 			return "", err
 		}
@@ -348,8 +410,8 @@ func (h *APIHandler) authenticateUser(r *http.Request) (string, error) {
 	// that need it. A token in a URL leaks into proxy logs, browser history and
 	// Referer headers, so it is accepted on the handful of routes a browser
 	// navigates to directly and nowhere else.
-	if token := r.URL.Query().Get("token"); token != "" && allowsTokenInURL(r.URL.Path) {
-		claims, err := h.jwt.Validate(token)
+	if token := r.URL.Query().Get("token"); token != "" && allowsTokenInURL(r.Method, r.URL.Path) {
+		claims, err := h.jwtService().Validate(token)
 		if err != nil {
 			return "", err
 		}
@@ -359,13 +421,33 @@ func (h *APIHandler) authenticateUser(r *http.Request) (string, error) {
 	return "", fmt.Errorf("missing authorization")
 }
 
-// allowsTokenInURL reports whether a path may authenticate with ?token=.
+// allowsTokenInURL reports whether a request may authenticate with ?token=.
 //
-// Only routes a browser navigates to directly, where no Authorization header can
-// be set, qualify. Everything else must use the header, so a leaked URL cannot
-// be replayed against the admin API.
-func allowsTokenInURL(path string) bool {
-	return strings.Contains(path, "/download") || strings.HasSuffix(path, "/export")
+// Only the two download routes a browser navigates to directly, where no
+// Authorization header can be set, qualify, and only for GET. Everything else
+// must use the header, so a leaked URL cannot be replayed against the admin API.
+// This used to be a substring test for "/download" on any method, so a token
+// lifted from a download link also worked on PUT /buckets/downloads-x/policy or
+// DELETE /iam/users/download-bot.
+func allowsTokenInURL(method, path string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	rest, ok := strings.CutPrefix(strings.TrimPrefix(path, "/api/v1"), "/buckets/")
+	if !ok {
+		return false
+	}
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) < 2 || parts[0] == "" {
+		return false
+	}
+	switch parts[1] {
+	case "download":
+		return len(parts) == 3 && parts[2] != ""
+	case "download-zip":
+		return len(parts) == 2
+	}
+	return false
 }
 
 // isAdminUser returns true if the user is the admin user.

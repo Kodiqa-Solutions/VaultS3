@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
 
 // Per-bucket authorization for the console API (security assessment finding 14).
@@ -127,7 +130,19 @@ func (h *APIHandler) authorizeConsoleBucket(r *http.Request, rest string) error 
 	if !ok {
 		return nil
 	}
-	allowed := h.allowsConsole(user, act)
+	return h.authorizeConsoleAction(r, user, act)
+}
+
+// authorizeConsoleAction decides one action for a non-admin subject, with the
+// same IAM evaluation and external authorizer the route gate uses. The bulk
+// routes call it once per key: their gate only proves the caller may act on
+// SOME key in the bucket, and a Deny on one prefix is invisible to a check
+// against the bucket wildcard.
+func (h *APIHandler) authorizeConsoleAction(r *http.Request, user string, act consoleAction) error {
+	if user == "admin" {
+		return nil
+	}
+	allowed := h.allowsConsoleCtx(user, act, consoleConditionContext(r, user))
 	ext := h.s3Auth.ExternalAuth()
 	if ext == nil {
 		if allowed {
@@ -154,11 +169,75 @@ func (h *APIHandler) authorizeConsoleBucket(r *http.Request, rest string) error 
 	return nil
 }
 
-// allowsConsole reports whether a subject's IAM policies permit an action. A
+// consoleConditionContext is what IAM conditions see for a console request.
+// The console used to evaluate with no context at all, so every Allow carrying
+// a Condition failed closed and a policy that granted a bucket only from the
+// office network granted nothing in the dashboard. aws:SourceIp is the TCP
+// peer, never X-Forwarded-For, which any client can set to an allowed address.
+func consoleConditionContext(r *http.Request, user string) map[string]string {
+	ctx := map[string]string{
+		"aws:SourceIp":        iam.SourceIPOf(r.RemoteAddr),
+		"aws:SecureTransport": strconv.FormatBool(r.TLS != nil),
+		"aws:CurrentTime":     time.Now().UTC().Format(time.RFC3339),
+	}
+	if user != "" {
+		ctx["aws:username"] = user
+	}
+	if ua := r.UserAgent(); ua != "" {
+		ctx["aws:UserAgent"] = ua
+	}
+	return ctx
+}
+
+// checkConsoleIP applies a user's AllowedCIDRs, and the server's global allow
+// and block lists, to a console request the way the S3 path applies them to a
+// signed one. The console never looked at them, so a user restricted to the
+// office network over S3 could do the same things from anywhere through the
+// dashboard. A user record that cannot be read is refused rather than treated
+// as unrestricted.
+func (h *APIHandler) checkConsoleIP(r *http.Request, user string) error {
+	var cidrs []string
+	u, err := h.store.GetIAMUser(user)
+	if err == nil && u != nil {
+		cidrs = u.AllowedCIDRs
+	} else if h.iamUserMissing(user) != nil {
+		return fmt.Errorf("could not read the restrictions of user %q", user)
+	}
+	ip := iam.SourceIPOf(r.RemoteAddr)
+	if h.s3Auth != nil {
+		return h.s3Auth.CheckIPAccess(&iam.Identity{UserID: user, AllowedCIDRs: cidrs}, ip)
+	}
+	return iam.CheckIP(ip, cidrs, nil)
+}
+
+// iamUserMissing tells a user that does not exist (nil) from a store that
+// could not answer (an error). A session for a user with no record has no
+// restrictions to apply and no policies to grant anything, so it is not an
+// error here.
+func (h *APIHandler) iamUserMissing(user string) error {
+	users, err := h.store.ListIAMUsers()
+	if err != nil {
+		return err
+	}
+	for _, u := range users {
+		if u.Name == user {
+			return fmt.Errorf("user %q exists but could not be read", user)
+		}
+	}
+	return nil
+}
+
+// allowsConsole reports whether a subject's IAM policies permit an action with
+// no request context. Kept for callers with no request to hand.
+func (h *APIHandler) allowsConsole(user string, act consoleAction) bool {
+	return h.allowsConsoleCtx(user, act, nil)
+}
+
+// allowsConsoleCtx reports whether a subject's IAM policies permit an action. A
 // subject with no policies is denied, which is the same default the S3 path
 // applies, and a policy lookup that fails is denied too: a store error must not
 // widen access.
-func (h *APIHandler) allowsConsole(user string, act consoleAction) bool {
+func (h *APIHandler) allowsConsoleCtx(user string, act consoleAction, ctx map[string]string) bool {
 	if h.store == nil {
 		return false
 	}
@@ -176,7 +255,25 @@ func (h *APIHandler) allowsConsole(user string, act consoleAction) bool {
 		}
 		converted = append(converted, pol)
 	}
-	return iam.Evaluate(converted, act.action, act.resource())
+	return iam.EvaluateWithContext(converted, act.action, act.resource(), ctx)
+}
+
+// visibleBucketSet is visibleBuckets over the whole bucket list, as a set, for
+// the cross-bucket read routes a non-admin may call. It answers nil for admin,
+// meaning no filtering.
+func (h *APIHandler) visibleBucketSet(r *http.Request, buckets []metadata.BucketInfo) map[string]bool {
+	if h.isAdminUser(r) {
+		return nil
+	}
+	names := make([]string, 0, len(buckets))
+	for _, b := range buckets {
+		names = append(names, b.Name)
+	}
+	set := make(map[string]bool, len(names))
+	for _, n := range h.visibleBuckets(r, names) {
+		set[n] = true
+	}
+	return set
 }
 
 // visibleBuckets filters a bucket list to those the caller may list. Admin sees
@@ -196,9 +293,10 @@ func (h *APIHandler) visibleBuckets(r *http.Request, names []string) []string {
 	if user == "admin" {
 		return names
 	}
+	ctx := consoleConditionContext(r, user)
 	out := make([]string, 0, len(names))
 	for _, name := range names {
-		if h.allowsConsole(user, consoleAction{action: "s3:ListBucket", bucket: name}) {
+		if h.allowsConsoleCtx(user, consoleAction{action: "s3:ListBucket", bucket: name}, ctx) {
 			out = append(out, name)
 		}
 	}

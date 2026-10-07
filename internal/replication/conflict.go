@@ -14,6 +14,10 @@ type ChangeEntry struct {
 	ETag        string      `json:"etag,omitempty"`
 	Size        int64       `json:"size,omitempty"`
 	Timestamp   int64       `json:"timestamp"` // unix nanos
+	// Seq is the entry's position in the sending site's change log. It is set
+	// when the log is read for a sync, so the puller can resume right after
+	// the last change it applied. A peer older than this field sends 0.
+	Seq uint64 `json:"seq,omitempty"`
 }
 
 // ConflictStrategy names the available conflict resolution strategies.

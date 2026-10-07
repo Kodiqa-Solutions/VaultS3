@@ -6,7 +6,8 @@ export interface ReplicationPeer {
   queueDepth: number
   lastSync: string
   totalSynced: number
-  lastError: string
+  // Sent only while the peer has a failure to report (omitempty on the server).
+  lastError?: string
 }
 
 export interface ReplicationStatus {

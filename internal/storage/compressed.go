@@ -42,6 +42,16 @@ func NewCompressedEngine(inner Engine) *CompressedEngine {
 	return &CompressedEngine{inner: inner}
 }
 
+// neverCompressed reports whether the compressor has always stored this key as
+// it was given: a directory marker, or one of the built-in already-compressed
+// extensions. Those have been passed through since compression was added, so a
+// compression magic at the start of such an object is the owner's own data.
+// Only the built-in list counts, because ExcludedTypes is configuration and an
+// object may predate a change to it.
+func neverCompressed(key string) bool {
+	return IsDirMarker(key) || excludedExtensions[strings.ToLower(filepath.Ext(key))]
+}
+
 // shouldCompress returns true if the key should be compressed.
 func (c *CompressedEngine) shouldCompress(key string) bool {
 	ext := strings.ToLower(filepath.Ext(key))
@@ -130,8 +140,12 @@ func (c *CompressedEngine) ObjectPath(bucket, key string) string {
 	return c.inner.ObjectPath(bucket, key)
 }
 
-// maxCompressedSize is the maximum plaintext size accepted for compression (1GB).
-const maxCompressedSize int64 = 1 * 1024 * 1024 * 1024
+// maxCompressedSize bounds how much the legacy read paths (single-frame zstd,
+// gzip, and the in-memory fallback) will decode, since those formats were only
+// ever written for objects up to 1 GiB. New writes use the seekable format,
+// which streams with memory bounded by one frame, so they are not capped by it.
+// A var so a test can lower it.
+var maxCompressedSize int64 = 1 * 1024 * 1024 * 1024
 
 // compressAndPut compresses reader as it flows through, computes the ETag of the
 // plaintext, and writes the compressed blob to putFn.
@@ -146,13 +160,14 @@ const maxCompressedSize int64 = 1 * 1024 * 1024 * 1024
 // from the table, so, unlike the single-frame format this replaces, the length
 // no longer has to be known before the first byte is written and an upload of
 // unknown length (chunked, size -1) streams exactly like one with a
-// Content-Length. The size cap is enforced as the plaintext is counted, so an
-// oversized upload fails partway through and the inner engine abandons its
-// partial write instead of a gigabyte being buffered first.
+// Content-Length.
+//
+// There is no size cap. Objects over 1 GiB used to be refused with a 500 even
+// though nothing here buffers the object: the cap came from the single-frame
+// format, which had to hold the whole plaintext. The seek table records each
+// frame's sizes in 32 bits, but a frame is at most maxSeekFrame, so the table
+// places no limit on the object either.
 func (c *CompressedEngine) compressAndPut(reader io.Reader, size int64, putFn func(io.Reader, int64) (int64, string, error)) (int64, string, error) {
-	if size > maxCompressedSize {
-		return 0, "", fmt.Errorf("object too large for compression (max %dMB)", maxCompressedSize/(1024*1024))
-	}
 	h := md5.New()
 	pr, pw := io.Pipe()
 
@@ -163,11 +178,7 @@ func (c *CompressedEngine) compressAndPut(reader io.Reader, size int64, putFn fu
 	done := make(chan encResult, 1)
 
 	go func() {
-		limited := io.LimitReader(io.TeeReader(reader, h), maxCompressedSize+1)
-		n, err := writeSeekableZstd(pw, limited, defaultCompressFrame)
-		if err == nil && n > maxCompressedSize {
-			err = fmt.Errorf("object too large for compression (max %dMB)", maxCompressedSize/(1024*1024))
-		}
+		n, err := writeSeekableZstd(pw, io.TeeReader(reader, h), defaultCompressFrame)
 		// Closing the pipe with the error propagates a failed read or encode to
 		// the inner engine, which then abandons its partial write.
 		pw.CloseWithError(err)

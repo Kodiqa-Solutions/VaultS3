@@ -19,12 +19,14 @@ import (
 // o/perShard at offset o%perShard, and no parity math is needed while every data
 // shard is intact.
 //
-// If any data shard turns out to be missing or unreadable, the stream transparently
-// falls back to a full read-and-reconstruct (parity recovery) and continues from the
-// same logical offset, so a degraded read still returns correct bytes. Cross-shard
-// parity verification is not run on the healthy read path (it would require reading
-// every shard, which is exactly the cost being removed); the background Healer scans
-// for and repairs degraded objects instead.
+// Reads go a stripe at a time (crcStripeBytes, aligned to the shard), so that
+// when the version carries per-stripe checksums each stripe is verified before
+// any of its bytes are returned. If a data shard turns out to be missing,
+// unreadable or corrupt, the stream switches to the degraded reader with that
+// shard excluded and continues from the same logical offset, so the read
+// returns correct bytes, recovered from parity. Before checksums a
+// corrupt-but-present shard was served as it was, since cross-shard parity is
+// not run on the healthy path (it would mean reading every shard).
 type shardStream struct {
 	e      *Engine
 	bucket string
@@ -35,13 +37,18 @@ type shardStream struct {
 	size     int64 // OriginalSize: logical length of the object
 	pos      int64 // current logical read offset
 
-	cur    storage.ReadSeekCloser // currently open data shard, nil if none
-	curIdx int                    // index of the open shard, -1 when none
-	curPos int64                  // offset within the open shard
+	// readers holds every data shard, opened up front. An open file survives
+	// being unlinked, so a concurrent overwrite retiring this version cannot
+	// pull a shard out from under a read in progress.
+	readers []storage.ReadSeekCloser
 
-	// fallback holds the fully reconstructed object once a degraded shard forced
-	// parity recovery; when set it is the source of truth for all further reads.
-	fallback []byte
+	buf      []byte // the loaded stripe
+	bufShard int    // which data shard buf came from, -1 when none
+	bufOff   int64  // buf's offset within that shard
+
+	// alt takes over once a data shard failed: a degraded stream, or the whole
+	// reconstructed object when even that cannot be built.
+	alt storage.ReadSeekCloser
 }
 
 // newShardStream builds a streaming reader when every data shard is present.
@@ -65,103 +72,121 @@ func (e *Engine) newShardStream(bucket, key string, meta *ShardMeta) (*shardStre
 	if perShard*int64(meta.DataShards) < meta.OriginalSize {
 		return nil, false
 	}
-	// Cheap presence check (a stat per data shard, no data read). A shard that
-	// exists but fails to open later is handled by the in-stream fallback.
+	s := &shardStream{
+		e: e, bucket: bucket, key: key, meta: meta,
+		perShard: perShard, size: meta.OriginalSize, bufShard: -1,
+		readers: make([]storage.ReadSeekCloser, meta.DataShards),
+	}
 	for i := 0; i < meta.DataShards; i++ {
-		if !e.backendFor(i).ObjectExists(bucket, shardKey(key, i)) {
+		rc, _, err := e.backendFor(i).GetObject(bucket, meta.shardPath(key, i))
+		if err != nil {
+			s.Close()
 			return nil, false
 		}
+		s.readers[i] = rc
 	}
-	return &shardStream{
-		e: e, bucket: bucket, key: key, meta: meta,
-		perShard: perShard, size: meta.OriginalSize, curIdx: -1,
-	}, true
+	return s, true
+}
+
+// stripeLen is the read granularity: the checksum stripe when the version has
+// checksums, so every load can be verified, and the same size otherwise.
+func (s *shardStream) stripeLen() int64 {
+	if s.meta.hasChecksums() {
+		return s.meta.CRCStripe
+	}
+	return crcStripeBytes
+}
+
+// load reads and verifies the stripe of data shard idx that starts at off.
+func (s *shardStream) load(idx int, off int64) error {
+	n := s.stripeLen()
+	if rem := s.perShard - off; rem < n {
+		n = rem
+	}
+	rc := s.readers[idx]
+	if _, err := rc.Seek(off, io.SeekStart); err != nil {
+		return fmt.Errorf("seek data shard %d: %w", idx, err)
+	}
+	if int64(cap(s.buf)) < n {
+		s.buf = make([]byte, n)
+	}
+	s.buf = s.buf[:n]
+	if _, err := io.ReadFull(rc, s.buf); err != nil {
+		s.bufShard = -1
+		return fmt.Errorf("read data shard %d at %d: %w", idx, off, err)
+	}
+	if !s.meta.stripeOK(idx, off, s.buf) {
+		s.bufShard = -1
+		return fmt.Errorf("data shard %d failed its checksum at %d", idx, off)
+	}
+	s.bufShard, s.bufOff = idx, off
+	return nil
 }
 
 func (s *shardStream) Read(p []byte) (int, error) {
+	if s.alt != nil {
+		return s.alt.Read(p)
+	}
 	if s.pos >= s.size {
 		return 0, io.EOF
-	}
-	if s.fallback != nil {
-		n := copy(p, s.fallback[s.pos:s.size])
-		s.pos += int64(n)
-		return n, nil
 	}
 
 	idx := int(s.pos / s.perShard)
-	off := s.pos % s.perShard
-
-	if s.curIdx != idx {
-		s.closeCur()
-		rc, _, err := s.e.backendFor(idx).GetObject(s.bucket, shardKey(s.key, idx))
-		if err != nil {
-			return s.recoverAndRead(p, fmt.Errorf("open data shard %d: %w", idx, err))
+	inShard := s.pos % s.perShard
+	stripe := s.stripeLen()
+	start := inShard / stripe * stripe
+	if s.bufShard != idx || s.bufOff != start {
+		if err := s.load(idx, start); err != nil {
+			return s.recoverAndRead(p, idx, err)
 		}
-		s.cur, s.curIdx, s.curPos = rc, idx, 0
-	}
-	if s.curPos != off {
-		if _, err := s.cur.Seek(off, io.SeekStart); err != nil {
-			return s.recoverAndRead(p, fmt.Errorf("seek data shard %d: %w", idx, err))
-		}
-		s.curPos = off
 	}
 
-	// Never read past this shard's end (the next bytes live in the next shard) or
-	// past the object's logical end (the last data shard is zero-padded).
-	limit := s.perShard - off
-	if rem := s.size - s.pos; rem < limit {
-		limit = rem
+	// Never read past this stripe or past the object's logical end (the last
+	// data shard is zero-padded). The next Read moves on to the next stripe.
+	within := inShard - s.bufOff
+	avail := int64(len(s.buf)) - within
+	if rem := s.size - s.pos; rem < avail {
+		avail = rem
 	}
-	if int64(len(p)) > limit {
-		p = p[:limit]
+	if int64(len(p)) > avail {
+		p = p[:avail]
 	}
-
-	n, err := s.cur.Read(p)
+	n := copy(p, s.buf[within:])
 	s.pos += int64(n)
-	s.curPos += int64(n)
-	if err == io.EOF {
-		// The shard ended: fine if we consumed it exactly (the next Read moves to
-		// the next shard), but a genuinely short shard means it is damaged.
-		if n > 0 || s.curPos >= s.perShard {
-			return n, nil
-		}
-		return s.recoverAndRead(p, fmt.Errorf("data shard %d is short", idx))
-	}
-	if err != nil {
-		if n > 0 {
-			return n, nil
-		}
-		return s.recoverAndRead(p, fmt.Errorf("read data shard %d: %w", idx, err))
-	}
 	return n, nil
 }
 
-// recoverAndRead reconstructs the whole object from parity after a data shard turned
-// out to be unusable, then serves the current read from it. This keeps a degraded
-// read correct (identical bytes to the old always-reconstruct path) at the cost of
-// buffering, which only happens when the fast path actually fails.
-func (s *shardStream) recoverAndRead(p []byte, cause error) (int, error) {
-	s.closeCur()
+// recoverAndRead takes over after data shard bad turned out to be unusable. It
+// prefers the degraded stream, which recovers a stripe at a time, with that
+// shard excluded so a corrupt shard is not read again. When that cannot be
+// built it reconstructs the whole object, which is what this path always did.
+func (s *shardStream) recoverAndRead(p []byte, bad int, cause error) (int, error) {
+	s.closeReaders()
 	slog.Warn("erasure: falling back to parity reconstruction for read",
 		"bucket", s.bucket, "key", s.key, "reason", cause)
 
-	data, err := s.e.reconstruct(s.bucket, s.key, s.meta)
-	if err != nil {
-		return 0, fmt.Errorf("erasure: %w (after %v)", err, cause)
+	if ds, ok := s.e.newDegradedStreamExcluding(s.bucket, s.key, s.meta, bad); ok {
+		s.alt = ds
+	} else {
+		data, err := s.e.reconstruct(s.bucket, s.key, s.meta)
+		if err != nil {
+			return 0, fmt.Errorf("erasure: %w (after %v)", err, cause)
+		}
+		if int64(len(data)) < s.size {
+			return 0, fmt.Errorf("erasure: reconstructed %d bytes, expected %d", len(data), s.size)
+		}
+		s.alt = newBytesReadSeekCloser(data[:s.size])
 	}
-	if int64(len(data)) < s.size {
-		return 0, fmt.Errorf("erasure: reconstructed %d bytes, expected %d", len(data), s.size)
+	if _, err := s.alt.Seek(s.pos, io.SeekStart); err != nil {
+		return 0, err
 	}
-	s.fallback = data
-	if s.pos >= s.size {
-		return 0, io.EOF
-	}
-	n := copy(p, s.fallback[s.pos:s.size])
-	s.pos += int64(n)
-	return n, nil
+	return s.alt.Read(p)
 }
 
 func (s *shardStream) Seek(offset int64, whence int) (int64, error) {
+	if s.alt != nil {
+		return s.alt.Seek(offset, whence)
+	}
 	var abs int64
 	switch whence {
 	case io.SeekStart:
@@ -176,23 +201,27 @@ func (s *shardStream) Seek(offset int64, whence int) (int64, error) {
 	if abs < 0 {
 		return 0, fmt.Errorf("erasure: negative seek position %d", abs)
 	}
-	// Reposition lazily: the next Read opens/seeks the right shard. Range and
-	// partNumber reads therefore cost one seek, not a full materialization.
+	// Reposition lazily: the next Read loads the right stripe. Range and
+	// partNumber reads therefore cost one stripe, not a full materialization.
 	s.pos = abs
 	return abs, nil
 }
 
 func (s *shardStream) Close() error {
-	s.closeCur()
-	s.fallback = nil
+	s.closeReaders()
+	if s.alt != nil {
+		s.alt.Close()
+		s.alt = nil
+	}
 	return nil
 }
 
-func (s *shardStream) closeCur() {
-	if s.cur != nil {
-		s.cur.Close()
-		s.cur = nil
+func (s *shardStream) closeReaders() {
+	for i, rc := range s.readers {
+		if rc != nil {
+			rc.Close()
+			s.readers[i] = nil
+		}
 	}
-	s.curIdx = -1
-	s.curPos = 0
+	s.bufShard = -1
 }

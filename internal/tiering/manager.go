@@ -2,6 +2,8 @@ package tiering
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"time"
@@ -60,7 +62,7 @@ func (m *Manager) scan() {
 		if tier == "" {
 			tier = "hot"
 		}
-		if tier != "hot" {
+		if tier != "hot" || meta.VersionID != "" {
 			return true
 		}
 
@@ -78,7 +80,9 @@ func (m *Manager) scan() {
 
 	migrated := 0
 	for _, c := range candidates {
-		if err := m.migrateToCol(c.bucket, c.key); err != nil {
+		if err := m.migrateToCol(c.bucket, c.key); errors.Is(err, errChanged) {
+			slog.Info("tiering skipped an object rewritten during migration", "bucket", c.bucket, "key", c.key)
+		} else if err != nil {
 			slog.Error("tiering failed to migrate to cold", "bucket", c.bucket, "key", c.key, "error", err)
 		} else {
 			migrated++
@@ -90,7 +94,32 @@ func (m *Manager) scan() {
 	}
 }
 
+// sameObject reports whether cur still describes the object snap described. A
+// PUT replaces the record with a new ETag and modification time.
+func sameObject(snap, cur *metadata.ObjectMeta) bool {
+	return cur.ETag == snap.ETag && cur.LastModified == snap.LastModified &&
+		cur.VersionID == snap.VersionID && cur.DeleteMarker == snap.DeleteMarker
+}
+
+// errChanged means the object was rewritten while it was being moved, so the
+// move was abandoned and the new object left where its writer put it.
+var errChanged = errors.New("object changed during tier migration, left in place")
+
 func (m *Manager) migrateToCol(bucket, key string) error {
+	snap, err := m.store.GetObjectMeta(bucket, key)
+	if err != nil {
+		return err
+	}
+	if snap.DeleteMarker || (snap.Tier != "" && snap.Tier != "hot") {
+		return nil
+	}
+	if snap.VersionID != "" {
+		// The current version of a versioned object is not at the plain
+		// object path this manager reads and deletes, so moving it would copy
+		// the wrong bytes, or none.
+		return fmt.Errorf("versioned objects are not tiered")
+	}
+
 	reader, size, err := m.hotEngine.GetObject(bucket, key)
 	if err != nil {
 		return err
@@ -102,14 +131,52 @@ func (m *Manager) migrateToCol(bucket, key string) error {
 		return err
 	}
 
-	if err := m.hotEngine.DeleteObject(bucket, key); err != nil {
+	// A PUT that landed while the bytes were being copied has replaced the hot
+	// object and its record. Deleting the hot copy then destroyed the NEW data
+	// and marked the new record cold, so reads returned the old bytes. Check
+	// before switching the tier, and again after, so a PUT on either side of
+	// the switch is caught.
+	if cur, err := m.store.GetObjectMeta(bucket, key); err != nil || !sameObject(snap, cur) {
+		m.dropColdCopy(bucket, key)
+		return errChanged
+	}
+	if err := m.store.SetObjectTier(bucket, key, "cold"); err != nil {
+		m.dropColdCopy(bucket, key)
 		return err
 	}
+	if cur, err := m.store.GetObjectMeta(bucket, key); err != nil || !sameObject(snap, cur) {
+		// The tier may have been set on the new record. Put it back to hot,
+		// where the new data is, and keep the hot copy.
+		if cur != nil && cur.Tier == "cold" {
+			m.store.SetObjectTier(bucket, key, "hot")
+		}
+		m.dropColdCopy(bucket, key)
+		return errChanged
+	}
 
-	return m.store.SetObjectTier(bucket, key, "cold")
+	// Reads now go to the cold copy. A PUT landing between the check above and
+	// this delete can still lose its data, because the engine cannot delete
+	// conditionally. Closing that needs a per-key lock shared with the S3
+	// write path.
+	if err := m.hotEngine.DeleteObject(bucket, key); err != nil {
+		slog.Warn("tiering could not remove the hot copy after moving it", "bucket", bucket, "key", key, "error", err)
+	}
+	return nil
+}
+
+func (m *Manager) dropColdCopy(bucket, key string) {
+	if err := m.coldEngine.DeleteObject(bucket, key); err != nil {
+		slog.Warn("tiering could not remove an abandoned cold copy", "bucket", bucket, "key", key, "error", err)
+	}
 }
 
 func (m *Manager) MigrateToHot(bucket, key string) error {
+	// Only an object recorded as cold is promoted. Copying the cold bytes over
+	// the hot path of an object a PUT has since rewritten would replace the new
+	// data with the old.
+	if meta, err := m.store.GetObjectMeta(bucket, key); err == nil && meta.Tier != "cold" {
+		return nil
+	}
 	reader, size, err := m.coldEngine.GetObject(bucket, key)
 	if err != nil {
 		return err
@@ -120,11 +187,13 @@ func (m *Manager) MigrateToHot(bucket, key string) error {
 		return err
 	}
 
+	if err := m.store.SetObjectTier(bucket, key, "hot"); err != nil {
+		return err
+	}
 	if err := m.coldEngine.DeleteObject(bucket, key); err != nil {
 		slog.Error("tiering failed to delete cold copy", "bucket", bucket, "key", key, "error", err)
 	}
-
-	return m.store.SetObjectTier(bucket, key, "hot")
+	return nil
 }
 
 // GetObject transparently reads from the correct tier.
@@ -166,8 +235,13 @@ func (m *Manager) GetObject(bucket, key string) (storage.ReadSeekCloser, int64, 
 			slog.Error("tiering async promote failed", "bucket", bucket, "key", key, "error", err)
 			return
 		}
-		m.store.SetObjectTier(bucket, key, "hot")
-		// Only delete cold copy after tier metadata is updated
+		// Only delete the cold copy once the record points at the hot one. If
+		// the tier could not be updated, reads still go to cold, so the cold
+		// copy is the one that must survive.
+		if err := m.store.SetObjectTier(bucket, key, "hot"); err != nil {
+			slog.Error("tiering async promote could not update the tier", "bucket", bucket, "key", key, "error", err)
+			return
+		}
 		m.coldEngine.DeleteObject(bucket, key)
 	}()
 

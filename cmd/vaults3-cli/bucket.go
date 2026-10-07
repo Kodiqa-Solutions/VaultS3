@@ -100,7 +100,7 @@ func bucketList() {
 }
 
 func bucketCreate(name string) {
-	resp, err := s3Request("PUT", "/"+name, nil)
+	resp, err := s3Request("PUT", bucketPath(name), nil)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -117,7 +117,7 @@ func bucketCreate(name string) {
 }
 
 func bucketDelete(name string) {
-	resp, err := s3Request("DELETE", "/"+name, nil)
+	resp, err := s3Request("DELETE", bucketPath(name), nil)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -159,7 +159,7 @@ func bucketInfo(name string) {
 // each value is the bucket's own choice or the server default.
 func bucketDurability(name string, flags []string) {
 	if len(flags) == 0 {
-		resp, err := s3Request("GET", "/"+name+"?durability", nil)
+		resp, err := s3Request("GET", bucketPath(name)+"?durability", nil)
 		if err != nil {
 			fatal(err.Error())
 		}
@@ -220,7 +220,7 @@ func bucketDurability(name string, flags []string) {
 	}
 
 	body, _ := json.Marshal(payload)
-	resp, err := s3Request("PUT", "/"+name+"?durability", bytes.NewReader(body))
+	resp, err := s3Request("PUT", bucketPath(name)+"?durability", bytes.NewReader(body))
 	if err != nil {
 		fatal(err.Error())
 	}

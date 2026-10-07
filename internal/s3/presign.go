@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -97,12 +98,23 @@ func ValidatePresignedRestrictions(r *http.Request, bucket, key string) error {
 		return nil
 	}
 
-	// Check max size
+	// Check max size. The declared length alone was the whole check, so a body
+	// sent chunked (no declared length) or aws-chunked with a small
+	// X-Amz-Decoded-Content-Length was never measured at all. A restricted URL
+	// now needs a declared length, and the body is cut off at the limit whatever
+	// it declared.
 	if maxSizeStr := q.Get("X-Vault-MaxSize"); maxSizeStr != "" {
 		maxSize, err := strconv.ParseInt(maxSizeStr, 10, 64)
-		if err == nil && maxSize > 0 && r.ContentLength > maxSize {
+		if err != nil || maxSize <= 0 {
+			return fmt.Errorf("the upload size restriction on this URL is invalid")
+		}
+		if r.ContentLength < 0 {
+			return fmt.Errorf("this URL limits the upload size, so the request must declare its Content-Length")
+		}
+		if r.ContentLength > maxSize {
 			return fmt.Errorf("upload exceeds maximum size limit of %d bytes", maxSize)
 		}
+		r.Body = &sizeCappedBody{rc: r.Body, remaining: maxSize}
 	}
 
 	// Check content type whitelist
@@ -137,3 +149,30 @@ func ValidatePresignedRestrictions(r *http.Request, bucket, key string) error {
 
 	return nil
 }
+
+// sizeCappedBody fails a body that carries more than its limit. The error is a
+// reqError, so it reaches the client as EntityTooLarge through the storage
+// engine's failed write, and nothing is stored.
+type sizeCappedBody struct {
+	rc        io.ReadCloser
+	remaining int64
+}
+
+func (b *sizeCappedBody) Read(p []byte) (int, error) {
+	if b.remaining < 0 {
+		return 0, &reqError{"EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", http.StatusBadRequest}
+	}
+	// Read one byte past the limit, so a body that is exactly at the limit ends
+	// cleanly and one that is over it is caught.
+	if int64(len(p)) > b.remaining+1 {
+		p = p[:b.remaining+1]
+	}
+	n, err := b.rc.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining < 0 {
+		return 0, &reqError{"EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", http.StatusBadRequest}
+	}
+	return n, err
+}
+
+func (b *sizeCappedBody) Close() error { return b.rc.Close() }

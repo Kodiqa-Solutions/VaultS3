@@ -3,10 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
 
+	"github.com/Kodiqa-Solutions/VaultS3/internal/api"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/server"
 )
@@ -95,7 +97,9 @@ func main() {
 	default:
 		level = slog.LevelInfo
 	}
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	// Every log line also goes to the dashboard's live log view.
+	server.LogBroadcaster = api.NewLogBroadcaster()
+	handler := slog.NewTextHandler(io.MultiWriter(os.Stderr, server.LogBroadcaster), &slog.HandlerOptions{Level: level})
 	slog.SetDefault(slog.New(handler))
 
 	if usedDefaults {
@@ -113,11 +117,13 @@ func main() {
 		slog.Error("failed to create server", "error", err)
 		os.Exit(1)
 	}
-	defer srv.Close()
-
-	// Run blocks until shutdown signal
+	// Run blocks until a shutdown signal. Close is called on every way out:
+	// os.Exit skips deferred calls, so a listener error used to leave Raft,
+	// the metadata store and the access log unclosed.
 	if err := srv.Run(); err != nil {
 		slog.Error("server error", "error", err)
+		srv.Close()
 		os.Exit(1)
 	}
+	srv.Close()
 }

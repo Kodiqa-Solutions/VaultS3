@@ -14,29 +14,9 @@ import (
 )
 
 func runMount(args []string) {
-	cacheSizeMB := 64
-	metadataTTLSecs := 5
-
-	// Parse optional flags
-	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
-		switch {
-		case args[0] == "--cache-size" && len(args) >= 2:
-			n, err := strconv.Atoi(args[1])
-			if err != nil || n < 0 {
-				fatal("--cache-size must be a non-negative integer (MB)")
-			}
-			cacheSizeMB = n
-			args = args[2:]
-		case args[0] == "--metadata-ttl" && len(args) >= 2:
-			n, err := strconv.Atoi(args[1])
-			if err != nil || n < 0 {
-				fatal("--metadata-ttl must be a non-negative integer (seconds)")
-			}
-			metadataTTLSecs = n
-			args = args[2:]
-		default:
-			break
-		}
+	cacheSizeMB, metadataTTLSecs, args, err := parseMountFlags(args)
+	if err != nil {
+		fatal(err.Error())
 	}
 
 	if len(args) < 2 {
@@ -45,7 +25,7 @@ func runMount(args []string) {
 Mount a VaultS3 bucket as a local filesystem directory.
 
 Options:
-  --cache-size <MB>     Block cache size in MB (default: 64, 0=disabled)
+  --cache-size <MB>     Block cache size in MB (default: 64)
   --metadata-ttl <s>    Metadata cache TTL in seconds (default: 5)
 
 Examples:
@@ -94,6 +74,40 @@ Examples:
 
 	server.Wait()
 	fmt.Println("Unmounted")
+}
+
+// parseMountFlags reads the options in front of <bucket> <mountpoint>. Every
+// flag that starts the argument list is consumed or refused. The loop used to
+// end on "break", which only leaves the switch, so an unknown flag, or a flag
+// given last with no value, kept the loop spinning at full CPU forever.
+func parseMountFlags(args []string) (cacheSizeMB, metadataTTLSecs int, rest []string, err error) {
+	cacheSizeMB, metadataTTLSecs = 64, 5
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		name, value, inline := strings.Cut(args[0], "=")
+		if name != "--cache-size" && name != "--metadata-ttl" {
+			return 0, 0, nil, fmt.Errorf("unknown mount option %s (options: --cache-size <MB>, --metadata-ttl <seconds>)", name)
+		}
+		consumed := 1
+		if !inline {
+			if len(args) < 2 {
+				return 0, 0, nil, fmt.Errorf("%s needs a value", name)
+			}
+			value, consumed = args[1], 2
+		}
+		n, convErr := strconv.Atoi(value)
+		switch {
+		case name == "--cache-size" && (convErr != nil || n < 0):
+			return 0, 0, nil, fmt.Errorf("--cache-size must be a non-negative integer (MB)")
+		case name == "--metadata-ttl" && (convErr != nil || n < 0):
+			return 0, 0, nil, fmt.Errorf("--metadata-ttl must be a non-negative integer (seconds)")
+		case name == "--cache-size":
+			cacheSizeMB = n
+		default:
+			metadataTTLSecs = n
+		}
+		args = args[consumed:]
+	}
+	return cacheSizeMB, metadataTTLSecs, args, nil
 }
 
 func runUmount(args []string) {

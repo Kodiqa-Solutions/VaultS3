@@ -33,11 +33,34 @@ type putDigests struct {
 	crc32  hash.Hash32
 	crc32c hash.Hash32
 	sha1   hash.Hash
+
+	// req, once set by checkInline, makes the reader verify the digests itself
+	// when the body ends and fail the read if they do not match. The engine
+	// then abandons its own temp file and never renames it over the object
+	// already at the key. Verifying after the engine returned was too late for
+	// an overwrite: the new bytes had already replaced the old ones, and
+	// discarding them deleted the object while its old metadata stayed behind.
+	req *http.Request
+	// limit is how many bytes the body may carry before it takes the bucket
+	// over its size quota, or -1. It is enforced while reading for the same
+	// reason, since a chunked body's real length is not known up front.
+	limit int64
+	// done is set once the body reached its end and the digests were checked.
+	done    bool
+	sums    objectChecksums
+	failure *reqError
+}
+
+// checkInline arms the in-reader checks for request r and a byte limit (-1 for
+// none).
+func (d *putDigests) checkInline(r *http.Request, limit int64) {
+	d.req = r
+	d.limit = limit
 }
 
 // newPutDigests wraps body, enabling exactly the hashes this request needs.
 func newPutDigests(r *http.Request, body io.Reader) *putDigests {
-	d := &putDigests{src: body}
+	d := &putDigests{src: body, limit: -1}
 	var ws []io.Writer
 
 	if r.Header.Get("Content-MD5") != "" {
@@ -71,12 +94,28 @@ func newPutDigests(r *http.Request, body io.Reader) *putDigests {
 }
 
 func (d *putDigests) Read(p []byte) (int, error) {
+	if d.failure != nil {
+		return 0, d.failure
+	}
 	n, err := d.src.Read(p)
 	if n > 0 {
 		d.n += int64(n)
 		if d.sum != nil {
 			d.sum.Write(p[:n]) // hash.Hash never returns an error
 		}
+		if d.limit >= 0 && d.n > d.limit {
+			d.failure = &reqError{"QuotaExceeded", "Maximum bucket size exceeded", http.StatusForbidden}
+			return n, d.failure
+		}
+	}
+	if err == io.EOF && d.req != nil {
+		d.done = true
+		sums, code, message, ok := d.verify(d.req)
+		if !ok {
+			d.failure = &reqError{code, message, http.StatusBadRequest}
+			return n, d.failure
+		}
+		d.sums = sums
 	}
 	return n, err
 }

@@ -1,12 +1,29 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
 import { Link } from 'react-router-dom'
+import { useAuth } from '../hooks/useAuth'
+import { isAdminSession } from '../api/auth'
+import { isAdminOnlyPath } from '../components/Sidebar'
 import { getStats, type Stats } from '../api/stats'
 import { getActivity, type ActivityEntry } from '../api/activity'
 import Sparkline from '../components/Sparkline'
 
 export default function HomePage() {
   const { t } = useI18n()
+  const { user } = useAuth()
+  const isAdmin = isAdminSession(user)
+  // Same rule as the sidebar: a non-admin is not offered pages that answer 403.
+  const linkTo = (to: string) => (isAdmin || !isAdminOnlyPath(to) ? to : undefined)
+  const quickLinks = [
+    { to: '/buckets', label: t('home.browseBuckets') },
+    { to: '/search', label: t('home.searchObjects') },
+    { to: '/access-keys', label: t('home.manageKeys') },
+    { to: '/iam', label: t('home.iamUsers') },
+    { to: '/audit', label: t('home.auditTrail') },
+    { to: '/stats', label: t('home.storageStats') },
+    { to: '/activity', label: t('home.activityLog') },
+    { to: '/settings', label: t('nav.settings') },
+  ].filter(l => linkTo(l.to))
   const [stats, setStats] = useState<Stats | null>(null)
   const [activity, setActivity] = useState<ActivityEntry[]>([])
   const [loading, setLoading] = useState(true)
@@ -64,7 +81,7 @@ export default function HomePage() {
         <SummaryCard label={t('nav.buckets')} value={String(stats.totalBuckets)} to="/buckets" color="indigo" />
         <SummaryCard label={t('home.objects')} value={stats.totalObjects.toLocaleString()} color="blue" />
         <SummaryCard label={t('home.storage')} value={formatSize(stats.totalSize)} color="emerald" />
-        <SummaryCard label={t('home.requests')} value={stats.totalRequests.toLocaleString()} to="/stats" color="amber" />
+        <SummaryCard label={t('home.requests')} value={stats.totalRequests.toLocaleString()} to={linkTo('/stats')} color="amber" />
       </div>
 
       {/* Activity sparkline + runtime */}
@@ -108,14 +125,7 @@ export default function HomePage() {
       <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5">
         <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-3">{t('home.quickActions')}</h3>
         <div className="flex flex-wrap gap-2">
-          <QuickLink to="/buckets" label={t('home.browseBuckets')} />
-          <QuickLink to="/search" label={t('home.searchObjects')} />
-          <QuickLink to="/access-keys" label={t('home.manageKeys')} />
-          <QuickLink to="/iam" label={t('home.iamUsers')} />
-          <QuickLink to="/audit" label={t('home.auditTrail')} />
-          <QuickLink to="/stats" label={t('home.storageStats')} />
-          <QuickLink to="/activity" label={t('home.activityLog')} />
-          <QuickLink to="/settings" label={t('nav.settings')} />
+          {quickLinks.map(l => <QuickLink key={l.to} to={l.to} label={l.label} />)}
         </div>
       </div>
     </div>

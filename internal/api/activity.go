@@ -87,5 +87,25 @@ func (h *APIHandler) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if entries == nil {
 		entries = []ActivityEntry{}
 	}
+	// A non-admin sees calls on the buckets they may list, without the client
+	// address. Every recent S3 call, with its bucket, key and caller IP, used to
+	// go to any session.
+	if !h.isAdminUser(r) {
+		buckets, err := h.store.ListBuckets()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list buckets")
+			return
+		}
+		visible := h.visibleBucketSet(r, buckets)
+		kept := make([]ActivityEntry, 0, len(entries))
+		for _, e := range entries {
+			if !visible[e.Bucket] {
+				continue
+			}
+			e.ClientIP = ""
+			kept = append(kept, e)
+		}
+		entries = kept
+	}
 	writeJSON(w, http.StatusOK, entries)
 }

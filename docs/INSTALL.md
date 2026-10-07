@@ -19,11 +19,11 @@ RPM, DEB and APK packages are attached to every [release](https://github.com/Kod
 
 ```bash
 # Debian or Ubuntu
-sudo apt install ./vaults3_4.4.79_amd64.deb
+sudo apt install ./vaults3_5.0.0_amd64.deb
 # RHEL, Rocky or Fedora
-sudo rpm -i vaults3-4.4.79-1.x86_64.rpm
+sudo rpm -i vaults3-5.0.0-1.x86_64.rpm
 # Alpine
-sudo apk add --allow-untrusted vaults3_4.4.79_x86_64.apk
+sudo apk add --allow-untrusted vaults3_5.0.0_x86_64.apk
 
 sudo systemctl enable --now vaults3
 journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
@@ -32,7 +32,7 @@ journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
 Every release also ships an SPDX SBOM per platform, generated from the binary so it lists the modules actually compiled in, and a Sigstore provenance bundle attached as an asset, so a download can be verified against the workflow run and commit that produced it, offline or from a mirror:
 
 ```bash
-gh attestation verify vaults3_4.4.79_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_5.0.0_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 ## Build from source
@@ -64,8 +64,11 @@ secret for this installation, which it prints once:
 ```
 
 The secret is stored with the metadata, so later starts reuse it. Set
-`VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY` to use credentials of your own,
-or change them from the dashboard.
+`VAULTS3_ACCESS_KEY` and `VAULTS3_SECRET_KEY` before the first start to use
+credentials of your own, or change them from the dashboard later. Once
+credentials are saved they win over the environment, so a dashboard change
+survives a restart. To replace saved credentials from the environment, set them
+together with `VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true` for one start.
 
 
 ## Docker
@@ -183,7 +186,8 @@ helm install vaults3 ./deploy/helm/vaults3 \
   --set auth.secretKey="$(openssl rand -hex 20)" \
   --set defaultBuckets="{app-data,backups}"
 
-# Or plain manifests (single-node, no Helm)
+# Or plain manifests (single-node, no Helm). The server generates the admin
+# secret on first start and prints it once to its log.
 kubectl apply -f deploy/k8s/quickstart.yaml
 ```
 

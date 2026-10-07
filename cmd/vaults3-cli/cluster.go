@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -17,12 +18,15 @@ Subcommands:
   status                       Show cluster members, leader, and drain state
   shards                       Show how object metadata is distributed
   join <nodeId> <raftAddr>     Add a member (run against the leader)
-  leave <nodeId>               Remove a member (run against the leader)
+  leave <nodeId> [--yes]       Remove a member (run against the leader), asks first
   drain [nodeId]               Stop a node accepting writes (defaults to the node served)
   undrain [nodeId]             Resume writes on a node
-  rebalance                    Move objects to their correct owner after membership changes
+  rebalance                    Retired: replica repair restores placement (use cluster repair)
   repair [--status]            Restore replica counts after a node was lost for good
-  decommission <nodeId>        Drain + rebalance a node so it can be safely replaced`)
+  decommission <nodeId> [--yes]
+                               Drain + rebalance a node so it can be safely replaced, asks first
+
+--yes (or -y) skips the confirmation. Without a terminal to ask on, it is required.`)
 		os.Exit(1)
 	}
 
@@ -39,10 +43,9 @@ Subcommands:
 		}
 		clusterJoin(args[1], args[2])
 	case "leave":
-		if len(args) < 2 {
-			fatal("usage: vaults3-cli cluster leave <nodeId>")
-		}
-		clusterLeave(args[1])
+		nodeID, yes := nodeAndYes(args[1:], "usage: vaults3-cli cluster leave <nodeId> [--yes]")
+		confirmClusterChange(fmt.Sprintf("This removes node %s from the cluster membership.", nodeID), yes)
+		clusterLeave(nodeID)
 	case "drain":
 		clusterDrain(argOrEmpty(args, 1), true)
 	case "undrain":
@@ -56,12 +59,60 @@ Subcommands:
 		}
 		clusterRepair()
 	case "decommission":
-		if len(args) < 2 {
-			fatal("usage: vaults3-cli cluster decommission <nodeId>")
-		}
-		clusterDecommission(args[1])
+		nodeID, yes := nodeAndYes(args[1:], "usage: vaults3-cli cluster decommission <nodeId> [--yes]")
+		confirmClusterChange(fmt.Sprintf("This drains node %s (it stops accepting writes).", nodeID), yes)
+		clusterDecommission(nodeID)
 	default:
 		fatal("unknown cluster subcommand: " + args[0])
+	}
+}
+
+// nodeAndYes reads "<nodeId> [--yes]" in either order and refuses anything else.
+func nodeAndYes(args []string, usage string) (string, bool) {
+	nodeID, yes := "", false
+	for _, a := range args {
+		switch {
+		case a == "--yes" || a == "-y":
+			yes = true
+		case strings.HasPrefix(a, "-"):
+			fatal("unknown flag: " + a + "\n" + usage)
+		case nodeID == "":
+			nodeID = a
+		default:
+			fatal("unexpected argument: " + a + "\n" + usage)
+		}
+	}
+	if nodeID == "" {
+		fatal(usage)
+	}
+	return nodeID, yes
+}
+
+// confirmInput and stdinIsTerminal are variables so a test can answer the
+// prompt and choose whether there is a terminal to ask on.
+var (
+	confirmInput    io.Reader = os.Stdin
+	stdinIsTerminal           = func() bool {
+		fi, err := os.Stdin.Stat()
+		return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	}
+)
+
+// confirmClusterChange asks before a membership change, the way storage
+// reclaim --apply does. Removing or draining the wrong node of a cluster is
+// hard to undo, and these ran on the first keystroke. With no terminal to ask
+// on, such as in a script, --yes is required rather than taken for granted.
+func confirmClusterChange(what string, assumeYes bool) {
+	if assumeYes {
+		return
+	}
+	if !stdinIsTerminal() {
+		fatal(what + " Pass --yes to confirm, there is no terminal to ask on")
+	}
+	fmt.Print(what + " Continue? [y/N]: ")
+	answer, _ := bufio.NewReader(confirmInput).ReadString('\n')
+	if !strings.EqualFold(strings.TrimSpace(answer), "y") {
+		fatal("aborted, nothing was changed")
 	}
 }
 
@@ -298,10 +349,12 @@ func clusterDrain(nodeID string, drain bool) {
 	}
 }
 
+// clusterRebalance reports that rebalance is retired. Its data movement never
+// worked (every transfer was refused) and, had it worked, it would have deleted
+// valid replicas. Replica repair restores placement and copy counts instead.
 func clusterRebalance() {
 	out := clusterPost("/cluster/rebalance", nil)
-	running := out["running"] == true
-	fmt.Printf("Rebalance triggered (running=%v). Objects are moving to their correct owner in the background.\n", running)
+	fmt.Println(msgOr(out, "Rebalance no longer moves data. Replica repair restores every object's placement and copy count: run `vaults3-cli cluster repair`."))
 }
 
 func clusterRepair() {
@@ -335,17 +388,17 @@ func clusterRepairStatus() {
 }
 
 func clusterDecommission(nodeID string) {
-	fmt.Printf("Decommissioning %s: this drains the node and triggers a rebalance so its\n", nodeID)
-	fmt.Println("data moves to the remaining members. It does NOT remove the node — verify the")
-	fmt.Println("data has moved (vaults3-cli info / cluster status), then run:")
-	fmt.Printf("  vaults3-cli cluster leave %s\n\n", nodeID)
-	fmt.Println("Zero-data-loss requires replica_count >= 2 (replicas already exist elsewhere).")
+	fmt.Printf("Decommissioning %s: this drains the node so it takes no new writes. It does NOT\n", nodeID)
+	fmt.Println("remove the node. Next, remove it, then let replica repair re-create on the")
+	fmt.Println("remaining members every copy it held:")
+	fmt.Printf("  vaults3-cli cluster leave %s\n", nodeID)
+	fmt.Println("  vaults3-cli cluster repair")
+	fmt.Println("  vaults3-cli cluster repair --status   # until repaired settles at 0")
+	fmt.Println("\nZero data loss requires replica_count >= 2: the copies repair re-creates come")
+	fmt.Println("from the ones the other members already hold.")
 
 	clusterPost("/cluster/drain", map[string]string{"nodeId": nodeID})
 	fmt.Printf("- %s drained (no new writes)\n", nodeID)
-	clusterPost("/cluster/rebalance", nil)
-	fmt.Println("- rebalance triggered")
-	fmt.Println("\nWatch progress, then leave the node when its data has moved.")
 }
 
 // msgOr returns the response "message" field, or a fallback.

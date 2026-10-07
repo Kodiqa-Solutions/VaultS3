@@ -5,11 +5,14 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -70,8 +73,19 @@ func (n *Node) MembersInfo() []ServerInfo {
 }
 
 // StatusHandler returns an HTTP handler for /cluster/status.
+//
+// It requires the cluster secret, like every other /cluster/ endpoint. It sits
+// on the public API port and answers with node IDs, Raft addresses and Raft's
+// internal stats, which is a map of the cluster for anyone who can reach the
+// port, the same disclosure /cluster/ownership was locked down for. Operators
+// and the CLI read the same information through the authenticated admin API at
+// /api/v1/cluster/status.
 func (n *Node) StatusHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !n.authOK(r) {
+			http.Error(w, "unauthorized: /cluster/status needs the cluster secret, use /api/v1/cluster/status with admin credentials", http.StatusUnauthorized)
+			return
+		}
 		status := ClusterStatus{
 			NodeID:   n.cfg.NodeID,
 			State:    n.raft.State().String(),
@@ -129,7 +143,7 @@ func (n *Node) JoinHandler() http.HandlerFunc {
 					http.Error(w, "no leader available", http.StatusServiceUnavailable)
 					return
 				}
-				w.Header().Set("Location", fmt.Sprintf("http://%s/cluster/join", apiAddrFromRaft(leaderAddr, n.cfg.APIPort)))
+				w.Header().Set("Location", interNodeURL(apiAddrFromRaft(leaderAddr, n.cfg.APIPort), "/cluster/join"))
 				http.Error(w, "not leader, redirect to: "+leaderAddr, http.StatusTemporaryRedirect)
 				return
 			}
@@ -225,7 +239,7 @@ func (n *Node) AutoJoin(ctx context.Context, joinAddr string) {
 
 // postJoin POSTs a join request to addr, following a single leader redirect.
 func postJoin(ctx context.Context, client *http.Client, addr string, body []byte, secret string) error {
-	url := fmt.Sprintf("http://%s/cluster/join", addr)
+	url := interNodeURL(addr, "/cluster/join")
 	for redirects := 0; redirects < 2; redirects++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
@@ -262,9 +276,9 @@ func postJoin(ctx context.Context, client *http.Client, addr string, body []byte
 func (n *Node) ForwardToLeader(data []byte) error {
 	leaderAPI, err := n.leaderAPIAddr()
 	if err != nil {
-		return fmt.Errorf("cluster: no leader to forward write to")
+		return fmt.Errorf("%w: no leader to forward the write to, it was not applied", ErrLeaderUnavailable)
 	}
-	url := fmt.Sprintf("http://%s/cluster/apply", leaderAPI)
+	url := interNodeURL(leaderAPI, "/cluster/apply")
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -275,11 +289,27 @@ func (n *Node) ForwardToLeader(data []byte) error {
 	}
 	resp, err := InterNodeClient(10 * time.Second).Do(req)
 	if err != nil {
-		return fmt.Errorf("cluster: forward to leader: %w", err)
+		// Never retried. A request that failed to connect certainly did not
+		// reach the leader, but one that timed out or lost its connection after
+		// being sent may well have been committed, and sending it again would
+		// apply the write twice. The caller reports the failure and the client
+		// decides, knowing the outcome is unknown.
+		if neverSent(err) {
+			return fmt.Errorf("%w: forward to leader %s failed before it was sent, the write was not applied: %v",
+				ErrLeaderUnavailable, leaderAPI, err)
+		}
+		slog.Warn("cluster: forwarded write got no answer from the leader, it may or may not have been applied",
+			"leader", leaderAPI, "error", err)
+		return fmt.Errorf("%w: forward to leader %s got no answer, the write may have been applied: %v",
+			ErrLeaderUnavailable, leaderAPI, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return fmt.Errorf("%w: leader moved before the forwarded write was applied (%d): %s",
+				ErrLeaderUnavailable, resp.StatusCode, string(body))
+		}
 		return fmt.Errorf("cluster: leader rejected forwarded write (%d): %s", resp.StatusCode, string(body))
 	}
 	// Note: we deliberately do NOT block here waiting for this node's FSM to apply
@@ -290,6 +320,23 @@ func (n *Node) ForwardToLeader(data []byte) error {
 	// rare read that actually races a write.
 	return nil
 }
+
+// neverSent reports whether a request failed while connecting, so the peer
+// cannot have seen it. Anything later, an EOF or a reset included, may have
+// followed a request the peer read in full.
+func neverSent(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// ErrLeaderUnavailable marks a forwarded write that could not be confirmed
+// because the leader could not be reached or answered. An API layer should
+// answer it with 503 so the client retries, and its message says whether the
+// write may already have been applied.
+var ErrLeaderUnavailable = errors.New("cluster: leader unavailable")
 
 // ApplyHandler returns an HTTP handler for POST /cluster/apply: a follower
 // forwards a serialized metadata command here and the leader commits it to Raft.

@@ -9,8 +9,13 @@ import (
 	"testing"
 )
 
+// unreachableNode stands in for a version in fakeServer: a peer the cluster
+// could not reach, which reports no version at all.
+const unreachableNode = "(unreachable)"
+
 // fakeServer answers like a server of the given versions, with a key create
-// response shaped the way that version shapes it, and counts key issues.
+// response shaped the way that version shapes it, and counts key issues. A nil
+// versions list makes the version request itself fail.
 func fakeServer(t *testing.T, versions []string, response string) *int32 {
 	t.Helper()
 	var issued int32
@@ -19,9 +24,17 @@ func fakeServer(t *testing.T, versions []string, response string) *int32 {
 		fmt.Fprint(w, `{"token":"t"}`)
 	})
 	mux.HandleFunc("/api/v1/cluster/info", func(w http.ResponseWriter, _ *http.Request) {
+		if versions == nil {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
 		var nodes []string
-		for _, v := range versions {
-			nodes = append(nodes, fmt.Sprintf(`{"reachable":true,"version":%q}`, v))
+		for i, v := range versions {
+			if v == unreachableNode {
+				nodes = append(nodes, fmt.Sprintf(`{"nodeId":"node-%d","error":"dial tcp: timeout"}`, i))
+				continue
+			}
+			nodes = append(nodes, fmt.Sprintf(`{"nodeId":"node-%d","reachable":true,"version":%q}`, i, v))
 		}
 		fmt.Fprintf(w, `{"nodes":[%s]}`, strings.Join(nodes, ","))
 	})
@@ -71,20 +84,79 @@ func TestKeyCreateCountsTheOldestNode(t *testing.T) {
 	}
 }
 
-// A version that cannot be compared, such as "main" or "dev", is not refused.
-// If the answer then does not say what was granted, --user-policies must not be
-// reported as honoured.
-func TestKeyCreateWarnsWhenAnUnversionedServerDoesNotSay(t *testing.T) {
+// A version that cannot be compared, such as "main" or "dev", is exactly the
+// server the check exists for: the :latest image reports "main" whatever it
+// contains. So is a node that does not answer, and a cluster that cannot be
+// asked. Each one is refused without --force, and nothing is issued.
+func TestKeyCreateRefusesAnUnknownVersionWithoutForce(t *testing.T) {
+	for name, versions := range map[string][]string{
+		"main":            {"main"},
+		"dev":             {"dev"},
+		"empty":           {""},
+		"unreachable":     {"v4.4.80", unreachableNode},
+		"one main of two": {"v4.4.80", "main"},
+		"request fails":   nil,
+	} {
+		issued := fakeServer(t, versions, oldServerKey)
+		_, errOut, failed := runCLI(t, "key", "create", "alice", "--all-buckets")
+		if !failed || !strings.Contains(errOut, "--force") || !strings.Contains(errOut, "cannot confirm") {
+			t.Errorf("%s: want a refusal pointing at --force, got failed=%v %q", name, failed, errOut)
+		}
+		if n := atomic.LoadInt32(issued); n != 0 {
+			t.Errorf("%s: a key was issued without a confirmed version (%d)", name, n)
+		}
+	}
+}
+
+// The refusal says which node could not be confirmed, so the operator knows
+// where to look before reaching for --force.
+func TestKeyCreateNamesTheUnconfirmedNode(t *testing.T) {
+	fakeServer(t, []string{"v4.4.80", unreachableNode}, oldServerKey)
+	_, errOut, _ := runCLI(t, "key", "create", "alice", "--all-buckets")
+	if !strings.Contains(errOut, "node-1 is unreachable") {
+		t.Errorf("refusal does not name the unreachable node: %q", errOut)
+	}
+}
+
+// --force accepts an unknown version. If the answer then does not say what was
+// granted, --user-policies must not be reported as honoured.
+func TestKeyCreateWarnsWhenAForcedUnversionedServerDoesNotSay(t *testing.T) {
 	issued := fakeServer(t, []string{"main"}, oldServerKey)
-	out, errOut, failed := runCLI(t, "key", "create", "alice", "--user-policies")
+	out, errOut, failed := runCLI(t, "key", "create", "alice", "--user-policies", "--force")
 	if failed {
-		t.Fatalf("unversioned server refused: %s", errOut)
+		t.Fatalf("forced create on an unversioned server refused: %s", errOut)
 	}
 	if atomic.LoadInt32(issued) != 1 {
 		t.Fatal("no key was issued")
 	}
 	if !strings.Contains(out, "WARNING") || strings.Contains(out, "exactly what the user's own policies allow") {
 		t.Errorf("output claims the limit was honoured: %q", out)
+	}
+}
+
+// --force is for a version that cannot be read. A version known to be too old
+// is still refused.
+func TestKeyCreateForceDoesNotOverrideAKnownOldVersion(t *testing.T) {
+	issued := fakeServer(t, []string{"v4.4.78"}, oldServerKey)
+	_, errOut, failed := runCLI(t, "key", "create", "alice", "--all-buckets", "--force")
+	if !failed || !strings.Contains(errOut, "4.4.79 or later") {
+		t.Errorf("want a refusal naming the version, got failed=%v %q", failed, errOut)
+	}
+	if atomic.LoadInt32(issued) != 0 {
+		t.Error("--force issued a key on a server known to be too old")
+	}
+}
+
+// The API creates a missing user, and one named with '/' can never be
+// addressed again, so it could not be deleted.
+func TestKeyCreateRefusesAnUnaddressableUserName(t *testing.T) {
+	issued := fakeServer(t, []string{"v4.4.80"}, oldServerKey)
+	_, errOut, failed := runCLI(t, "key", "create", "team/alice", "--all-buckets")
+	if !failed || !strings.Contains(errOut, "cannot address") {
+		t.Errorf("want a refusal, got failed=%v %q", failed, errOut)
+	}
+	if atomic.LoadInt32(issued) != 0 {
+		t.Error("a key was issued for a user that can never be deleted")
 	}
 }
 

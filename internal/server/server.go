@@ -55,6 +55,11 @@ import (
 // Version is the running build version, set by main from the -ldflags value.
 var Version = "dev"
 
+// LogBroadcaster, when set by main before New, receives a copy of every log
+// line for the dashboard's live log view (/api/v1/logs). That view answered 503
+// forever because nothing ever fed it.
+var LogBroadcaster *api.LogBroadcaster
+
 // reapClient issues the best-effort inter-node object-delete broadcasts (issue
 // #34 layer 2), and replClient streams object data to replica-set peers (issue
 // #37, replica_count > 1). Both share the pooled inter-node transport so they
@@ -160,6 +165,8 @@ type Server struct {
 	biDirWorker          *replication.BiDirectionalWorker
 	replicationFunc      func(eventType, bucket, key string, size int64, etag, versionID string)
 	searchIndex          *search.Index
+	eventBus             *api.EventBus
+	traceBus             *api.TraceBroadcaster
 	vectorMgr            *vector.Manager
 	scanWorker           *scanner.Scanner
 	tieringMgr           *tiering.Manager
@@ -346,6 +353,12 @@ func New(cfg *config.Config) (*Server, error) {
 		// Normalise here rather than letting each component default its own copy,
 		// so the shard service and the Raft node agree on the replica count.
 		cluster.ApplyDefaults(&cfg.Cluster)
+		// Node-to-node calls follow the server's own TLS setting. Control-plane
+		// calls always used http://, so the cluster secret crossed the wire in
+		// cleartext even with TLS on.
+		if cfg.Server.TLS.Enabled {
+			cluster.SetInterNodeScheme("https")
+		}
 		// A cluster with no shared secret cannot authenticate its own inter-node
 		// traffic, and those endpoints are registered on the public S3 port. They
 		// now fail closed, so an unset secret would mean a cluster that cannot
@@ -529,18 +542,18 @@ func New(cfg *config.Config) (*Server, error) {
 			metaStore, engine, clusterProxy.Ring(), clusterProxy,
 			cfg.Cluster.NodeID, cfg.Cluster.Secret, repairScheme, cfg.Cluster.Repair,
 		)
-		replicaRepairer.SetRebalanceGuard(rebalancer.IsRunning)
 		replicaRepairer.SetBucketEncrypted(encryptedNow)
 		replicaRepairer.SetShardedMetadata(cfg.Cluster.MetadataShards > 1)
 
 		failureDetector.SetCallbacks(
+			// Rebalance no longer moves data (see internal/cluster/rebalance.go):
+			// replica repair restores placement, so a membership change only
+			// needs repair.
 			func(nodeID string) {
 				failoverProxy.OnNodeDown(nodeID)
-				rebalancer.Trigger()
 			},
 			func(nodeID string) {
 				failoverProxy.OnNodeRecover(nodeID)
-				rebalancer.Trigger()
 				// A node that just came back is the likeliest place for a copy
 				// to be missing, so top up rather than wait for the next tick.
 				replicaRepairer.Trigger()
@@ -618,6 +631,7 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// Initialize S3 handler
 	s3h := s3.NewHandler(metaStore, engine, auth, cfg.Encryption.Enabled, cfg.Server.Domain, mc)
+	s3h.SetPrivateEndpoints(cfg.Notifications.AllowPrivateWebhooks, cfg.Lambda.AllowPrivateEndpoints)
 	s3h.SetPerBucketMode(cfg.Encryption.PerBucket)
 
 	// Node write gate (drain): shared by the S3 handler (rejects object writes when
@@ -894,6 +908,9 @@ func New(cfg *config.Config) (*Server, error) {
 	// Initialize notification dispatcher
 	nc := cfg.Notifications
 	notifyDispatcher := notify.NewDispatcher(metaStore, nc.MaxWorkers, nc.QueueSize, nc.TimeoutSecs, nc.MaxRetries)
+	if nc.AllowPrivateWebhooks {
+		notifyDispatcher.AllowPrivateWebhooks()
+	}
 
 	// Register notification backends
 	if nc.Kafka.Enabled && len(nc.Kafka.Brokers) > 0 && nc.Kafka.Topic != "" {
@@ -922,8 +939,17 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 	}
 
+	if nc.Elasticsearch.Enabled && nc.Elasticsearch.URL != "" {
+		notifyDispatcher.AddBackend(notify.NewElasticsearchBackend(nc.Elasticsearch.URL, nc.Elasticsearch.Index))
+		slog.Info("Elasticsearch notification backend enabled", "index", nc.Elasticsearch.Index)
+	}
+
+	// The dashboard's live event stream (/api/v1/events) reads from this bus.
+	// Nothing published to it, so the stream answered 503 forever.
+	eventBus := api.NewEventBus()
 	s3h.SetNotificationFunc(func(eventType, bucket, key string, size int64, etag, versionID string) {
 		notifyDispatcher.Dispatch(bucket, key, eventType, size, etag, versionID)
+		eventBus.Publish(eventType, bucket, key, size, etag)
 	})
 
 	// Initialize replication worker if enabled
@@ -969,7 +995,10 @@ func New(cfg *config.Config) (*Server, error) {
 			)
 		} else {
 			// Traditional push-based replication
-			replWorker = replication.NewWorker(metaStore, engine, cfg.Replication)
+			// The local store, not the Raft-backed one: the queue is per node
+			// (see raftscope.go). Acknowledging through Raft deleted events with
+			// the same local ID on every other node.
+			replWorker = replication.NewWorker(store, engine, cfg.Replication)
 			replicationFunc = func(eventType, bucket, key string, size int64, etag, versionID string) {
 				evtType := "put"
 				if eventType == "s3:ObjectRemoved:Delete" {
@@ -1091,6 +1120,9 @@ func New(cfg *config.Config) (*Server, error) {
 	var lambdaMgr *lambda.TriggerManager
 	if cfg.Lambda.Enabled {
 		lambdaMgr = lambda.NewTriggerManager(metaStore, engine, cfg.Lambda)
+		if cfg.Lambda.AllowPrivateEndpoints {
+			lambdaMgr.AllowPrivateEndpoints(true)
+		}
 		s3h.SetLambdaFunc(func(eventType, bucket, key string, size int64, etag, versionID string) {
 			lambdaMgr.Dispatch(bucket, key, eventType, size, etag, versionID)
 		})
@@ -1120,6 +1152,8 @@ func New(cfg *config.Config) (*Server, error) {
 		biDirWorker:          biDirWorker,
 		replicationFunc:      replicationFunc,
 		searchIndex:          searchIdx,
+		eventBus:             eventBus,
+		traceBus:             api.NewTraceBroadcaster(),
 		vectorMgr:            vectorMgr,
 		scanWorker:           scanWorker,
 		tieringMgr:           tieringMgr,
@@ -1151,6 +1185,7 @@ func (s *Server) Run() error {
 	// Dashboard API
 	apiHandler := api.NewAPIHandler(s.metaStore, s.engine, s.metrics, s.cfg, s.activity)
 	apiHandler.SetS3Authenticator(s.s3Auth)
+	apiHandler.SetAllowPrivateLambda(s.cfg.Lambda.AllowPrivateEndpoints)
 	// Graph the measured physical footprint next to the logical size, so growth
 	// that never shows up in object bytes (old versions, replicas, Raft logs) is
 	// visible in Prometheus and not just in the dashboard (issue #43).
@@ -1159,6 +1194,11 @@ func (s *Server) Run() error {
 	// same flag the S3 handler enforces.
 	apiHandler.SetWritable(s.writable)
 	apiHandler.SetSearchIndex(s.searchIndex)
+	apiHandler.SetEventBus(s.eventBus)
+	apiHandler.SetTraceBroadcaster(s.traceBus)
+	if LogBroadcaster != nil {
+		apiHandler.SetLogBroadcaster(LogBroadcaster)
+	}
 	apiHandler.SetMigrator(migrate.NewManager(s.metaStore, s.engine))
 	apiHandler.SetSnapshotManager(snapshot.NewManager(s.metaStore))
 	// Per-bucket encryption controls (enable/rotate/shred) for the dashboard share
@@ -1323,8 +1363,11 @@ func (s *Server) Run() error {
 	splitConsole := s.cfg.Server.ConsolePort > 0 && s.cfg.Server.ConsolePort != s.cfg.Server.Port
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", healthHandler(s.metrics.StartTime()))
-	mux.HandleFunc("/ready", readyHandler(s.store))
+	// Kubernetes waits 5s for a probe (values.yaml timeoutSeconds), so the
+	// store gets 3s to answer.
+	probe := newStoreProbe(func() error { _, err := s.store.ListBuckets(); return err }, 3*time.Second)
+	mux.HandleFunc("/health", healthHandler(s.metrics.StartTime(), probe))
+	mux.HandleFunc("/ready", readyHandler(probe))
 	// Metrics carry per-bucket names, object counts and sizes, which is the same
 	// inventory ListBuckets requires credentials for. Unauthenticated scrapes get
 	// the process-level series with those labels dropped, unless the operator has
@@ -1454,13 +1497,25 @@ func (s *Server) Run() error {
 		slog.Info("bidirectional replication sync endpoint registered", "path", "/_replication/sync")
 	}
 
-	mux.Handle("/", s.s3h)
+	// A request forwarded by another node arrives from that node's address.
+	// The middleware restores the client's own address for IP rules, rate
+	// limiting, aws:SourceIp and the audit log, but only when the forwarding
+	// request proves it with the cluster secret.
+	if s.clusterNode != nil {
+		mux.Handle("/", cluster.TrustForwardedClient(s.cfg.Cluster.Secret, s.s3h))
+	} else {
+		mux.Handle("/", s.s3h)
+	}
 
 	// Wrap mux with middleware: panic recovery (outermost) → security headers → request ID → latency → mux
 	var handler http.Handler = mux
+	if s.traceBus != nil {
+		handler = traceRequests(s.traceBus, handler)
+	}
 	handler = middleware.Latency(s.metrics, handler)
 	handler = middleware.RequestID(handler)
 	handler = middleware.SecurityHeaders(handler)
+	handler = trustedProxies(s.cfg.Server.TrustedProxies, handler)
 	handler = middleware.PanicRecovery(handler)
 
 	httpServer := &http.Server{
@@ -1511,9 +1566,23 @@ func (s *Server) Run() error {
 	}
 
 	// Start batched access updater
+	// Run returns before the caller closes the store, so the updater's last
+	// flush has to finish first. Cancelling it only in a defer let that flush
+	// race the store's Close, and the final batch of access times was lost.
 	updaterCtx, updaterCancel := context.WithCancel(context.Background())
-	defer updaterCancel()
-	go s.accessUpdater.Run(updaterCtx)
+	updaterDone := make(chan struct{})
+	go func() {
+		s.accessUpdater.Run(updaterCtx)
+		close(updaterDone)
+	}()
+	defer func() {
+		updaterCancel()
+		select {
+		case <-updaterDone:
+		case <-time.After(10 * time.Second):
+			slog.Warn("access-time updater did not finish its last flush in time")
+		}
+	}()
 
 	// Start lifecycle worker
 	lcCtx, lcCancel := context.WithCancel(context.Background())
@@ -1664,7 +1733,11 @@ func (s *Server) Run() error {
 			interNodeMux.HandleFunc("/cluster/shard-apply", s.shardRouter.ApplyHandler())
 		}
 		if s.biDirWorker != nil {
-			interNodeMux.HandleFunc("/_replication/sync", s.biDirWorker.HandleSyncRequest)
+			// The cluster secret is required here exactly as on the public port.
+			// This listener registered the bare handler, so anyone who could reach
+			// internode_port could read the whole change log: every bucket, key,
+			// ETag and size (security assessment finding 9, on the second door).
+			interNodeMux.HandleFunc("/_replication/sync", s.requireClusterSecret(s.biDirWorker.HandleSyncRequest))
 		}
 		interNodeServer = &http.Server{
 			Addr:    interNodeAddr,
@@ -1672,7 +1745,15 @@ func (s *Server) Run() error {
 		}
 		go func() {
 			slog.Info("inter-node listener started", "addr", interNodeAddr)
-			if err := interNodeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			// The inter-node listener was always plain HTTP, even with TLS on.
+			// Peers now call it with https when TLS is enabled.
+			var err error
+			if s.cfg.Server.TLS.Enabled {
+				err = interNodeServer.ListenAndServeTLS(s.cfg.Server.TLS.CertFile, s.cfg.Server.TLS.KeyFile)
+			} else {
+				err = interNodeServer.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
 				slog.Error("inter-node listener error", "error", err)
 			}
 		}()
@@ -1687,7 +1768,7 @@ func (s *Server) Run() error {
 		}
 		consoleAddr := fmt.Sprintf("%s:%d", caddr, s.cfg.Server.ConsolePort)
 		cmux := http.NewServeMux()
-		cmux.HandleFunc("/health", healthHandler(s.metrics.StartTime()))
+		cmux.HandleFunc("/health", healthHandler(s.metrics.StartTime(), probe))
 		cmux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/dashboard/favicon.svg", http.StatusMovedPermanently)
 		})
@@ -1699,6 +1780,7 @@ func (s *Server) Run() error {
 		var chandler http.Handler = cmux
 		chandler = middleware.RequestID(chandler)
 		chandler = middleware.SecurityHeaders(chandler)
+		chandler = trustedProxies(s.cfg.Server.TrustedProxies, chandler)
 		chandler = middleware.PanicRecovery(chandler)
 		consoleServer = &http.Server{Addr: consoleAddr, Handler: chandler}
 		go func() {
@@ -1775,26 +1857,57 @@ func requiresLeaderRead(r *http.Request, bucket, key string) bool {
 	return true
 }
 
-func initBuiltinPolicies(store *metadata.Store) {
-	builtins := []metadata.IAMPolicy{
+// The built-in policy documents as shipped before 5.0.0. Requests used to be
+// authorized under a handful of coarse actions (tagging, retention and ACL
+// writes as s3:PutObject, multipart as s3:*, bucket configuration as
+// s3:CreateBucket), so these were enough. With each request mapped to its own
+// AWS action they no longer cover what their names promise: a ReadWriteAccess
+// user could not tag an object or upload in parts.
+const (
+	oldReadOnlyAccess  = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket","s3:ListAllMyBuckets","s3:GetBucketPolicy"],"Resource":["*"]}]}`
+	oldReadWriteAccess = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:ListAllMyBuckets"],"Resource":["*"]}]}`
+)
+
+func builtinPolicies() []metadata.IAMPolicy {
+	return []metadata.IAMPolicy{
 		{
 			Name:     "ReadOnlyAccess",
-			Document: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket","s3:ListAllMyBuckets","s3:GetBucketPolicy"],"Resource":["*"]}]}`,
+			Document: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":["*"]}]}`,
 		},
 		{
-			Name:     "ReadWriteAccess",
-			Document: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:ListAllMyBuckets"],"Resource":["*"]}]}`,
+			Name: "ReadWriteAccess",
+			Document: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*",` +
+				`"s3:PutObject","s3:PutObjectTagging","s3:PutObjectVersionTagging","s3:PutObjectRetention","s3:PutObjectLegalHold","s3:PutObjectAcl",` +
+				`"s3:DeleteObject","s3:DeleteObjectTagging","s3:DeleteObjectVersionTagging","s3:AbortMultipartUpload","s3:RestoreObject"],"Resource":["*"]}]}`,
 		},
 		{
 			Name:     "FullAccess",
 			Document: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["*"]}]}`,
 		},
 	}
+}
 
-	for _, p := range builtins {
+func initBuiltinPolicies(store *metadata.Store) {
+	old := map[string]string{"ReadOnlyAccess": oldReadOnlyAccess, "ReadWriteAccess": oldReadWriteAccess}
+	for _, p := range builtinPolicies() {
 		p.CreatedAt = time.Now().UTC()
-		// Use CreateIAMPolicy which is a no-op if already exists
-		store.CreateIAMPolicy(p)
+		existing, err := store.GetIAMPolicy(p.Name)
+		if err != nil {
+			if err := store.CreateIAMPolicy(p); err != nil {
+				slog.Warn("could not create built-in policy", "policy", p.Name, "error", err)
+			}
+			continue
+		}
+		// An installation still holding the document this release replaced
+		// gets the new one. A document the operator edited is left alone.
+		if existing.Document == old[p.Name] {
+			existing.Document = p.Document
+			if err := store.UpdateIAMPolicy(*existing); err != nil {
+				slog.Warn("could not update built-in policy", "policy", p.Name, "error", err)
+			} else {
+				slog.Info("built-in policy updated for per-action authorization", "policy", p.Name)
+			}
+		}
 	}
 }
 
@@ -1826,6 +1939,13 @@ func validateExternalURL(rawURL string) error {
 }
 
 func (s *Server) Close() {
+	// The index is saved every two minutes while running. Without a save here,
+	// up to two minutes of embeddings were lost on every restart.
+	if s.vectorMgr != nil {
+		if err := s.vectorMgr.Save(); err != nil {
+			slog.Warn("vector: final save failed", "error", err)
+		}
+	}
 	if s.rebalancer != nil {
 		s.rebalancer.Stop()
 	}
@@ -1839,6 +1959,11 @@ func (s *Server) Close() {
 	}
 	if s.lambdaMgr != nil {
 		s.lambdaMgr.Stop()
+	}
+	// Stopping the dispatcher closes the notification backends. It was never
+	// called, so the Kafka writer's buffered messages were lost on shutdown.
+	if s.notifyDisp != nil {
+		s.notifyDisp.Stop()
 	}
 	if s.rateLimiter != nil {
 		s.rateLimiter.Stop()

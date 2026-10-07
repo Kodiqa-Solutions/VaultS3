@@ -110,7 +110,7 @@ What is planned, and what has already shipped.
 - [x] ListBuckets with prefix filter
 - [x] Versioning suspend support
 - [x] GetObject by part number (?partNumber=N)
-- [x] Advanced lifecycle rules (NoncurrentVersionExpiration, AbortIncompleteMultipartUpload, MaxNoncurrentVersions, ExpiredObjectDeleteMarker cleanup, object size filter)
+- [ ] Advanced lifecycle rules (NoncurrentVersionExpiration, MaxNoncurrentVersions, ExpiredObjectDeleteMarker cleanup, tag and size filters, several rules per bucket): the worker has code for them, but the S3 API never stored them and refuses them since 5.0.0
 - [x] IAM policy conditions (StringEquals, StringLike, IpAddress, DateLessThan)
 - [x] Policy variables (${aws:username}, ${aws:userid})
 - [ ] LDAP authentication with group mapping
@@ -124,8 +124,8 @@ What is planned, and what has already shipped.
 - [x] Existing object replication
 - [x] Delete marker replication
 - [x] Site replication (IAM + bucket config sync)
-- [x] KMS integration (HashiCorp Vault + local key provider)
-- [x] Remote tiering (S3-compatible cold tier)
+- [x] KMS integration (local key provider, the HashiCorp Vault provider does not work yet)
+- [ ] Remote tiering (S3-compatible cold tier): code exists, not wired in
 - [x] RestoreObject API (POST /{bucket}/{key}?restore)
 - [x] Storage classes (STANDARD, REDUCED_REDUNDANCY)
 - [x] Compression exclusions (skip already-compressed file types)
@@ -135,20 +135,20 @@ What is planned, and what has already shipped.
 - [x] Health diagnostics (/api/v1/diagnostics)
 - [x] Manual heal API (POST /api/v1/heal)
 - [x] Speedtest (POST /api/v1/speedtest)
-- [x] Batch operations processor (bulk delete/copy)
+- [ ] Batch operations processor (bulk delete/copy): code exists, no API route
 - [x] PROXY protocol v1 support
-- [x] Auto-TLS (Let's Encrypt + self-signed fallback)
+- [ ] Auto-TLS (Let's Encrypt + self-signed fallback): code exists, no configuration reads it
 - [x] Inter-node network separation
-- [x] Bucket bandwidth throttling
+- [ ] Bucket bandwidth throttling: code exists, not wired in
 - [x] S3 Select on compressed files (GZIP, BZIP2)
 - [x] S3 POST policy (HTML form-based upload)
-- [x] S3 Inventory reports (periodic CSV)
+- [ ] S3 Inventory reports (periodic CSV): code exists, no API route
 - [x] Snowball/TAR bulk upload
 - [x] FIFO quota (delete oldest objects when quota exceeded)
 - [x] AMQP/RabbitMQ notification backend (amqp091-go client with lazy connection and topic exchange)
 - [x] PostgreSQL notification backend (lib/pq driver, auto-create table, JSONB storage)
 - [x] Elasticsearch notification backend
-- [x] SSE-KMS encryption (HashiCorp Vault Transit engine + local key provider, key rotation, per-object AES-256-GCM)
+- [x] SSE-KMS encryption (local key provider, the Vault Transit provider does not work yet, key rotation, per-object AES-256-GCM)
 - [x] S3 Select on Parquet files (parquet-go, row group iteration, columnar to record conversion)
 - [x] Integration test suite (26 end-to-end tests with real SigV4 signing, filesystem storage, BoltDB metadata)
 - [x] Race detection in CI (`go test -race`)

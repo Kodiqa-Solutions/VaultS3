@@ -54,6 +54,17 @@ func (h *APIHandler) handleReencrypt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	apply := r.URL.Query().Get("apply") == "true"
+	// One rewriting run at a time. Two used to rewrite the same objects at once,
+	// each reading a legacy object while the other replaced it, and each paying
+	// the full in-memory cost of a legacy read. A report-only run changes
+	// nothing and is not held back.
+	if apply {
+		if !h.reencryptRunning.CompareAndSwap(false, true) {
+			writeError(w, http.StatusConflict, "a reencrypt with apply=true is already running, try again when it finishes")
+			return
+		}
+		defer h.reencryptRunning.Store(false)
+	}
 	onlyBucket := r.URL.Query().Get("bucket")
 	start := time.Now()
 	rep := reencryptReport{DryRun: !apply, ByBucket: map[string]int{}}

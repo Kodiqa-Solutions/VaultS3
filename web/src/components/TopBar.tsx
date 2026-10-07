@@ -1,4 +1,5 @@
 import { useAuth } from '../hooks/useAuth'
+import { sessionLabel } from '../api/auth'
 import { useTheme } from '../hooks/useTheme'
 import { useI18n, LOCALES } from '../i18n'
 
@@ -55,7 +56,7 @@ export default function TopBar({ onMenuToggle }: Props) {
           ))}
         </select>
         <span className="text-sm text-gray-600 dark:text-gray-400 hidden sm:inline">
-          {user?.accessKey}
+          {sessionLabel(user)}
         </span>
         <button
           onClick={logout}

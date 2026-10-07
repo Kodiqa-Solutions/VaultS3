@@ -15,7 +15,7 @@ VaultS3 is designed with security in mind:
 - **SSRF prevention**: webhook, lambda, and notification URLs blocked from targeting localhost, private IPs, and cloud metadata endpoints
 - **Upload size limits**: 5GB per PUT (S3 spec), enforced with `http.MaxBytesReader`
 - **Rate limiting**: per-IP and per-access-key token bucket, **on by default** (2000 req/s, 4000 burst), using `RemoteAddr` (not spoofable via `X-Forwarded-For`). The ceiling sits far above real client traffic so it bounds a flood without throttling legitimate use. Because the per-IP bucket keys on the connection address, every client behind a reverse proxy or ingress shares one bucket: raise `requests_per_sec` in that setup rather than lowering it
-- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault / local key) modes
+- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (local key provider, the HashiCorp Vault provider does not work yet) modes
 - **IAM with default-deny**: policy evaluation engine with wildcard matching
 - **Security headers**: CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 - **Non-root Docker**: container runs as `vaults3` user (UID 1000)
@@ -51,12 +51,10 @@ VaultS3 is designed with security in mind:
 - **FUSE cache size caps**: Signature cache, HEAD cache, and LIST cache bounded to prevent unbounded memory growth
 - **GetObjectAttributes version support**: Respects `versionId` parameter and handles delete markers
 - **External authorization webhook**: Delegate the access decision to an HTTP endpoint. Deny-only by default, fail-closed by default, admin exempt so a broken endpoint cannot lock the operator out
-- **KMS envelope encryption**: HashiCorp Vault and local key provider for data encryption key management
-- **Auto-TLS**: Automatic Let's Encrypt certificate provisioning with self-signed fallback
+- **KMS envelope encryption**: local key provider for data encryption key management (the HashiCorp Vault provider does not work yet)
 - **PROXY protocol v1**: Real client IP extraction behind PROXY protocol-aware load balancers
 - **Governance bypass protection**: `x-amz-bypass-governance-retention` restricted to authorized principals
 - **IAM policy conditions**: `StringEquals`, `StringLike`, `IpAddress`, `DateLessThan` condition evaluation
-- **Bucket bandwidth throttling**: Per-bucket upload/download rate limits prevent resource monopolization
 - **POST policy validation**: HTML form upload policies validated for expiration, conditions, and signature
 - **Content-MD5 validation**: Server-side integrity verification on PUT rejects corrupted uploads
 - **S3 Checksum API**: CRC32, CRC32C, SHA1, SHA256 checksums verified on upload and returned on download

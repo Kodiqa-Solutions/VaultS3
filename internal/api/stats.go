@@ -54,11 +54,23 @@ type statsResponse struct {
 	BytesOut         int64               `json:"bytesOut"`
 }
 
-func (h *APIHandler) handleStats(w http.ResponseWriter, _ *http.Request) {
+func (h *APIHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 	buckets, err := h.store.ListBuckets()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to get stats")
 		return
+	}
+	// A non-admin sees the buckets they may list and nothing else. This route
+	// used to return every bucket's name, size and quota to any session, which
+	// undid the filtering the bucket list applies.
+	if visible := h.visibleBucketSet(r, buckets); visible != nil {
+		kept := buckets[:0:0]
+		for _, b := range buckets {
+			if visible[b.Name] {
+				kept = append(kept, b)
+			}
+		}
+		buckets = kept
 	}
 
 	var totalSize, totalObjects int64

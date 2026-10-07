@@ -52,8 +52,7 @@ func (h *APIHandler) handleGeneratePresign(w http.ResponseWriter, r *http.Reques
 
 	// Use admin credentials for presigned URLs. The presigned URL is already
 	// scoped to a specific bucket/key and time-limited by the signature.
-	presignAccessKey := h.cfg.Auth.AdminAccessKey
-	presignSecretKey := h.cfg.Auth.AdminSecretKey
+	presignAccessKey, presignSecretKey := h.adminCredentials()
 
 	var presignedURL string
 	method := req.Method

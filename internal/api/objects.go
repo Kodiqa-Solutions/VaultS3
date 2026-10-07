@@ -2,11 +2,14 @@ package api
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -245,43 +248,142 @@ func (h *APIHandler) handleDeleteObject(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if err := h.consoleDeleteObject(bucket, key); err != nil {
+		writeError(w, deleteErrorStatus(err), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Why a console delete did not happen. The status each maps to is what the
+// single delete answers, and the message is what the bulk delete reports for
+// the key.
+var (
+	errObjectNotFound = errors.New("not found")
+)
+
+// deleteLockedError means object lock refused the delete.
+type deleteLockedError struct{ reason string }
+
+func (e *deleteLockedError) Error() string { return "refused: " + e.reason }
+
+// deleteNotRecordedError means a metadata write failed, so the delete must be
+// reported as NOT done even if bytes are already gone: metadata is
+// authoritative (issue #34).
+type deleteNotRecordedError struct {
+	op  string
+	err error
+}
+
+func (e *deleteNotRecordedError) Error() string { return e.op + " failed: " + e.err.Error() }
+func (e *deleteNotRecordedError) Unwrap() error { return e.err }
+
+func deleteErrorStatus(err error) int {
+	var locked *deleteLockedError
+	switch {
+	case errors.Is(err, errObjectNotFound):
+		return http.StatusNotFound
+	case errors.As(err, &locked):
+		return http.StatusForbidden
+	}
+	return http.StatusInternalServerError
+}
+
+// consoleDeleteObject deletes one key the way the S3 DeleteObject does with no
+// version id named, and is the only delete the dashboard performs, so the
+// single and the bulk delete cannot drift apart again. The bulk delete used to
+// remove the plain file and the metadata outright: on a versioned bucket that
+// destroyed the object instead of writing a delete marker, and it ignored
+// legal hold and retention altogether.
+//
+// On a versioned bucket a delete marker is written and nothing is destroyed,
+// which is also why object lock does not apply there, as on S3. Otherwise the
+// data goes, after the lock is checked.
+func (h *APIHandler) consoleDeleteObject(bucket, key string) error {
 	meta, err := h.store.GetObjectMeta(bucket, key)
 	if err != nil || meta == nil || meta.DeleteMarker {
-		writeError(w, http.StatusNotFound, "object not found")
-		return
+		return errObjectNotFound
+	}
+	versioning, _ := h.store.GetBucketVersioning(bucket)
+	if versioning == "Enabled" || meta.VersionID != "" {
+		return h.writeConsoleDeleteMarker(bucket, key, meta)
 	}
 
-	if versioning, _ := h.store.GetBucketVersioning(bucket); versioning == "Enabled" || meta.VersionID != "" {
-		// Versioned bucket: write a delete marker instead of erasing data. The
-		// object disappears from listings but its versions are kept, so it stays
-		// snapshot/restore-able (S3 versioned-delete semantics).
-		old := *meta
-		old.IsLatest = false
-		h.store.PutObjectVersion(old)
-
-		dm := metadata.ObjectMeta{
-			Bucket: bucket, Key: key, VersionID: genVersionID(),
-			DeleteMarker: true, IsLatest: true, LastModified: time.Now().UTC().Unix(),
-		}
-		h.store.PutObjectVersion(dm)
-		h.store.PutObjectMeta(dm)
-		if h.onReplication != nil {
-			h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", dm.VersionID)
-		}
-		w.WriteHeader(http.StatusNoContent)
-		return
+	if reason := objectLockReason(meta); reason != "" {
+		return &deleteLockedError{reason: reason}
 	}
-
-	// Non-versioned: hard delete.
-	if err := h.engine.DeleteObject(bucket, key); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to delete object")
-		return
+	if err := h.engine.DeleteObject(bucket, key); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("delete data: %w", err)
 	}
-	h.store.DeleteObjectMeta(bucket, key)
+	if err := h.store.DeleteObjectMeta(bucket, key); err != nil {
+		return &deleteNotRecordedError{op: "DeleteObjectMeta", err: err}
+	}
 	if h.onReplication != nil {
 		h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", "")
 	}
-	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// writeConsoleDeleteMarker hides the object behind a delete marker and keeps
+// every version. Each write is checked: these used to be discarded, so a
+// failed marker reported success while the object stayed listed.
+func (h *APIHandler) writeConsoleDeleteMarker(bucket, key string, current *metadata.ObjectMeta) error {
+	if err := h.demoteLatest(current); err != nil {
+		return &deleteNotRecordedError{op: "demote previous version", err: err}
+	}
+	dm := metadata.ObjectMeta{
+		Bucket: bucket, Key: key, VersionID: genVersionID(),
+		DeleteMarker: true, IsLatest: true, LastModified: time.Now().UTC().Unix(),
+	}
+	if err := h.store.PutObjectVersion(dm); err != nil {
+		return &deleteNotRecordedError{op: "write delete marker", err: err}
+	}
+	if err := h.store.PutObjectMeta(dm); err != nil {
+		return &deleteNotRecordedError{op: "write delete marker", err: err}
+	}
+	if h.onReplication != nil {
+		h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", dm.VersionID)
+	}
+	return nil
+}
+
+// demoteLatest records the current latest object as a non-latest version
+// before something replaces it. An object written before its bucket was
+// versioned carries no version id, and it used to be skipped here, so the new
+// latest pointer overwrote the only record naming it and its bytes became an
+// orphan for the reclaim scan to delete. It is adopted as the "null" version
+// instead, the way the S3 delete path does, and its bytes stay at the plain
+// object path where getVersionData looks for them.
+func (h *APIHandler) demoteLatest(current *metadata.ObjectMeta) error {
+	if current == nil {
+		return nil
+	}
+	old := *current
+	if old.VersionID == "" {
+		if old.DeleteMarker {
+			return nil
+		}
+		old.VersionID = nullVersionID
+	}
+	old.IsLatest = false
+	return h.store.PutObjectVersion(old)
+}
+
+// nullVersionID is the version id S3 gives an object stored before its bucket
+// was versioned. Its bytes live at the plain object path, not under .vs/.
+const nullVersionID = "null"
+
+// objectLockReason says why object lock forbids destroying a version, or ""
+// when nothing does. It mirrors the S3 path's check.
+func objectLockReason(meta *metadata.ObjectMeta) string {
+	if meta.LegalHold {
+		return "object is under legal hold"
+	}
+	if meta.RetentionMode != "" && meta.RetentionUntil > 0 && time.Now().UTC().Unix() < meta.RetentionUntil {
+		return fmt.Sprintf("object is under %s retention until %s", meta.RetentionMode,
+			time.Unix(meta.RetentionUntil, 0).UTC().Format(time.RFC3339))
+	}
+	return ""
 }
 
 // getLatestObject returns a reader for an object's current content, resolving the
@@ -289,12 +391,29 @@ func (h *APIHandler) handleDeleteObject(w http.ResponseWriter, r *http.Request, 
 // at the plain key path).
 func (h *APIHandler) getLatestObject(bucket, key string) (io.ReadCloser, int64, *metadata.ObjectMeta, error) {
 	meta, _ := h.store.GetObjectMeta(bucket, key)
-	if meta != nil && meta.VersionID != "" {
-		r, sz, err := h.engine.GetObjectVersion(bucket, key, meta.VersionID)
-		return r, sz, meta, err
+	if meta != nil && meta.DeleteMarker {
+		return nil, 0, meta, errObjectNotFound
 	}
-	r, sz, err := h.engine.GetObject(bucket, key)
+	versionID := ""
+	if meta != nil {
+		versionID = meta.VersionID
+	}
+	r, sz, err := h.getVersionData(bucket, key, versionID)
 	return r, sz, meta, err
+}
+
+// getVersionData opens the bytes of one version. The "null" version names an
+// object stored before its bucket was versioned, whose bytes are at the plain
+// object path rather than under .vs/, so a lookup as a version finds nothing.
+func (h *APIHandler) getVersionData(bucket, key, versionID string) (io.ReadCloser, int64, error) {
+	if versionID == "" {
+		return h.engine.GetObject(bucket, key)
+	}
+	r, sz, err := h.engine.GetObjectVersion(bucket, key, versionID)
+	if err != nil && versionID == nullVersionID {
+		return h.engine.GetObject(bucket, key)
+	}
+	return r, sz, err
 }
 
 func (h *APIHandler) handleDownload(w http.ResponseWriter, r *http.Request, bucket, key string) {
@@ -354,8 +473,9 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 
 	prefix := r.URL.Query().Get("prefix")
 	versioning, _ := h.store.GetBucketVersioning(bucket)
+	user, _ := h.authenticateUser(r)
 	var results []uploadResult
-	var anyFailed bool
+	var anyFailed, anyDenied bool
 
 	// fail records a per-file failure: it logs the real reason (uploads used to
 	// swallow write errors silently and still return 200, so a full disk or a
@@ -394,6 +514,17 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 		key := prefix + filename
 		if err := validateObjectKey(key); err != nil {
 			part.Close()
+			continue
+		}
+
+		// The route gate checked PutObject on the bucket wildcard, which a Deny
+		// on one prefix does not touch, so a user allowed b/* but denied
+		// b/secret/* could still write under secret/. Each file is checked under
+		// its own key, prefix included.
+		if err := h.authorizeConsoleAction(r, user, consoleAction{action: "s3:PutObject", bucket: bucket, key: key}); err != nil {
+			part.Close()
+			results = append(results, uploadResult{Key: key, Error: err.Error()})
+			anyDenied = true
 			continue
 		}
 
@@ -439,16 +570,20 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 				fail(key, err)
 				continue
 			}
-			if old, e := h.store.GetObjectMeta(bucket, key); e == nil && old.VersionID != "" {
-				old.IsLatest = false
-				h.store.PutObjectVersion(*old)
-			}
 			meta := metadata.ObjectMeta{
 				Bucket: bucket, Key: key, ContentType: ct, ETag: etag, Size: written,
 				LastModified: now, VersionID: versionID, IsLatest: true,
 			}
-			h.store.PutObjectVersion(meta)
-			h.store.PutObjectMeta(meta)
+			if err := h.recordNewLatestVersion(meta); err != nil {
+				// The metadata writes used to be discarded and the file reported
+				// stored. Bytes with no record are an orphan, which the reclaim
+				// scan later deletes, so the upload is undone and reported failed.
+				if derr := h.engine.DeleteObjectVersion(bucket, key, versionID); derr != nil {
+					slog.Warn("could not remove the bytes of an upload whose metadata failed", "bucket", bucket, "key", key, "error", derr)
+				}
+				fail(key, err)
+				continue
+			}
 			if h.onReplication != nil {
 				h.onReplication("s3:ObjectCreated:Put", bucket, key, written, etag, versionID)
 			}
@@ -459,9 +594,19 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 				fail(key, err)
 				continue
 			}
-			h.store.PutObjectMeta(metadata.ObjectMeta{
+			if err := h.store.PutObjectMeta(metadata.ObjectMeta{
 				Bucket: bucket, Key: key, ContentType: ct, ETag: etag, Size: written, LastModified: now,
-			})
+			}); err != nil {
+				// The plain path may have held an older object whose bytes are now
+				// overwritten, so they cannot be restored. Removing the new bytes
+				// at least keeps an object with no record from lingering, and the
+				// failure is reported instead of a success.
+				if derr := h.engine.DeleteObject(bucket, key); derr != nil {
+					slog.Warn("could not remove the bytes of an upload whose metadata failed", "bucket", bucket, "key", key, "error", derr)
+				}
+				fail(key, fmt.Errorf("record metadata: %w", err))
+				continue
+			}
 			if h.onReplication != nil {
 				h.onReplication("s3:ObjectCreated:Put", bucket, key, written, etag, "")
 			}
@@ -479,12 +624,49 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 	}
 	// If any file failed to store, return 5xx so the dashboard shows a real failure
 	// instead of a silent "success". Per-file reasons ride along in the results
-	// (each failed entry carries an `error`), and were already logged above.
+	// (each failed entry carries an `error`), and were already logged above. A
+	// file refused by policy alone answers 403.
 	status := http.StatusOK
-	if anyFailed {
+	switch {
+	case anyFailed:
 		status = http.StatusInternalServerError
+	case anyDenied:
+		status = http.StatusForbidden
 	}
 	writeJSON(w, status, results)
+}
+
+// recordNewLatestVersion writes the metadata of a freshly written version and
+// makes it the latest. The previous latest is demoted first, so two versions
+// never both claim to be latest. A failure after the demotion puts the previous
+// latest back, so the object keeps answering with its old content.
+func (h *APIHandler) recordNewLatestVersion(meta metadata.ObjectMeta) error {
+	current, _ := h.store.GetObjectMeta(meta.Bucket, meta.Key)
+	if err := h.demoteLatest(current); err != nil {
+		return fmt.Errorf("demote previous version: %w", err)
+	}
+	restore := func() {
+		if current == nil || current.VersionID == "" {
+			return
+		}
+		prev := *current
+		prev.IsLatest = true
+		if err := h.store.PutObjectVersion(prev); err != nil {
+			slog.Warn("could not restore the previous latest version", "bucket", meta.Bucket, "key", meta.Key, "error", err)
+		}
+	}
+	if err := h.store.PutObjectVersion(meta); err != nil {
+		restore()
+		return fmt.Errorf("record version: %w", err)
+	}
+	if err := h.store.PutObjectMeta(meta); err != nil {
+		restore()
+		if derr := h.store.DeleteObjectVersion(meta.Bucket, meta.Key, meta.VersionID); derr != nil {
+			slog.Warn("could not remove the record of a version whose latest pointer failed", "bucket", meta.Bucket, "key", meta.Key, "error", derr)
+		}
+		return fmt.Errorf("record latest pointer: %w", err)
+	}
+	return nil
 }
 
 // handleBulkDelete deletes multiple objects at once.
@@ -516,19 +698,32 @@ func (h *APIHandler) handleBulkDelete(w http.ResponseWriter, r *http.Request, bu
 		Error   string `json:"error,omitempty"`
 	}
 	var results []deleteResult
+	user, _ := h.authenticateUser(r)
 
 	for _, key := range req.Keys {
-		if !h.engine.ObjectExists(bucket, key) {
-			results = append(results, deleteResult{Key: key, Error: "not found"})
-			continue
-		}
-		if err := h.engine.DeleteObject(bucket, key); err != nil {
+		// The route gate checked DeleteObject on the bucket wildcard only, so a
+		// Deny on a prefix inside the bucket never applied here.
+		if err := h.authorizeConsoleAction(r, user, consoleAction{action: "s3:DeleteObject", bucket: bucket, key: key}); err != nil {
 			results = append(results, deleteResult{Key: key, Error: err.Error()})
 			continue
 		}
-		h.store.DeleteObjectMeta(bucket, key)
-		if h.onReplication != nil {
-			h.onReplication("s3:ObjectRemoved:Delete", bucket, key, 0, "", "")
+		// In a cluster the object's data lives on the node that owns it, and the
+		// single delete has always been sent there. The bulk delete removed only
+		// what this node held.
+		if handled, status, msg := h.proxyConsoleRequest(r, http.MethodDelete, bucket, "objects", key, nil); handled {
+			switch {
+			case status == http.StatusNoContent || status == http.StatusOK:
+				results = append(results, deleteResult{Key: key, Deleted: true})
+			case status == http.StatusNotFound:
+				results = append(results, deleteResult{Key: key, Error: errObjectNotFound.Error()})
+			default:
+				results = append(results, deleteResult{Key: key, Error: fmt.Sprintf("owner node answered %d: %s", status, msg)})
+			}
+			continue
+		}
+		if err := h.consoleDeleteObject(bucket, key); err != nil {
+			results = append(results, deleteResult{Key: key, Error: err.Error()})
+			continue
 		}
 		results = append(results, deleteResult{Key: key, Deleted: true})
 	}
@@ -536,23 +731,143 @@ func (h *APIHandler) handleBulkDelete(w http.ResponseWriter, r *http.Request, bu
 	writeJSON(w, http.StatusOK, results)
 }
 
+// proxyConsoleRequest sends one per-object console request for a bulk route to
+// the node that owns the object, with the caller's own session, so the owner
+// authorizes it exactly as if the caller had asked it directly. It reports
+// whether the request was handled elsewhere. When body is non-nil the owner's
+// response body is streamed into it as it arrives, otherwise up to 1 KiB of it
+// comes back as msg.
+func (h *APIHandler) proxyConsoleRequest(r *http.Request, method, bucket, sub, key string, body *zipEntryWriter) (handled bool, status int, msg string) {
+	if h.clusterProxy == nil {
+		return false, 0, ""
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, "/", nil)
+	if err != nil {
+		return false, 0, ""
+	}
+	req.URL.Path = "/api/v1/buckets/" + bucket + "/" + sub + "/" + key
+	req.Host = r.Host
+	req.RemoteAddr = r.RemoteAddr
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	} else if tok := r.URL.Query().Get("token"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if body != nil {
+		if !h.clusterProxy(body, req, bucket, key) {
+			return false, 0, ""
+		}
+		return true, body.statusCode(), body.errorText()
+	}
+	rec := httptest.NewRecorder()
+	if !h.clusterProxy(rec, req, bucket, key) {
+		return false, 0, ""
+	}
+	text := rec.Body.String()
+	if len(text) > 1024 {
+		text = text[:1024]
+	}
+	return true, rec.Code, strings.TrimSpace(text)
+}
+
+// zipEntryWriter receives one proxied download and streams it into the
+// archive. The entry is created only once the owner answers 200, so a failed
+// read leaves no empty file in the zip, and the start of an error answer is
+// kept to explain the failure.
+type zipEntryWriter struct {
+	zw     *zip.Writer
+	name   string
+	header http.Header
+	code   int
+	entry  io.Writer
+	errBuf []byte
+	err    error
+}
+
+func (z *zipEntryWriter) Header() http.Header {
+	if z.header == nil {
+		z.header = http.Header{}
+	}
+	return z.header
+}
+
+func (z *zipEntryWriter) WriteHeader(code int) {
+	if z.code != 0 {
+		return
+	}
+	z.code = code
+	if code == http.StatusOK {
+		z.entry, z.err = z.zw.Create(z.name)
+	}
+}
+
+func (z *zipEntryWriter) Write(p []byte) (int, error) {
+	if z.code == 0 {
+		z.WriteHeader(http.StatusOK)
+	}
+	if z.code != http.StatusOK {
+		if room := 1024 - len(z.errBuf); room > 0 {
+			if len(p) < room {
+				room = len(p)
+			}
+			z.errBuf = append(z.errBuf, p[:room]...)
+		}
+		return len(p), nil
+	}
+	if z.err != nil {
+		return 0, z.err
+	}
+	n, err := z.entry.Write(p)
+	if err != nil {
+		z.err = err
+	}
+	return n, err
+}
+
+func (z *zipEntryWriter) statusCode() int {
+	if z.code == 0 {
+		return http.StatusOK
+	}
+	return z.code
+}
+
+func (z *zipEntryWriter) errorText() string {
+	if z.err != nil {
+		return z.err.Error()
+	}
+	return strings.TrimSpace(string(z.errBuf))
+}
+
+// zipErrorsName is the archive entry that lists what could not be included.
+const zipErrorsName = "errors.txt"
+
 // handleDownloadZip streams multiple objects as a zip archive.
+//
+// Keys come from repeated ?key= parameters, or from ?keys= joined with commas,
+// which cannot carry a key that itself contains a comma. Every key that could
+// not be included is listed with its reason in an errors.txt entry. The archive
+// used to skip such keys in silence and still answer 200, so a download that
+// was missing files looked complete, which on a cluster was every key held by
+// another node.
 func (h *APIHandler) handleDownloadZip(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.store.BucketExists(bucket) {
 		writeError(w, http.StatusNotFound, "bucket not found")
 		return
 	}
 
-	keysParam := r.URL.Query().Get("keys")
-	if keysParam == "" {
+	keys := r.URL.Query()["key"]
+	if keysParam := r.URL.Query().Get("keys"); keysParam != "" {
+		keys = append(keys, strings.Split(keysParam, ",")...)
+	}
+	if len(keys) == 0 {
 		writeError(w, http.StatusBadRequest, "no keys provided")
 		return
 	}
-	keys := strings.Split(keysParam, ",")
 	if len(keys) > 1000 {
 		writeError(w, http.StatusBadRequest, "max 1000 keys per request")
 		return
 	}
+	user, _ := h.authenticateUser(r)
 
 	// Sanitize bucket name for Content-Disposition header
 	safeBucket := strings.Map(func(r rune) rune {
@@ -567,21 +882,59 @@ func (h *APIHandler) handleDownloadZip(w http.ResponseWriter, r *http.Request, b
 	zw := zip.NewWriter(w)
 	defer zw.Close()
 
+	var skipped []string
+	skip := func(key, reason string) {
+		skipped = append(skipped, key+": "+reason)
+	}
+	seen := make(map[string]bool, len(keys))
 	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		// Validate key to prevent zip slip
 		if err := validateObjectKey(key); err != nil {
+			skip(key, err.Error())
+			continue
+		}
+		if key == zipErrorsName {
+			skip(key, "the name is reserved for this list")
+			continue
+		}
+		// The route gate checked GetObject on the bucket wildcard only.
+		if err := h.authorizeConsoleAction(r, user, consoleAction{action: "s3:GetObject", bucket: bucket, key: key}); err != nil {
+			skip(key, err.Error())
+			continue
+		}
+		entry := &zipEntryWriter{zw: zw, name: key}
+		if handled, status, msg := h.proxyConsoleRequest(r, http.MethodGet, bucket, "download", key, entry); handled {
+			if status != http.StatusOK || entry.err != nil {
+				skip(key, fmt.Sprintf("owner node answered %d: %s", status, msg))
+			}
 			continue
 		}
 		reader, _, _, err := h.getLatestObject(bucket, key)
 		if err != nil {
+			skip(key, "not found or unreadable on this node: "+err.Error())
 			continue
 		}
 		fw, err := zw.Create(key)
 		if err != nil {
 			reader.Close()
+			skip(key, err.Error())
 			continue
 		}
-		io.Copy(fw, reader)
+		if _, err := io.Copy(fw, reader); err != nil {
+			skip(key, "read failed part way, the entry is incomplete: "+err.Error())
+		}
 		reader.Close()
+	}
+	if len(skipped) > 0 {
+		if fw, err := zw.Create(zipErrorsName); err == nil {
+			fmt.Fprintf(fw, "%d of the requested objects are missing from this archive:\n", len(skipped))
+			for _, line := range skipped {
+				fmt.Fprintln(fw, line)
+			}
+		}
 	}
 }

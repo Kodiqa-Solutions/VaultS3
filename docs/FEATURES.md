@@ -11,7 +11,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Low memory**: a small single-node deploy idles at about **17 MiB**, measured against MinIO's 184 MiB and Garage's 23 MiB on the same host (see the [comparison table](../README.md#why-vaults3)). A clustered node under sustained large-object load costs more, because it also forwards bodies to the owner and fans replicas out to peers, so size cluster pods from your own measurement, see the [benchmarks guide](BENCHMARKS.md)
 - **BoltDB metadata**: Embedded key-value store, no external database needed
 - **S3 Signature V4**: Standard AWS authentication
-- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (HashiCorp Vault or local key provider) encryption modes. Objects are sealed in 1 MiB chunks, so encrypted reads stream and cost a chunk of memory rather than a copy of the object
+- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (local key provider, the HashiCorp Vault provider does not work yet) encryption modes. Objects are sealed in 1 MiB chunks, so encrypted reads stream and cost a chunk of memory rather than a copy of the object
 - **Migrating older encrypted objects**: objects written before 4.4.53 were sealed as one AES-GCM message, which cannot be streamed on read because the authentication tag covers the whole object, so each read costs its own size in latency and memory. `vaults3-cli storage reencrypt` reports how many are affected and rewrites them in the current chunked format with `--apply`. Key rotation does not do this, it mints a new key version without touching object bodies
 - **Per-bucket encryption keys**: For bucket-per-tenant setups, each bucket can be encrypted with its own key that is **not shared** with other tenants (or opt out and stay plaintext). Envelope encryption (master KEK wraps a per-bucket data key). Opt in per bucket via `PUT /{bucket}?encryption` or the dashboard. Supports key rotation and crypto-shredding. Enable with `encryption.per_bucket: true`, see [design doc](design/per-bucket-encryption.md)
 - **SSE-C (customer-provided keys)**: Operator-blind per-object encryption: the client supplies the key per request (`x-amz-server-side-encryption-customer-*`). The server encrypts/decrypts with it in the same chunked streaming format as SSE-S3, so Range reads decrypt a chunk at a time, and stores only the key's MD5, never the key
@@ -57,7 +57,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Raft clustering**: Multi-node cluster with Hashicorp Raft consensus for strongly consistent distributed metadata, automatic leader election, and node join/leave via HTTP API. Optionally shards the object metadata across independent Raft groups (`cluster.metadata_shards`) so metadata capacity grows with the cluster instead of every node holding a copy of the whole index. See [docs/design/sharded-metadata.md](design/sharded-metadata.md)
 - **Consistent hashing**: xxhash64-based hash ring with virtual nodes for automatic data placement and request routing across cluster nodes via reverse proxy. A read whose data has not yet been copied to the node serving it is fetched from a holder that has it, so a `GET` never reports "not found" for an object that was just written, and a hop that fails before any response reaches the client is retried against the object's other holders instead of surfacing as a gateway error
 - **Erasure coding**: Reed-Solomon encoding (configurable data/parity shards) for disk-failure protection with background healer that auto-reconstructs degraded objects. Reads **and writes stream**, so neither holds the object in memory: a GET's time-to-first-byte stays flat regardless of object size, and a PUT costs a fixed number of stripe buffers rather than the object plus its parity, which is what makes large uploads at high concurrency safe. A degraded read, where a shard is actually missing, streams too: parity recovery runs one aligned stripe at a time rather than rebuilding the whole object first, so first-byte cost stays constant and a degraded read does not hold the object in memory. **Settable per bucket** alongside replica count (`vaults3-cli bucket durability`), so scratch data can be stored once while the buckets that matter keep their parity and copies: on a 3-node cluster with 4+2 coding and 3 replicas, the same data costs 4.52x with the defaults and 1.00x with both turned off
-- **High availability**: Automatic failure detection (health probes with suspect/down state machine), failover proxy routing to healthy replicas, and background rebalancer for membership changes. **Replica repair** restores a bucket's replica count after a node is lost for good: copies are placed when an object is written, and rebalance does not re-make them because it only moves objects whose owner changed, so without it an object that simply lost a copy stayed short of its replica count. A node that cannot be reached is never counted as a node that lost its copy, so a brief partition does not start a copy storm, and an object no node still holds is reported rather than quietly dropped (`vaults3-cli cluster repair --status`). Inter-node traffic shares a pooled HTTP transport (connection reuse instead of a new socket per call), and a node that genuinely cannot serve a request answers `503 SlowDown` with an S3 error document, which every mainstream SDK retries on its own
+- **High availability**: Automatic failure detection (health probes with suspect/down state machine), failover proxy routing to healthy replicas. **Replica repair** restores a bucket's replica count after a node is lost for good: copies are placed when an object is written, and repair re-makes any that a lost or new member is missing. A node that cannot be reached is never counted as a node that lost its copy, so a brief partition does not start a copy storm, and an object no node still holds is reported rather than quietly dropped (`vaults3-cli cluster repair --status`). Inter-node traffic shares a pooled HTTP transport (connection reuse instead of a new socket per call), and a node that genuinely cannot serve a request answers `503 SlowDown` with an S3 error document, which every mainstream SDK retries on its own
 - **Scalable listing**: Object listing is served from the sorted BoltDB metadata index (seek to the page, `O(log n + page_size)`), so `ListObjectsV2` page latency stays flat (~0.7 ms per 1000-key page) whether a prefix holds a thousand or **a hundred million** objects (measured, not extrapolated), no full-bucket scan
   - 📖 See the **[Scaling & Operations Guide](SCALING.md)** for multi-disk erasure coding, multi-node cluster setup, large-prefix listing, and lost-disk / lost-server recovery runbooks
 - **Active-active replication**: Bidirectional site-to-site sync with vector clocks for causal ordering, pluggable conflict resolution (last-writer-wins, largest-object, site-preference), and change log for efficient delta sync
@@ -111,12 +111,8 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **ListBuckets with prefix filter**: Filter bucket listing by name prefix
 - **Versioning suspend**: Suspend versioning on a bucket while preserving existing versions
 - **GetObject by part number**: `?partNumber=N` to retrieve individual parts of multipart objects
-- **Multiple lifecycle rules**: Multiple rules per bucket with prefix, tag, and size filters
-- **NoncurrentVersionExpiration**: Auto-expire non-current object versions after N days
 - **AbortIncompleteMultipartUpload**: Auto-cleanup stale multipart uploads after N days
-- **MaxNoncurrentVersions**: Cap retained non-current versions per object
-- **ExpiredObjectDeleteMarker cleanup**: Remove orphaned delete markers automatically
-- **Object size filter**: Lifecycle rules with `ObjectSizeGreaterThan` / `ObjectSizeLessThan` conditions
+- **Lifecycle limits**: one rule per bucket, filtered by prefix only. Tag and size filters, several rules, NoncurrentVersionExpiration, transitions and ExpiredObjectDeleteMarker are refused with 501 NotImplemented rather than stored, see docs/DATA-MANAGEMENT.md
 - **IAM policy conditions**: `StringEquals`, `StringLike`, `IpAddress`, `DateLessThan` condition operators
 - **Policy variables**: `${aws:username}`, `${aws:userid}` substitution in policy resources
 - **External authorization webhook**: Delegate the access decision to an HTTP endpoint you run. Deny-only by default so it can narrow IAM but not widen it, fail-closed, with a decision cache
@@ -128,8 +124,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Existing object replication**: Replicate pre-existing objects when enabling replication rules
 - **Delete marker replication**: Optionally replicate delete markers to target buckets
 - **Site replication**: IAM and bucket configuration sync across sites
-- **KMS integration**: HashiCorp Vault and local key provider for envelope encryption
-- **Remote tiering**: Tier cold objects to an S3-compatible remote backend
+- **KMS integration**: local key provider for envelope encryption. The HashiCorp Vault provider does not work yet, see docs/CONFIGURATION.md
 - **RestoreObject API**: `POST /{bucket}/{key}?restore` to initiate restore from cold tier
 - **Storage classes**: STANDARD and REDUCED_REDUNDANCY storage class support
 - **Compression exclusions**: Skip compression for already-compressed file types (GZIP, JPEG, MP4, etc.)
@@ -140,14 +135,10 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Manual heal API**: `POST /api/v1/heal` to trigger erasure-coded object repair on demand
 - **Orphan reclaim**: `POST /api/v1/reclaim` (or `vaults3-cli storage reclaim`) finds data files that no metadata refers to any more and frees them, scanning every node in a cluster. Reports by default, and `?apply=true` deletes, and nothing written in the last 24h is ever touched. A file is deleted only when metadata positively says it is gone: if a lookup cannot be answered at all, the whole bucket is reported `incomplete` and nothing in it is touched
 - **Speedtest**: `POST /api/v1/speedtest` to benchmark storage throughput
-- **Batch operations**: Bulk delete and copy processor for large-scale object operations
 - **PROXY protocol v1**: Accept PROXY protocol connections for real client IP behind load balancers
-- **Auto-TLS**: Automatic Let's Encrypt certificates with self-signed fallback
 - **Inter-node network separation**: Bind cluster traffic to a dedicated network interface
-- **Bucket bandwidth throttling**: Per-bucket upload/download rate limits
 - **S3 Select on compressed files**: Query GZIP and BZIP2 compressed CSV/JSON objects with S3 Select
 - **S3 POST policy**: HTML form-based upload with policy document validation
-- **S3 Inventory reports**: Periodic CSV inventory of bucket contents
 - **Snowball/TAR bulk upload**: Upload TAR archives that are automatically extracted into objects
 - **FIFO quota**: Automatically delete oldest objects when bucket quota is exceeded
 - **AMQP/RabbitMQ notifications**: Publish S3 events to RabbitMQ exchanges

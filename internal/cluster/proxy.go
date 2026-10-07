@@ -41,6 +41,17 @@ type Proxy struct {
 	configured map[string]string
 	mu         sync.RWMutex
 	proxies    map[string]*httputil.ReverseProxy // cached per-node proxies
+	// onMembership hears every membership sync, so state kept elsewhere about
+	// the peers (the failure detector's probe list) follows the same source.
+	onMembership func(members map[string]string)
+}
+
+// setMembershipObserver registers fn to receive the member set after every
+// membership sync.
+func (p *Proxy) setMembershipObserver(fn func(members map[string]string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onMembership = fn
 }
 
 // NewProxy creates a new cluster proxy.
@@ -116,10 +127,19 @@ func (p *Proxy) syncMembership(apiPort int) {
 	}
 
 	p.mu.Lock()
+	observer := p.onMembership
+	if observer != nil && len(members) > 0 {
+		snapshot := make(map[string]string, len(members))
+		for id, addr := range members {
+			snapshot[id] = addr
+		}
+		// Told after the lock is released, so the observer may call back in.
+		defer observer(snapshot)
+	}
 	defer p.mu.Unlock()
 	// Drop cached reverse proxies whose address changed or whose node left, so the
 	// next request rebuilds them against the current address. Pods get a new IP on
-	// restart; without this a node would route to a dead address forever.
+	// restart, and without this a node would route to a dead address forever.
 	p.invalidateStaleProxiesLocked(members)
 	p.nodeAddrs = members
 	// Reconcile the ring to exactly the live member set.
@@ -396,14 +416,24 @@ func (p *Proxy) getOrCreateProxy(nodeID, addr string) *httputil.ReverseProxy {
 		return proxy
 	}
 
-	target, err := url.Parse(fmt.Sprintf("http://%s", addr))
+	scheme := InterNodeScheme()
+	target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, addr))
 	if err != nil {
 		slog.Error("proxy: invalid target URL", "addr", addr, "error", err)
-		target = &url.URL{Scheme: "http", Host: addr}
+		target = &url.URL{Scheme: scheme, Host: addr}
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = newForwardTransport()
+	secret := ""
+	if p.node != nil {
+		secret = p.node.cfg.Secret
+	}
+	director := proxy.Director
+	proxy.Director = func(out *http.Request) {
+		director(out)
+		markForwardedClient(out, secret)
+	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		// Hand the error to forwardOnce when it is watching, so it can try another
 		// holder rather than turning a transient hiccup into a client-visible

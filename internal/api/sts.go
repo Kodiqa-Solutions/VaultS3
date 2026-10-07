@@ -1,8 +1,9 @@
 package api
 
 import (
-	"encoding/json"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -39,11 +40,17 @@ func (h *APIHandler) handleCreateSessionToken(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Validate optional inline policy
+	// Validate optional inline policy. A policy only scopes a session derived
+	// from a user, so one sent without userId used to be dropped in silence and
+	// the caller got a 201 for a credential that could reach nothing. Refused
+	// instead, and a document the authorizer could not use is refused too.
 	if req.Policy != "" {
-		var js json.RawMessage
-		if err := json.Unmarshal([]byte(req.Policy), &js); err != nil {
-			writeError(w, http.StatusBadRequest, "policy must be valid JSON")
+		if req.UserID == "" {
+			writeError(w, http.StatusBadRequest, "policy needs userId: a session policy narrows the access of the user the session is issued for")
+			return
+		}
+		if err := validatePolicyDocument(req.Policy); err != nil {
+			writeError(w, http.StatusBadRequest, "policy: "+err.Error())
 			return
 		}
 	}
@@ -91,7 +98,7 @@ func (h *APIHandler) handleCreateSessionToken(w http.ResponseWriter, r *http.Req
 
 	// If an inline policy was provided, create and attach it to a synthetic STS user
 	if req.Policy != "" && sourceUserID != "" {
-		policyName := "sts-" + accessKey
+		policyName := stsSyntheticName(accessKey)
 		stsPolicy := metadata.IAMPolicy{
 			Name:      policyName,
 			CreatedAt: now,
@@ -103,11 +110,12 @@ func (h *APIHandler) handleCreateSessionToken(w http.ResponseWriter, r *http.Req
 		}
 		// Create a synthetic IAM user for this STS token with only the inline policy
 		stsUser := metadata.IAMUser{
-			Name:       "sts-" + accessKey,
+			Name:       stsSyntheticName(accessKey),
 			CreatedAt:  now,
 			PolicyARNs: []string{policyName},
 		}
 		if err := h.store.CreateIAMUser(stsUser); err != nil {
+			_ = h.store.DeleteIAMPolicy(policyName)
 			writeError(w, http.StatusInternalServerError, "failed to create STS user")
 			return
 		}
@@ -116,6 +124,7 @@ func (h *APIHandler) handleCreateSessionToken(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := h.store.CreateAccessKey(key); err != nil {
+		h.deleteSTSArtifacts(key)
 		writeError(w, http.StatusInternalServerError, "failed to create STS key")
 		return
 	}
@@ -126,4 +135,35 @@ func (h *APIHandler) handleCreateSessionToken(w http.ResponseWriter, r *http.Req
 		SessionToken: sessionToken,
 		Expiration:   expiration.Format(time.RFC3339),
 	})
+}
+
+// stsSyntheticName names both the synthetic user a scoped session resolves to
+// and the policy that holds its session policy.
+func stsSyntheticName(accessKey string) string {
+	return "sts-" + accessKey
+}
+
+// isSTSSyntheticUser recognises the user a scoped session was given: named
+// after its key and holding exactly its own session policy. It is plumbing,
+// not a person, so the IAM user list does not show it.
+func isSTSSyntheticUser(u metadata.IAMUser) bool {
+	return strings.HasPrefix(u.Name, "sts-") && len(u.PolicyARNs) == 1 &&
+		u.PolicyARNs[0] == u.Name && len(u.Groups) == 0
+}
+
+// deleteSTSArtifacts removes the synthetic user and session policy a scoped
+// session key was issued with. They used to outlive the key: deleting the key,
+// or the user it was derived from, left both behind, and they showed up in the
+// IAM user list as if someone had created them.
+func (h *APIHandler) deleteSTSArtifacts(k metadata.AccessKey) {
+	name := stsSyntheticName(k.AccessKey)
+	if k.SessionToken == "" || k.UserID != name {
+		return
+	}
+	if err := h.store.DeleteIAMUser(name); err != nil {
+		slog.Warn("could not remove the synthetic user of a session key", "user", name, "error", err)
+	}
+	if err := h.store.DeleteIAMPolicy(name); err != nil {
+		slog.Warn("could not remove the session policy of a session key", "policy", name, "error", err)
+	}
 }

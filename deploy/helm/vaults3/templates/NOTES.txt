@@ -30,7 +30,7 @@ Raft clustering (Beta) is ENABLED with {{ .Values.replicaCount }} replicas. Pod-
 bootstraps and the rest auto-join. Check the cluster has a leader + all members:
 
    kubectl --namespace {{ .Release.Namespace }} exec {{ include "vaults3.fullname" . }}-0 -- \
-     wget -qO- http://localhost:{{ .Values.service.port }}/cluster/status
+     vaults3-cli cluster status
 {{- end }}
 {{- if not .Values.persistence.enabled }}
 

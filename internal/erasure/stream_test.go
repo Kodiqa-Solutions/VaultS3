@@ -77,7 +77,7 @@ func newCountingECEngine(t *testing.T) (*Engine, *countingEngine) {
 // instead of scaling with object size (the old read-all-shards-then-reconstruct path
 // read 100% of the object before emitting anything).
 func TestErasureFirstByteDoesNotReadWholeObject(t *testing.T) {
-	for _, size := range []int{256 * 1024, 1024 * 1024, 4 * 1024 * 1024} {
+	for _, size := range []int{256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024} {
 		eng, counter := newCountingECEngine(t)
 		data := makeData(size)
 		if _, _, err := eng.PutObject("b", "obj", bytes.NewReader(data), int64(len(data))); err != nil {
@@ -102,11 +102,15 @@ func TestErasureFirstByteDoesNotReadWholeObject(t *testing.T) {
 		if one[0] != data[0] {
 			t.Fatalf("first byte mismatch: got %d want %d", one[0], data[0])
 		}
-		// Generous bound: a materializing read costs >= size. Streaming costs one
-		// shard block plus the small meta file, far below a quarter of the object.
-		if firstByteCost > int64(size)/4 {
-			t.Fatalf("size=%d: reading the first byte pulled %d bytes from storage (>25%% of the object) — the read is materializing, not streaming",
+		// A materializing read costs >= size. Streaming costs at most one
+		// checksum stripe of the first data shard (it is verified before any of
+		// it is served) plus the small meta file, whatever the object's size.
+		if firstByteCost > crcStripeBytes+16*1024 {
+			t.Fatalf("size=%d: reading the first byte pulled %d bytes from storage, more than one stripe: the read is materializing, not streaming",
 				size, firstByteCost)
+		}
+		if size >= 32*1024*1024 && firstByteCost > int64(size)/16 {
+			t.Fatalf("size=%d: first byte cost %d does not stay flat as the object grows", size, firstByteCost)
 		}
 		t.Logf("size=%7d bytes-read-for-first-byte=%6d", size, firstByteCost)
 	}

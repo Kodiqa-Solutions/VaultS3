@@ -76,6 +76,29 @@ func (r *ecTestRig) wipeDisk(t *testing.T, i int) {
 	}
 }
 
+// put writes an object through the engine and records it in the metadata
+// store, as the S3 handler does. The healer finds objects through the store.
+func (r *ecTestRig) put(t *testing.T, key string, data []byte) {
+	t.Helper()
+	_, etag, err := r.eng.PutObject("b", key, bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("PutObject %s: %v", key, err)
+	}
+	if err := r.store.PutObjectMeta(metadata.ObjectMeta{Bucket: "b", Key: key, Size: int64(len(data)), ETag: etag}); err != nil {
+		t.Fatalf("PutObjectMeta %s: %v", key, err)
+	}
+}
+
+// shardFile is where shard i of key's current version lives on its disk.
+func (r *ecTestRig) shardFile(t *testing.T, key string, i int) string {
+	t.Helper()
+	meta, err := r.eng.readShardMeta("b", key)
+	if err != nil {
+		t.Fatalf("readShardMeta %s: %v", key, err)
+	}
+	return filepath.Join(r.disks[i], "b", filepath.FromSlash(meta.shardPath(key, i)))
+}
+
 func (r *ecTestRig) get(t *testing.T, key string) ([]byte, error) {
 	t.Helper()
 	rc, _, err := r.eng.GetObject("b", key)
@@ -98,7 +121,7 @@ func TestEngineErasureCodesLargeObject(t *testing.T) {
 
 	// Each of the 4 disks should hold its shard file.
 	for i := 0; i < 4; i++ {
-		p := filepath.Join(r.disks[i], "b", ".ec", "obj", shardName(i))
+		p := r.shardFile(t, "obj", i)
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("expected shard %d at %s: %v", i, p, err)
 		}
@@ -159,9 +182,7 @@ func TestEngineFailsBeyondParity(t *testing.T) {
 func TestHealerRepairsDegradedObject(t *testing.T) {
 	r := newECRig(t)
 	data := makeData(8192)
-	if _, _, err := r.eng.PutObject("b", "obj", bytes.NewReader(data), int64(len(data))); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	r.put(t, "obj", data)
 
 	healer := NewHealer(r.store, r.eng, 3600)
 	if healer.Status().DegradedObjects != 0 {
@@ -182,7 +203,7 @@ func TestHealerRepairsDegradedObject(t *testing.T) {
 
 	// Shard files should be rewritten to the previously-wiped disks.
 	for _, i := range []int{2, 3} {
-		p := filepath.Join(r.disks[i], "b", ".ec", "obj", shardName(i))
+		p := r.shardFile(t, "obj", i)
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("expected repaired shard %d at %s: %v", i, p, err)
 		}
@@ -210,9 +231,7 @@ func TestHealerRepairsDegradedObject(t *testing.T) {
 func TestHealerLeavesHealthyObjectAlone(t *testing.T) {
 	r := newECRig(t)
 	data := makeData(8192)
-	if _, _, err := r.eng.PutObject("b", "obj", bytes.NewReader(data), int64(len(data))); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	r.put(t, "obj", data)
 
 	healer := NewHealer(r.store, r.eng, 3600)
 	res := healer.Heal("b", "")
@@ -226,9 +245,7 @@ func TestHealerPrefixScope(t *testing.T) {
 	r := newECRig(t)
 	data := makeData(8192)
 	for _, key := range []string{"logs/a", "images/b"} {
-		if _, _, err := r.eng.PutObject("b", key, bytes.NewReader(data), int64(len(data))); err != nil {
-			t.Fatalf("PutObject %s: %v", key, err)
-		}
+		r.put(t, key, data)
 	}
 
 	healer := NewHealer(r.store, r.eng, 3600)

@@ -145,9 +145,6 @@ cluster:
     suspect_after: 3              # → "suspect" after 3 missed probes
     down_after: 6                # → "down" after 6 missed probes
     probe_timeout_secs: 3
-  rebalance:
-    max_bandwidth_mbps: 50       # throttle data movement on membership change
-    batch_size: 100
   repair:
     interval_secs: 600           # restore replica counts after a node is lost for good
     max_bandwidth_mbps: 50
@@ -189,7 +186,7 @@ cluster:
 
 1. Start **node-1** (with `bootstrap: true`). Confirm it becomes leader:
    ```bash
-   curl -s http://node1:9000/cluster/status | jq
+   curl -s -H "X-Cluster-Secret: $CLUSTER_SECRET" http://node1:9000/cluster/status | jq
    # → "state": "Leader"
    ```
 2. Start **node-2** and **node-3** (`bootstrap: false`).
@@ -202,7 +199,7 @@ cluster:
    (If you POST to a follower you get a `307` redirect to the leader, follow it.)
 4. Verify all members are present and voting:
    ```bash
-   curl -s http://node1:9000/cluster/status | jq '.servers'
+   curl -s -H "X-Cluster-Secret: $CLUSTER_SECRET" http://node1:9000/cluster/status | jq '.servers'
    # each entry should show "suffrage": "Voter"
    ```
 
@@ -229,7 +226,7 @@ vaults3-cli cluster status
 ```
 
 No manual join step is needed. If you use PVCs, the new pod gets its own volumes;
-run `vaults3-cli cluster rebalance` afterwards so existing data spreads onto it.
+run `vaults3-cli cluster repair` afterwards so existing objects get their copies on it.
 
 #### Non-Kubernetes (VM / bare metal / Docker)
 
@@ -257,9 +254,9 @@ run `vaults3-cli cluster rebalance` afterwards so existing data spreads onto it.
    ```bash
    vaults3-cli cluster status        # node-4 should appear as Voter
    ```
-4. **Rebalance** so data spreads onto the new node:
+4. **Repair** so existing objects get their copies on the new node:
    ```bash
-   vaults3-cli cluster rebalance
+   vaults3-cli cluster repair
    ```
 
 > Keep the cluster at an **odd number of voting members** (3, 5, 7) so Raft can
@@ -288,8 +285,8 @@ vaults3-cli cluster join  node-3 10.0.0.4:7000 # add a member (run against the l
 vaults3-cli cluster leave node-3               # remove a member (run against the leader)
 vaults3-cli cluster drain   node-2             # stop a node accepting writes (reads continue)
 vaults3-cli cluster undrain node-2             # resume writes
-vaults3-cli cluster rebalance                  # move objects to their correct owner
-vaults3-cli cluster decommission node-2        # guided drain + rebalance before replacing a node
+vaults3-cli cluster repair                     # give every object its copies on the current members
+vaults3-cli cluster decommission node-2        # drain a node before removing it
 ```
 
 **Adding a member.** See "Adding a new server to a running cluster" above —
@@ -300,7 +297,7 @@ Kubernetes auto-joins on `kubectl scale`; elsewhere start the node with
 > before 4.4.47 the configured `peer_apis` were discarded shortly after startup, so
 > peers resolved to the local node and replicas were never placed. Confirm the fix took
 > with `vaults3-cli info`, whose per-node line should now show a distinct footprint per
-> node, then run `vaults3-cli cluster rebalance` once to backfill the copies objects
+> node, then run `vaults3-cli cluster repair` once to backfill the copies objects
 > written before the upgrade never got. Clusters with one node per IP (the usual
 > Kubernetes shape) were unaffected and need no action.
 
@@ -310,17 +307,21 @@ cluster, new writes for that node's keys keep routing to it until you also chang
 membership — drain is for taking a node down gracefully, not for permanently
 steering traffic away.
 
-**Replacing a server (decommission).** To move a member's data onto the rest of
-the cluster and retire it:
+**Replacing a server (decommission).** To retire a member:
 
-1. `vaults3-cli cluster decommission <nodeId>` — drains the node and triggers a
-   rebalance so its objects move to the remaining members.
-2. Watch `vaults3-cli cluster status` / `vaults3-cli info` until its data has moved.
-3. `vaults3-cli cluster leave <nodeId>`, then stop the node.
+1. `vaults3-cli cluster decommission <nodeId>` drains the node so it takes no new writes.
+2. `vaults3-cli cluster leave <nodeId>`, then stop the node.
+3. `vaults3-cli cluster repair`, and `vaults3-cli cluster repair --status` until
+   `repaired` settles at 0. Repair re-creates, on the remaining members, every copy
+   the node held.
 
-> **Zero-data-loss decommission requires `placement.replica_count >= 2`** so a
-> second copy already exists on another node. With `replica_count: 1`, removing a
-> node before its data has fully rebalanced off it loses that data.
+> **Zero-data-loss decommission requires `placement.replica_count >= 2`.** Repair
+> re-creates a copy from one another member already holds. With `replica_count: 1`
+> the node's objects have no other copy, so removing it loses them.
+>
+> `vaults3-cli cluster rebalance` is retired from 5.0.0. Its transfers were refused
+> by every node, so it never moved anything, and had they worked it would have
+> deleted valid copies. Repair does the job.
 
 ---
 
@@ -477,16 +478,14 @@ that disk are *degraded* but still readable (as long as failures ≤ `parity_sha
    curl -X POST http://<leader>:9000/cluster/join \
      -d '{"node_id":"node-3b","addr":"<new-host>:9001"}'
    ```
-4. **Rebalance** moves objects whose owner changed onto the new member, and **replica repair**
-   restores the copies that died with the old node:
+4. **Replica repair** gives every object its copies on the current members, the new one
+   included, and restores the copies that died with the old node:
    ```bash
-   vaults3-cli cluster rebalance
    vaults3-cli cluster repair
    vaults3-cli cluster repair --status   # repeat until repaired settles at 0
    ```
-   The two do different jobs and you want both. Rebalance asks who should own an object and
-   moves it there. Repair asks how many copies an object actually has and makes another when
-   it is short, which is the only one that answers a node dying.
+   Repair asks how many copies an object actually has on the members that should hold it
+   and makes another when it is short. It never deletes a copy.
 
    > Before 4.4.75 nothing performed that second job, so a permanently lost node left every
    > object that had a copy on it one copy short indefinitely. If you have replaced a node on

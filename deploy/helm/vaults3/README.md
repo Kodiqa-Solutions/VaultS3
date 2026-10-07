@@ -34,8 +34,9 @@ kubectl -n vaults3 port-forward svc/vaults3 9000:9000
 | `image.repository` | `eniz1806/vaults3` | Image repo. |
 | `image.tag` | `""` | Defaults to the chart `appVersion`. Pin for reproducibility. |
 | `auth.accessKey` | `vaults3-admin` | Admin access key (injected via Secret → env). |
-| `auth.secretKey` | `vaults3-secret-change-me` | Admin secret. **Change it**, or set empty to auto-generate. |
-| `auth.existingSecret` | `""` | Use your own Secret (keys `access-key`, `secret-key`). |
+| `auth.secretKey` | `""` | Admin secret. Empty generates one on first install and keeps it across upgrades. |
+| `auth.clusterSecret` | `""` | Secret nodes use to authenticate each other. Empty generates one on install, and an upgraded release keeps the value it already used (the admin secret, before this chart version). |
+| `auth.existingSecret` | `""` | Use your own Secret (keys `access-key`, `secret-key`, optionally `cluster-secret`). |
 | `config` | single-node config | The `vaults3.yaml` mounted at `/etc/vaults3/`. Replace to enable encryption/replication/erasure/external auth/etc. |
 | `existingConfigMap` | `""` | Use your own ConfigMap (key `vaults3.yaml`). |
 | `defaultBuckets` | `[]` | Buckets created on startup if missing (e.g. `{app-data,backups}`). Existing buckets are untouched; an invalid name stops the pod. |
@@ -53,6 +54,12 @@ kubectl -n vaults3 port-forward svc/vaults3 9000:9000
 | `extraEnv` | `[]` | Extra env vars (`VAULTS3_LOG_LEVEL`, `VAULTS3_DOMAIN`, `VAULTS3_ENCRYPTION_KEY`, …). |
 
 See [`values.yaml`](./values.yaml) for the full list.
+
+**GitOps and `helm template`.** Generated secrets are kept across upgrades by
+reading the existing Secret, which needs cluster access at render time. Argo CD,
+Flux in some modes and `helm template` render without it, so every render
+generates new values and pods that restart disagree with the rest. Set
+`auth.secretKey` and `auth.clusterSecret`, or `auth.existingSecret`, for those.
 
 ## Enabling features
 
@@ -82,7 +89,7 @@ helm install vaults3 ./deploy/helm/vaults3 -n vaults3 --create-namespace \
   --set auth.secretKey="$(openssl rand -hex 20)"
 
 # verify the cluster has a leader + all members
-kubectl -n vaults3 exec vaults3-0 -- wget -qO- http://localhost:9000/cluster/status
+kubectl -n vaults3 exec vaults3-0 -- vaults3-cli cluster status
 ```
 
 Metadata writes (buckets, objects, IAM, …) are committed through Raft consensus,

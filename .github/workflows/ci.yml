@@ -15,6 +15,9 @@ name: CI
 # skipped run cannot strand a pull request waiting for a check that never reports.
 # If required checks are ever turned on, this needs the companion-workflow pattern
 # instead, or a docs-only PR will block forever.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -83,6 +86,19 @@ jobs:
         run: |
           go test -race -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out
+
+  # The chart had no CI at all, so a template error reached users first. Render
+  # it in both modes, single node and clustered, with a pinned Helm.
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Render the chart
+        run: |
+          for args in "" "--set cluster.enabled=true --set controller.kind=StatefulSet --set replicaCount=3"; do
+            docker run --rm -v "$PWD/deploy/helm/vaults3:/c:ro" alpine/helm:4.3.0 template t /c $args > /dev/null
+            docker run --rm -v "$PWD/deploy/helm/vaults3:/c:ro" alpine/helm:4.3.0 lint /c $args
+          done
 
   lint:
     runs-on: ubuntu-latest
@@ -168,6 +184,22 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # A branch build used to pass github.ref_name, which is "main", so the
+      # :latest image reported version "main". The updater then treated it as
+      # older than every release, and vaults3-cli could not tell what it was
+      # talking to. A tag build reports the tag, a branch build the nearest tag
+      # plus the commits since it, for example v5.0.0-3-gabc1234.
+      - name: Version string
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -197,7 +229,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ steps.ver.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

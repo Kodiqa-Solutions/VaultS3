@@ -124,10 +124,27 @@ func (h *APIHandler) handleChangeCredentials(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// The whole change runs under the credential lock, so two changes cannot
+	// interleave and a login never sees half of one.
+	h.authMu.Lock()
+	defer h.authMu.Unlock()
+
 	// Verify current secret key
 	if !hmac.Equal([]byte(req.CurrentSecretKey), []byte(h.cfg.Auth.AdminSecretKey)) {
 		writeError(w, http.StatusForbidden, "current secret key is incorrect")
 		return
+	}
+
+	// Persist first. A failed write used to be ignored and the change reported
+	// as done, so the old password came back on the next restart while the
+	// operator believed it was gone. Nothing in memory changes until the new
+	// pair is on disk.
+	if h.store != nil {
+		if err := h.store.SetAdminCredentials(req.NewAccessKey, req.NewSecretKey); err != nil {
+			slog.Error("could not persist the new admin credentials", "error", err)
+			writeError(w, http.StatusInternalServerError, "could not save the new credentials, nothing was changed")
+			return
+		}
 	}
 
 	// Update in-memory config
@@ -152,11 +169,6 @@ func (h *APIHandler) handleChangeCredentials(w http.ResponseWriter, r *http.Requ
 		}
 	} else {
 		slog.Error("could not rotate the console signing key", "error", err)
-	}
-
-	// Persist to metadata store
-	if h.store != nil {
-		_ = h.store.SetAdminCredentials(req.NewAccessKey, req.NewSecretKey)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "credentials updated successfully"})

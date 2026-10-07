@@ -3,11 +3,64 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 
+	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 )
+
+// AWS limits for IAM names. Users and groups take up to 64 characters,
+// policies up to 128, all from the same set.
+const (
+	maxIAMUserNameLen   = 64
+	maxIAMPolicyNameLen = 128
+)
+
+var iamNameRe = regexp.MustCompile(`^[\w+=,.@-]+$`)
+
+// validateIAMName applies the AWS naming rule to a new user, group or policy.
+// Names used to be taken as given, so one containing "/" was created and then
+// could never be addressed again, since the API splits its paths on it, and one
+// of any length was stored. It applies only at creation: an existing object
+// with another name must stay deletable.
+func validateIAMName(kind, name string, max int) error {
+	if name == "" {
+		return fmt.Errorf("%s name is required", kind)
+	}
+	if len(name) > max {
+		return fmt.Errorf("%s name must be at most %d characters", kind, max)
+	}
+	if !iamNameRe.MatchString(name) {
+		return fmt.Errorf("%s name may contain only letters, digits and + = , . @ _ -", kind)
+	}
+	return nil
+}
+
+// validatePolicyDocument refuses a document the authorizer could not use. It
+// used to check only that the text was JSON, so a document that did not decode
+// into a policy was stored and attached, and from then on every user holding it
+// was denied everything, because a policy that fails to parse fails the whole
+// identity closed. Decoding into iam.Policy here means this check accepts
+// exactly what the authorizer accepts.
+func validatePolicyDocument(doc string) error {
+	var pol iam.Policy
+	if err := json.Unmarshal([]byte(doc), &pol); err != nil {
+		return fmt.Errorf("document is not a valid IAM policy: %v", err)
+	}
+	if len(pol.Statement) == 0 {
+		return fmt.Errorf("document has no Statement")
+	}
+	for i, st := range pol.Statement {
+		if st.Effect != "Allow" && st.Effect != "Deny" {
+			return fmt.Errorf("statement %d: Effect must be Allow or Deny, got %q", i+1, st.Effect)
+		}
+	}
+	return nil
+}
 
 // IAM Users
 
@@ -28,6 +81,9 @@ func (h *APIHandler) handleListIAMUsers(w http.ResponseWriter, _ *http.Request) 
 
 	items := make([]iamUserResponse, 0, len(users))
 	for _, u := range users {
+		if isSTSSyntheticUser(u) {
+			continue
+		}
 		policyARNs := u.PolicyARNs
 		if policyARNs == nil {
 			policyARNs = []string{}
@@ -57,6 +113,10 @@ func (h *APIHandler) handleCreateIAMUser(w http.ResponseWriter, r *http.Request)
 	}
 	if err := readJSON(r, &req); err != nil || req.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if err := validateIAMName("user", req.Name, maxIAMUserNameLen); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -125,6 +185,7 @@ func (h *APIHandler) handleDeleteIAMUser(w http.ResponseWriter, _ *http.Request,
 			writeError(w, http.StatusInternalServerError, "failed to delete the user's access key "+k.AccessKey)
 			return
 		}
+		h.deleteSTSArtifacts(k)
 		if k.PolicyName != "" {
 			_ = h.store.DeleteIAMPolicy(k.PolicyName)
 		}
@@ -291,6 +352,10 @@ func (h *APIHandler) handleCreateIAMGroup(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+	if err := validateIAMName("group", req.Name, maxIAMUserNameLen); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	group := metadata.IAMGroup{
 		Name:      req.Name,
@@ -309,6 +374,31 @@ func (h *APIHandler) handleCreateIAMGroup(w http.ResponseWriter, r *http.Request
 }
 
 func (h *APIHandler) handleDeleteIAMGroup(w http.ResponseWriter, _ *http.Request, name string) {
+	// Members are taken out of the group first. The name used to stay on every
+	// member, so a group created later with the same name silently granted its
+	// policies to people nobody had added to it. Done before the group goes, so
+	// a failure part way leaves the group in place to delete again.
+	users, err := h.store.ListIAMUsers()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not list the group's members, retry")
+		return
+	}
+	for _, u := range users {
+		kept := make([]string, 0, len(u.Groups))
+		for _, g := range u.Groups {
+			if g != name {
+				kept = append(kept, g)
+			}
+		}
+		if len(kept) == len(u.Groups) {
+			continue
+		}
+		u.Groups = kept
+		if err := h.store.UpdateIAMUser(u); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to remove user "+u.Name+" from the group")
+			return
+		}
+	}
 	if err := h.store.DeleteIAMGroup(name); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete group")
 		return
@@ -409,10 +499,12 @@ func (h *APIHandler) handleCreateIAMPolicy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Validate document is valid JSON
-	var js json.RawMessage
-	if err := json.Unmarshal([]byte(req.Document), &js); err != nil {
-		writeError(w, http.StatusBadRequest, "document must be valid JSON")
+	if err := validateIAMName("policy", req.Name, maxIAMPolicyNameLen); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePolicyDocument(req.Document); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -437,13 +529,18 @@ func (h *APIHandler) handleDeleteIAMPolicy(w http.ResponseWriter, _ *http.Reques
 	// An access key's own policy is removed with the key. Deleting it on its own
 	// would leave the key listed and working for signing while it can reach
 	// nothing, with no sign of why.
-	if keys, err := h.store.ListAccessKeys(); err == nil {
-		for _, k := range keys {
-			if k.PolicyName == name {
-				writeError(w, http.StatusConflict,
-					fmt.Sprintf("policy %q belongs to access key %s, delete the key instead", name, k.AccessKey))
-				return
-			}
+	// A key list that cannot be read is not an empty one: the check used to be
+	// skipped then, which deleted a key's own policy whenever the store hiccuped.
+	keys, err := h.store.ListAccessKeys()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not check whether an access key owns this policy, retry")
+		return
+	}
+	for _, k := range keys {
+		if k.PolicyName == name {
+			writeError(w, http.StatusConflict,
+				fmt.Sprintf("policy %q belongs to access key %s, delete the key instead", name, k.AccessKey))
+			return
 		}
 	}
 	if err := h.store.DeleteIAMPolicy(name); err != nil {
@@ -462,6 +559,15 @@ func (h *APIHandler) handleSetIPRestrictions(w http.ResponseWriter, r *http.Requ
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	// A CIDR that does not parse used to be stored as given and then skipped by
+	// the matcher, so a typo in the only entry left the user locked out of
+	// everything, and one among several silently allowed less than intended.
+	for _, c := range req.AllowedCIDRs {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(c)); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("%q is not a CIDR such as 203.0.113.0/24", c))
+			return
+		}
 	}
 
 	user, err := h.store.GetIAMUser(userName)

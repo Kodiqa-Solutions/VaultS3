@@ -3,7 +3,9 @@ package storage
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -36,13 +38,37 @@ import (
 //
 // Reading is chunk-at-a-time and each chunk is authenticated before any of its
 // bytes are returned, so no unverified plaintext ever reaches a client.
+//
+// Format 2 (every write since it was introduced) appends a 32-byte random salt
+// to the header and seals the chunks under a per-object key,
+// HKDF-SHA256(key, salt, "vaults3 object v2"), instead of under the bucket or
+// server key itself:
+//
+//	header : magic[4] "VS3S" | format[1]=2 | keyVersion[4] | chunkSize[4] | noncePrefix[7] | salt[32]
+//
+// Format 1 used the long-lived key directly with only the 7-byte random prefix
+// telling objects apart, so two objects that drew the same prefix reused a
+// (key, nonce) pair on chunk 0, which breaks GCM. At 16 million writes under one
+// key that is about a 0.2% chance. With a fresh key per object a nonce can only
+// repeat within one object, where the chunk index rules it out. Format 1 blobs
+// still read: the version byte picks the header length and the key.
+//
+// Bucket and object key are deliberately NOT bound into the ciphertext as
+// associated data, because a server-side copy or rename moves the stored bytes
+// to a new key unchanged and would then fail authentication.
 const (
 	streamMagic       = "VS3S"
 	streamFormatV1    = byte(1)
+	streamFormatV2    = byte(2)
 	streamNoncePrefix = 7
-	streamHeaderLen   = 4 + 1 + 4 + 4 + streamNoncePrefix // 20
+	streamSaltLen     = 32
+	streamHeaderLenV1 = 4 + 1 + 4 + 4 + streamNoncePrefix // 20
+	streamHeaderLen   = streamHeaderLenV1 + streamSaltLen // 52, what new writes use
 	streamTagLen      = 16
 	streamNonceLen    = 12
+
+	// streamKeyInfo is the HKDF info string for format 2 per-object keys.
+	streamKeyInfo = "vaults3 object v2"
 
 	// maxStreamChunk bounds what a header may ask us to allocate per reader, so a
 	// corrupt or hostile header cannot turn a GET into a huge allocation.
@@ -77,9 +103,36 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 
 // streamHeader is the parsed fixed-size header of a VS3S blob.
 type streamHeader struct {
+	format     byte
 	keyVersion uint32
 	chunkSize  int
 	prefix     [streamNoncePrefix]byte
+	salt       [streamSaltLen]byte // format 2 only
+}
+
+// headerLen is the stored length of this header, which differs by format.
+func (h streamHeader) headerLen() int64 {
+	if h.format == streamFormatV1 {
+		return streamHeaderLenV1
+	}
+	return streamHeaderLen
+}
+
+// objectKey returns the key the chunks were sealed under: the stored key itself
+// for format 1, a per-object key derived from it and the salt for format 2.
+func (h streamHeader) objectKey(key []byte) ([]byte, error) {
+	if h.format == streamFormatV1 {
+		return key, nil
+	}
+	return deriveObjectKey(key, h.salt[:])
+}
+
+// deriveObjectKey is the format 2 per-object key derivation.
+func deriveObjectKey(key, salt []byte) ([]byte, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("storage: key must be 32 bytes, got %d", len(key))
+	}
+	return hkdf.Key(sha256.New, key, salt, streamKeyInfo, 32)
 }
 
 // streamNonce derives the nonce for one chunk: prefix || index || final flag.
@@ -98,14 +151,15 @@ func streamNonce(prefix [streamNoncePrefix]byte, idx uint32, final bool) []byte 
 // parseStreamHeader reads and validates a header from the front of src.
 func parseStreamHeader(src io.Reader) (streamHeader, error) {
 	var h streamHeader
-	buf := make([]byte, streamHeaderLen)
+	buf := make([]byte, streamHeaderLenV1)
 	if _, err := io.ReadFull(src, buf); err != nil {
 		return h, errNotStream
 	}
 	if !isStreamBlob(buf) {
 		return h, errNotStream
 	}
-	if buf[4] != streamFormatV1 {
+	h.format = buf[4]
+	if h.format != streamFormatV1 && h.format != streamFormatV2 {
 		return h, fmt.Errorf("storage: unsupported stream format %d", buf[4])
 	}
 	h.keyVersion = binary.BigEndian.Uint32(buf[5:9])
@@ -114,7 +168,14 @@ func parseStreamHeader(src io.Reader) (streamHeader, error) {
 		return h, fmt.Errorf("storage: invalid stream chunk size %d", chunk)
 	}
 	h.chunkSize = int(chunk)
-	copy(h.prefix[:], buf[13:streamHeaderLen])
+	copy(h.prefix[:], buf[13:streamHeaderLenV1])
+	if h.format == streamFormatV2 {
+		// The salt follows the fields format 1 also has. A blob that ends
+		// inside it is truncated, not a different format.
+		if _, err := io.ReadFull(src, h.salt[:]); err != nil {
+			return h, fmt.Errorf("storage: stream header truncated: %w", err)
+		}
+	}
 	return h, nil
 }
 
@@ -143,10 +204,15 @@ func streamChunkCount(n int64, chunkSize int) int64 {
 	return n/int64(chunkSize) + 1
 }
 
-// streamCipherSize is the exact stored size of a plaintext of n bytes, so a write
-// can tell the inner engine its length up front instead of streaming blind.
+// streamCipherSize is the exact stored size of a plaintext of n bytes in the
+// format new writes use, so a write can tell the inner engine its length up
+// front instead of streaming blind.
 func streamCipherSize(n int64, chunkSize int) int64 {
-	return streamHeaderLen + n + streamChunkCount(n, chunkSize)*streamTagLen
+	return streamCipherSizeHdr(streamHeaderLen, n, chunkSize)
+}
+
+func streamCipherSizeHdr(hdrLen, n int64, chunkSize int) int64 {
+	return hdrLen + n + streamChunkCount(n, chunkSize)*streamTagLen
 }
 
 // streamPlainSize recovers the plaintext length and chunk count from the stored
@@ -159,15 +225,15 @@ func streamCipherSize(n int64, chunkSize int) int64 {
 // yields a self-consistent plaintext length, and without it the reader would
 // simply expect one more chunk than exists, never read the truncated tail, and
 // serve the short object as if it were whole.
-func streamPlainSize(stored int64, chunkSize int) (plain, chunks int64, err error) {
-	rem := stored - streamHeaderLen
+func streamPlainSize(stored, hdrLen int64, chunkSize int) (plain, chunks int64, err error) {
+	rem := stored - hdrLen
 	if rem < streamTagLen {
 		return 0, 0, fmt.Errorf("storage: stream too short (%d bytes)", stored)
 	}
 	per := int64(chunkSize) + streamTagLen
 	chunks = (rem + per - 1) / per
 	plain = rem - chunks*streamTagLen
-	if plain < 0 || streamCipherSize(plain, chunkSize) != stored {
+	if plain < 0 || streamCipherSizeHdr(hdrLen, plain, chunkSize) != stored {
 		return 0, 0, fmt.Errorf("storage: stream length %d is not a whole object (truncated or corrupt)", stored)
 	}
 	return plain, chunks, nil
@@ -180,22 +246,30 @@ func sealStream(dst io.Writer, src io.Reader, key []byte, keyVersion uint32, chu
 	if chunkSize <= 0 || chunkSize > maxStreamChunk {
 		chunkSize = defaultStreamChunk
 	}
-	gcm, err := newAEAD(key)
-	if err != nil {
-		return 0, err
-	}
-
 	var prefix [streamNoncePrefix]byte
 	if _, err := rand.Read(prefix[:]); err != nil {
 		return 0, fmt.Errorf("storage: nonce prefix: %w", err)
 	}
+	var salt [streamSaltLen]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return 0, fmt.Errorf("storage: key salt: %w", err)
+	}
+	objKey, err := deriveObjectKey(key, salt[:])
+	if err != nil {
+		return 0, err
+	}
+	gcm, err := newAEAD(objKey)
+	if err != nil {
+		return 0, err
+	}
 
 	header := make([]byte, 0, streamHeaderLen)
 	header = append(header, streamMagic...)
-	header = append(header, streamFormatV1)
+	header = append(header, streamFormatV2)
 	header = binary.BigEndian.AppendUint32(header, keyVersion)
 	header = binary.BigEndian.AppendUint32(header, uint32(chunkSize))
 	header = append(header, prefix[:]...)
+	header = append(header, salt[:]...)
 	if _, err := dst.Write(header); err != nil {
 		return 0, err
 	}
@@ -277,6 +351,7 @@ type streamReader struct {
 	gcm       cipher.AEAD
 	prefix    [streamNoncePrefix]byte
 	chunkSize int
+	hdrLen    int64 // where chunk 0 starts, which depends on the format
 	plainSize int64
 	chunks    int64
 
@@ -293,11 +368,16 @@ type streamReader struct {
 // blob. A straight read from start to finish never seeks src, which keeps the
 // cost off inner readers that seek expensively.
 func newStreamReader(src ReadSeekCloser, stored int64, h streamHeader, key []byte) (*streamReader, error) {
-	gcm, err := newAEAD(key)
+	objKey, err := h.objectKey(key)
 	if err != nil {
 		return nil, err
 	}
-	plainSize, chunks, err := streamPlainSize(stored, h.chunkSize)
+	gcm, err := newAEAD(objKey)
+	if err != nil {
+		return nil, err
+	}
+	hdrLen := h.headerLen()
+	plainSize, chunks, err := streamPlainSize(stored, hdrLen, h.chunkSize)
 	if err != nil {
 		return nil, err
 	}
@@ -306,10 +386,11 @@ func newStreamReader(src ReadSeekCloser, stored int64, h streamHeader, key []byt
 		gcm:       gcm,
 		prefix:    h.prefix,
 		chunkSize: h.chunkSize,
+		hdrLen:    hdrLen,
 		plainSize: plainSize,
 		chunks:    chunks,
 		bufIdx:    -1,
-		srcAt:     streamHeaderLen, // just past the header, i.e. at chunk 0
+		srcAt:     hdrLen, // just past the header, i.e. at chunk 0
 	}, nil
 }
 
@@ -323,7 +404,7 @@ func (r *streamReader) loadChunk(idx int64) error {
 	}
 
 	per := int64(r.chunkSize) + streamTagLen
-	off := int64(streamHeaderLen) + idx*per
+	off := r.hdrLen + idx*per
 
 	// Every chunk but the last is full; the last is whatever remains.
 	want := per

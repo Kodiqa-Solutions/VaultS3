@@ -58,7 +58,7 @@ func TestPublicReadPrincipalFormats(t *testing.T) {
 			    "Resource": ["arn:aws:s3:::photos/*"]
 			  }]
 			}`)
-			if got := s.IsObjectPublicRead("photos", "cat.jpg"); got != tc.want {
+			if got := s.IsObjectPublicRead("photos", "cat.jpg", nil); got != tc.want {
 				t.Fatalf("IsObjectPublicRead = %v, want %v (principal %s)", got, tc.want, tc.principal)
 			}
 		})
@@ -92,7 +92,7 @@ func TestPublicReadActionForms(t *testing.T) {
 			    "Resource": ["arn:aws:s3:::photos/*"]
 			  }]
 			}`)
-			if got := s.IsObjectPublicRead("photos", "cat.jpg"); got != tc.want {
+			if got := s.IsObjectPublicRead("photos", "cat.jpg", nil); got != tc.want {
 				t.Fatalf("action %s: got %v want %v", tc.action, got, tc.want)
 			}
 		})
@@ -113,10 +113,10 @@ func TestPublicListIsSeparateFromRead(t *testing.T) {
 		    "Resource": ["arn:aws:s3:::photos"]
 		  }]
 		}`)
-		if !s.IsBucketPublicList("photos") {
+		if !s.IsBucketPublicList("photos", nil) {
 			t.Fatal("s3:ListBucket should make the bucket publicly listable")
 		}
-		if s.IsObjectPublicRead("photos", "cat.jpg") {
+		if s.IsObjectPublicRead("photos", "cat.jpg", nil) {
 			t.Fatal("SECURITY: s3:ListBucket must NOT make objects publicly readable")
 		}
 	})
@@ -131,10 +131,10 @@ func TestPublicListIsSeparateFromRead(t *testing.T) {
 		    "Resource": ["arn:aws:s3:::photos/*"]
 		  }]
 		}`)
-		if !s.IsObjectPublicRead("photos", "cat.jpg") {
+		if !s.IsObjectPublicRead("photos", "cat.jpg", nil) {
 			t.Fatal("s3:GetObject should make objects publicly readable")
 		}
-		if s.IsBucketPublicList("photos") {
+		if s.IsBucketPublicList("photos", nil) {
 			t.Fatal("SECURITY: s3:GetObject must NOT make the bucket publicly listable")
 		}
 	})
@@ -150,7 +150,7 @@ func TestPublicReadExplicitDenyWins(t *testing.T) {
 	    {"Effect": "Deny",  "Principal": {"AWS": "*"}, "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::photos/*"]}
 	  ]
 	}`)
-	if s.IsObjectPublicRead("photos", "cat.jpg") {
+	if s.IsObjectPublicRead("photos", "cat.jpg", nil) {
 		t.Fatal("SECURITY: an explicit Deny must override the Allow")
 	}
 }
@@ -187,7 +187,7 @@ func TestPublicReadResourceMustMatchObject(t *testing.T) {
 			    "Resource": `+tc.resource+`
 			  }]
 			}`)
-			if got := s.IsObjectPublicRead("photos", "cat.jpg"); got != tc.want {
+			if got := s.IsObjectPublicRead("photos", "cat.jpg", nil); got != tc.want {
 				t.Fatalf("resource %s: got %v want %v", tc.resource, got, tc.want)
 			}
 		})
@@ -209,7 +209,7 @@ func TestPublicAccessBlockOverridesPolicy(t *testing.T) {
 			    "Resource": ["arn:aws:s3:::photos/*"]
 			  }]
 			}`)
-			if !s.IsObjectPublicRead("photos", "cat.jpg") {
+			if !s.IsObjectPublicRead("photos", "cat.jpg", nil) {
 				t.Fatal("precondition: bucket should be public before the block")
 			}
 
@@ -222,7 +222,7 @@ func TestPublicAccessBlockOverridesPolicy(t *testing.T) {
 			if err := s.PutPublicAccessBlock("photos", cfg); err != nil {
 				t.Fatalf("PutPublicAccessBlock: %v", err)
 			}
-			if s.IsObjectPublicRead("photos", "cat.jpg") {
+			if s.IsObjectPublicRead("photos", "cat.jpg", nil) {
 				t.Fatalf("SECURITY: %s must block anonymous read access", field)
 			}
 		})
@@ -232,11 +232,11 @@ func TestPublicAccessBlockOverridesPolicy(t *testing.T) {
 // TestNoPolicyIsNotPublic is the default-deny guard.
 func TestNoPolicyIsNotPublic(t *testing.T) {
 	s := newPolicyStore(t)
-	if s.IsObjectPublicRead("photos", "cat.jpg") || s.IsBucketPublicList("photos") {
+	if s.IsObjectPublicRead("photos", "cat.jpg", nil) || s.IsBucketPublicList("photos", nil) {
 		t.Fatal("a bucket with no policy must not be public")
 	}
 	setPolicy(t, s, `{not valid json`)
-	if s.IsObjectPublicRead("photos", "cat.jpg") {
+	if s.IsObjectPublicRead("photos", "cat.jpg", nil) {
 		t.Fatal("a malformed policy must not be treated as public")
 	}
 }
@@ -255,7 +255,7 @@ func TestPublicReadIsScopedToTheResourcePrefix(t *testing.T) {
 	    "Resource": "arn:aws:s3:::photos/public/*"
 	  }]
 	}`)
-	if !s.IsObjectPublicRead("photos", "public/ok.txt") {
+	if !s.IsObjectPublicRead("photos", "public/ok.txt", nil) {
 		t.Fatal("the published prefix should be anonymously readable")
 	}
 	for _, key := range []string{
@@ -264,7 +264,7 @@ func TestPublicReadIsScopedToTheResourcePrefix(t *testing.T) {
 		"public-but-not-really/x", // a sibling key sharing the prefix string
 		"decoy/public/ok.txt",     // the prefix must anchor at the start
 	} {
-		if s.IsObjectPublicRead("photos", key) {
+		if s.IsObjectPublicRead("photos", key, nil) {
 			t.Fatalf("SECURITY: %q is outside the published prefix but reads as public", key)
 		}
 	}
@@ -276,7 +276,7 @@ func TestPublicReadIsScopedToTheResourcePrefix(t *testing.T) {
 	}
 
 	// Listing is a different permission and this policy does not grant it.
-	if s.IsBucketPublicList("photos") {
+	if s.IsBucketPublicList("photos", nil) {
 		t.Fatal("SECURITY: an s3:GetObject grant must not make the bucket listable")
 	}
 }
@@ -293,10 +293,10 @@ func TestStatementWithNoResourceGrantsNothing(t *testing.T) {
 	    "Action": ["s3:GetObject", "s3:ListBucket"]
 	  }]
 	}`)
-	if s.IsObjectPublicRead("photos", "cat.jpg") {
+	if s.IsObjectPublicRead("photos", "cat.jpg", nil) {
 		t.Fatal("SECURITY: a statement with no Resource must not publish objects")
 	}
-	if s.IsBucketPublicList("photos") {
+	if s.IsBucketPublicList("photos", nil) {
 		t.Fatal("SECURITY: a statement with no Resource must not publish the listing")
 	}
 	if s.HasPublicReadPolicy("photos") {

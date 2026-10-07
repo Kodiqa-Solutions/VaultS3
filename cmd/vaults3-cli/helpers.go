@@ -16,6 +16,10 @@ import (
 	"time"
 )
 
+// unsignedPayload is the SigV4 payload hash for a body that is not hashed
+// before it is sent. The server takes it as the signed value, as AWS does.
+const unsignedPayload = "UNSIGNED-PAYLOAD"
+
 // signV4 signs an HTTP request with AWS Signature V4.
 func signV4(req *http.Request, accessKey, secretKey, region string) {
 	now := time.Now().UTC()
@@ -24,14 +28,17 @@ func signV4(req *http.Request, accessKey, secretKey, region string) {
 
 	req.Header.Set("X-Amz-Date", amzDate)
 
-	var bodyHash string
-	if req.Body != nil {
-		body, _ := io.ReadAll(req.Body)
-		req.Body = io.NopCloser(bytes.NewReader(body))
+	// A caller that streams its body sets the payload hash itself, normally
+	// UNSIGNED-PAYLOAD, and the body is then left alone. Hashing it here meant
+	// reading all of it into memory, whatever its size.
+	bodyHash := req.Header.Get("X-Amz-Content-Sha256")
+	if bodyHash == "" {
+		var body []byte
+		if req.Body != nil && req.Body != http.NoBody {
+			body, _ = io.ReadAll(req.Body)
+			req.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		h := sha256.Sum256(body)
-		bodyHash = hex.EncodeToString(h[:])
-	} else {
-		h := sha256.Sum256([]byte{})
 		bodyHash = hex.EncodeToString(h[:])
 	}
 	req.Header.Set("X-Amz-Content-Sha256", bodyHash)

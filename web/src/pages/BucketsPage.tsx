@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useInFlight } from '../hooks/useInFlight'
 import { Link } from 'react-router-dom'
 import { listBuckets, createBucket, deleteBucket, setBucketVersioning } from '../api/buckets'
 import { setLifecycleRule } from '../api/buckets'
@@ -17,6 +18,7 @@ export default function BucketsPage() {
   const [newName, setNewName] = useState('')
   const [creating, setCreating] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleting, runDelete] = useInFlight()
   const [error, setError] = useState('')
   const { addToast } = useToast()
 
@@ -68,7 +70,7 @@ export default function BucketsPage() {
     }
   }
 
-  const handleDelete = async (name: string) => {
+  const handleDelete = (name: string) => runDelete(async () => {
     setError('')
     try {
       await deleteBucket(name)
@@ -78,7 +80,7 @@ export default function BucketsPage() {
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('buckets.deleteFailed'))
     }
-  }
+  })
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {
@@ -213,13 +215,15 @@ export default function BucketsPage() {
             <div className="flex gap-2 justify-end">
               <button
                 onClick={() => setDeleteTarget(null)}
-                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                disabled={deleting}
+                className="px-4 py-2 rounded-lg text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50"
               >
                 {t('common.cancel')}
               </button>
               <button
                 onClick={() => handleDelete(deleteTarget)}
-                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors"
+                disabled={deleting}
+                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50"
               >
                 {t('common.delete')}
               </button>

@@ -10,7 +10,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -132,15 +134,30 @@ func (u *Updater) Apply(ctx context.Context, allowMajor bool) error {
 		return fmt.Errorf("refusing to auto-cross a major version (%s → %s); update manually", u.current, rel.TagName)
 	}
 
+	// A checksum file downloaded from the same release proves only that the
+	// download is intact, not who published it: anyone able to publish a release
+	// could have shipped a binary every node with apply on would run. The
+	// checksums must carry a signature from the release key built into this
+	// binary, and without a key nothing is installed.
+	pub, err := releasePublicKey()
+	if err != nil {
+		return err
+	}
+
 	want := assetBaseName()
-	var assetURL, checksumsURL string
+	var assetURL, checksumsURL, signatureURL string
 	for _, a := range rel.Assets {
 		switch a.Name {
 		case want:
 			assetURL = a.URL
 		case "checksums.txt":
 			checksumsURL = a.URL
+		case "checksums.txt.sig":
+			signatureURL = a.URL
 		}
+	}
+	if signatureURL == "" {
+		return fmt.Errorf("release has no checksums.txt.sig; refusing to install an unsigned binary")
 	}
 	if assetURL == "" {
 		return fmt.Errorf("no release asset for %s/%s", runtime.GOOS, runtime.GOARCH)
@@ -152,6 +169,13 @@ func (u *Updater) Apply(ctx context.Context, allowMajor bool) error {
 	checksums, err := u.download(ctx, checksumsURL)
 	if err != nil {
 		return fmt.Errorf("download checksums: %w", err)
+	}
+	sig, err := u.download(ctx, signatureURL)
+	if err != nil {
+		return fmt.Errorf("download checksum signature: %w", err)
+	}
+	if err := verifyChecksums(pub, checksums, sig); err != nil {
+		return err
 	}
 	wantSum, err := checksumFor(string(checksums), want)
 	if err != nil {
@@ -259,6 +283,14 @@ func replaceAndRestart(newBin []byte) error {
 	if err := os.WriteFile(tmp, newBin, 0755); err != nil {
 		return fmt.Errorf("write new binary: %w", err)
 	}
+	// Keep the running binary, so a new one that does not start can be put back
+	// by hand. It used to be overwritten in place with no copy left.
+	if old, err := os.ReadFile(exe); err == nil {
+		if err := os.WriteFile(exe+".prev", old, 0755); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("keep the previous binary: %w", err)
+		}
+	}
 	// On Unix, renaming over the running executable is safe — the running
 	// process keeps its open inode; new starts use the new file.
 	if err := os.Rename(tmp, exe); err != nil {
@@ -319,4 +351,39 @@ func majorOf(v string) int {
 		return p[0]
 	}
 	return -1
+}
+
+// releaseSigningKey is the base64 Ed25519 public key that release checksums
+// are signed with. It is set at build time by the release workflow
+// (-X .../internal/selfupdate.releaseSigningKey=...). A build without it cannot
+// verify a release and refuses to apply one.
+var releaseSigningKey = ""
+
+func releasePublicKey() (ed25519.PublicKey, error) {
+	if releaseSigningKey == "" {
+		return nil, fmt.Errorf("this build has no release signing key, so it cannot verify an update; " +
+			"update by replacing the binary or the image")
+	}
+	k, err := base64.StdEncoding.DecodeString(releaseSigningKey)
+	if err != nil || len(k) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("the release signing key built into this binary is malformed")
+	}
+	return ed25519.PublicKey(k), nil
+}
+
+// verifyChecksums checks checksums.txt against its detached signature, which is
+// the raw or base64 Ed25519 signature over the file's exact bytes.
+func verifyChecksums(pub ed25519.PublicKey, checksums, sig []byte) error {
+	raw := sig
+	if len(raw) != ed25519.SignatureSize {
+		d, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sig)))
+		if err != nil {
+			return fmt.Errorf("checksum signature is malformed; refusing to install")
+		}
+		raw = d
+	}
+	if len(raw) != ed25519.SignatureSize || !ed25519.Verify(pub, checksums, raw) {
+		return fmt.Errorf("checksum signature does not verify against the release key; refusing to install")
+	}
+	return nil
 }

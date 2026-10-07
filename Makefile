@@ -10,7 +10,7 @@ LDFLAGS=-X main.version=$(VERSION)
 
 # Build React frontend
 web:
-	cd web && npm install && npm run build
+	cd web && npm ci && npm run build
 	rm -rf internal/dashboard/dist
 	cp -r web/dist internal/dashboard/dist
 
@@ -26,7 +26,7 @@ build-go:
 
 # Build CLI only
 cli:
-	go build -o $(BUILD_DIR)/$(CLI_NAME) ./cmd/vaults3-cli
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(CLI_NAME) ./cmd/vaults3-cli
 
 run: build
 	./$(BINARY_NAME)

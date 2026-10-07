@@ -1,8 +1,9 @@
 package api
 
 import (
-	"io"
+	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/versioning"
 )
@@ -177,42 +178,79 @@ func (h *APIHandler) handleRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read the specified version
-	reader, size, err := h.engine.GetObjectVersion(req.Bucket, req.Key, req.VersionID)
-	if err != nil {
+	// Rollback means "make that version's content the latest again", which on
+	// a versioned bucket is a new version, the way S3 does it with a copy. It
+	// used to write the content to the plain object path with no version id,
+	// leave the old latest still marked latest, and discard the metadata error.
+	// Version listings then disagreed with GET, and the next upload, which only
+	// preserved a previous latest that had a version id, turned the rolled back
+	// content into an orphan for the reclaim scan to delete.
+	if versioning, _ := h.store.GetBucketVersioning(req.Bucket); versioning != "Enabled" {
+		writeError(w, http.StatusConflict, "rollback needs versioning enabled on the bucket, so the content it replaces is kept as a version")
+		return
+	}
+
+	oldMeta, err := h.store.GetObjectVersion(req.Bucket, req.Key, req.VersionID)
+	if err != nil || oldMeta == nil {
 		writeError(w, http.StatusNotFound, "version not found")
+		return
+	}
+	if oldMeta.DeleteMarker {
+		writeError(w, http.StatusBadRequest, "that version is a delete marker and has no content to roll back to")
+		return
+	}
+
+	reader, size, err := h.getVersionData(req.Bucket, req.Key, req.VersionID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "version data not found")
 		return
 	}
 	defer reader.Close()
 
-	// Get metadata from the old version
-	oldMeta, err := h.store.GetObjectVersion(req.Bucket, req.Key, req.VersionID)
+	newVersionID := genVersionID()
+	written, etag, err := h.engine.PutObjectVersion(req.Bucket, req.Key, newVersionID, reader, size)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "version metadata not found")
+		writeError(w, http.StatusInternalServerError, "could not write the new version: "+err.Error())
 		return
 	}
 
-	// Create a new version with the old content (PutObject via engine)
-	written, etag, err := h.engine.PutObject(req.Bucket, req.Key, io.Reader(reader), size)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// Update metadata to point to this as latest
+	// The new version carries the old one's content and content headers. Lock
+	// state is not copied, as with an S3 copy: the bucket default applies.
 	newMeta := *oldMeta
+	newMeta.VersionID = newVersionID
 	newMeta.ETag = etag
 	newMeta.Size = written
 	newMeta.IsLatest = true
-	newMeta.VersionID = ""
-	h.store.PutObjectMeta(newMeta)
+	newMeta.LastModified = time.Now().UTC().Unix()
+	newMeta.LegalHold = false
+	newMeta.RetentionMode = ""
+	newMeta.RetentionUntil = 0
+	newMeta.VectorClock = nil
+	newMeta.ReplicationStatus = ""
+	if b, err := h.store.GetBucket(req.Bucket); err == nil && b != nil &&
+		b.DefaultRetentionMode != "" && b.DefaultRetentionDays > 0 {
+		newMeta.RetentionMode = b.DefaultRetentionMode
+		newMeta.RetentionUntil = newMeta.LastModified + int64(b.DefaultRetentionDays*86400)
+	}
+	if err := h.recordNewLatestVersion(newMeta); err != nil {
+		if derr := h.engine.DeleteObjectVersion(req.Bucket, req.Key, newVersionID); derr != nil {
+			slog.Warn("could not remove the bytes of a rollback whose metadata failed",
+				"bucket", req.Bucket, "key", req.Key, "error", derr)
+		}
+		writeError(w, http.StatusInternalServerError, "rollback not recorded: "+err.Error())
+		return
+	}
+	if h.onReplication != nil {
+		h.onReplication("s3:ObjectCreated:Put", req.Bucket, req.Key, written, etag, newVersionID)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status": "rolled back",
-		"bucket": req.Bucket,
-		"key":    req.Key,
-		"from":   req.VersionID,
-		"size":   written,
-		"etag":   etag,
+		"status":    "rolled back",
+		"bucket":    req.Bucket,
+		"key":       req.Key,
+		"from":      req.VersionID,
+		"versionId": newVersionID,
+		"size":      written,
+		"etag":      etag,
 	})
 }

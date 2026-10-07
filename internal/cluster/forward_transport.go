@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -49,6 +50,10 @@ func newForwardTransport() http.RoundTripper {
 			IdleConnTimeout:       90 * time.Second,
 			MaxIdleConns:          1024,
 			MaxIdleConnsPerHost:   256,
+			// Peers on a TLS cluster commonly use self-signed certificates, as
+			// for every other node-to-node call (see InterNodeTransport).
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			TLSHandshakeTimeout: 5 * time.Second,
 		}
 	}
 	return &forwardTransport{

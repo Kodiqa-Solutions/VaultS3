@@ -24,7 +24,8 @@ type AccessLogger struct {
 }
 
 func NewAccessLogger(path string) (*AccessLogger, error) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// 0600: the log records client addresses, access keys and object keys.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
 	}

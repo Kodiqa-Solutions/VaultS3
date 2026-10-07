@@ -1,8 +1,12 @@
 package config
 
 import (
+	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -153,9 +157,15 @@ type MemoryConfig struct {
 }
 
 type OIDCConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	IssuerURL string `yaml:"issuer_url"`
-	ClientID  string `yaml:"client_id"`
+	// AcceptEmailWithoutVerifiedClaim lets a login through when the provider
+	// sends an email but no email_verified claim at all, which some providers
+	// (Azure AD, some ADFS setups) never send. A claim that says false is
+	// always refused. Turn it on only for a provider whose users cannot choose
+	// their own email address. (env: VAULTS3_OIDC_ACCEPT_EMAIL_WITHOUT_VERIFIED_CLAIM)
+	AcceptEmailWithoutVerifiedClaim bool   `yaml:"accept_email_without_verified_claim"`
+	Enabled                         bool   `yaml:"enabled"`
+	IssuerURL                       string `yaml:"issuer_url"`
+	ClientID                        string `yaml:"client_id"`
 	// ClientSecret turns the dashboard into a confidential OAuth client. It is
 	// needed for the authorization-code flow on providers that issue one (the
 	// default for Authentik and Keycloak). The secret is only ever used
@@ -183,11 +193,17 @@ type OIDCConfig struct {
 }
 
 type LambdaConfig struct {
-	Enabled         bool  `yaml:"enabled"`
-	MaxResponseSize int64 `yaml:"max_response_size"`
-	TimeoutSecs     int   `yaml:"timeout_secs"`
-	MaxWorkers      int   `yaml:"max_workers"`
-	QueueSize       int   `yaml:"queue_size"`
+	Enabled bool `yaml:"enabled"`
+	// AllowPrivateEndpoints lets function URLs resolve to private, loopback and
+	// link-local addresses, for functions running next to the server, such as
+	// a docker-compose service. Off by default: trigger configuration is set
+	// per bucket, so without the check a bucket owner could make the server
+	// call internal services. (env: VAULTS3_LAMBDA_ALLOW_PRIVATE_ENDPOINTS=true)
+	AllowPrivateEndpoints bool  `yaml:"allow_private_endpoints"`
+	MaxResponseSize       int64 `yaml:"max_response_size"`
+	TimeoutSecs           int   `yaml:"timeout_secs"`
+	MaxWorkers            int   `yaml:"max_workers"`
+	QueueSize             int   `yaml:"queue_size"`
 }
 
 type RateLimitConfig struct {
@@ -253,15 +269,30 @@ type ReplicationConfig struct {
 }
 
 type NotificationsConfig struct {
-	MaxWorkers  int                  `yaml:"max_workers"`
-	QueueSize   int                  `yaml:"queue_size"`
-	TimeoutSecs int                  `yaml:"timeout_secs"`
-	MaxRetries  int                  `yaml:"max_retries"`
-	Kafka       KafkaNotifyConfig    `yaml:"kafka"`
-	NATS        NATSNotifyConfig     `yaml:"nats"`
-	Redis       RedisNotifyConfig    `yaml:"redis"`
-	AMQP        AMQPNotifyConfig     `yaml:"amqp"`
-	Postgres    PostgresNotifyConfig `yaml:"postgres"`
+	// AllowPrivateWebhooks lets bucket webhooks reach private, loopback and
+	// link-local addresses. Off by default: webhook URLs are set by bucket
+	// owners, and without the check any of them could make the server call
+	// internal services or the cloud metadata endpoint.
+	// (env: VAULTS3_ALLOW_PRIVATE_WEBHOOKS=true)
+	AllowPrivateWebhooks bool                 `yaml:"allow_private_webhooks"`
+	MaxWorkers           int                  `yaml:"max_workers"`
+	QueueSize            int                  `yaml:"queue_size"`
+	TimeoutSecs          int                  `yaml:"timeout_secs"`
+	MaxRetries           int                  `yaml:"max_retries"`
+	Kafka                KafkaNotifyConfig    `yaml:"kafka"`
+	NATS                 NATSNotifyConfig     `yaml:"nats"`
+	Redis                RedisNotifyConfig    `yaml:"redis"`
+	AMQP                 AMQPNotifyConfig     `yaml:"amqp"`
+	Postgres             PostgresNotifyConfig `yaml:"postgres"`
+	// Elasticsearch was documented and shipped in the sample config, but no
+	// setting read it, so the backend could never be turned on.
+	Elasticsearch ElasticsearchNotifyConfig `yaml:"elasticsearch"`
+}
+
+type ElasticsearchNotifyConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	URL     string `yaml:"url"`
+	Index   string `yaml:"index"`
 }
 
 type KafkaNotifyConfig struct {
@@ -294,6 +325,11 @@ type PostgresNotifyConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	ConnStr string `yaml:"conn_str"`
 	Table   string `yaml:"table"`
+	// The shipped config and the docs named this key connection_string and dsn,
+	// neither of which was read, so a backend configured as documented never
+	// started and logged nothing. Both spellings are accepted.
+	ConnectionString string `yaml:"connection_string"`
+	DSN              string `yaml:"dsn"`
 }
 
 type SecurityConfig struct {
@@ -310,7 +346,12 @@ type ServerConfig struct {
 	ShutdownTimeoutSecs int       `yaml:"shutdown_timeout_secs"`
 	TLS                 TLSConfig `yaml:"tls"`
 	InterNodeAddress    string    `yaml:"internode_address"` // separate bind address for inter-node traffic
-	InterNodePort       int       `yaml:"internode_port"`    // separate port for inter-node traffic
+	// TrustedProxies lists reverse proxies (addresses or CIDRs) whose
+	// X-Forwarded-For is believed. Without it every client behind nginx shares
+	// the proxy's address for rate limits, IP rules and aws:SourceIp.
+	// (env: VAULTS3_TRUSTED_PROXIES, comma separated)
+	TrustedProxies []string `yaml:"trusted_proxies"`
+	InterNodePort  int      `yaml:"internode_port"` // separate port for inter-node traffic
 	// ConsolePort, when set, serves the dashboard (Web UI) + its API on a separate
 	// port from the S3 API — so each can have its own network rules / TLS / proxy
 	// (MinIO-style). 0 = serve everything on Port. See issue #18.
@@ -353,6 +394,13 @@ type StorageConfig struct {
 type AuthConfig struct {
 	AdminAccessKey string `yaml:"admin_access_key"`
 	AdminSecretKey string `yaml:"admin_secret_key"`
+	// OverrideStoredCredentials makes the credentials above replace the ones
+	// saved in the metadata store at startup. Saved credentials normally win,
+	// so a change made in the dashboard survives a restart with the original
+	// values still in the environment. That also meant a leaked or example
+	// secret could not be replaced from the environment at all.
+	// (env: VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true)
+	OverrideStoredCredentials bool `yaml:"override_stored_credentials"`
 }
 
 // ExternalAuthConfig delegates the access decision to an HTTP endpoint the
@@ -585,6 +633,18 @@ func parse(data []byte) (*Config, error) {
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
+		warnUnknownKeys(data)
+	}
+	pg := &cfg.Notifications.Postgres
+	if pg.ConnStr == "" {
+		if pg.ConnectionString != "" {
+			pg.ConnStr = pg.ConnectionString
+		} else {
+			pg.ConnStr = pg.DSN
+		}
+	}
+	if pg.Enabled && pg.ConnStr == "" {
+		slog.Warn("notifications.postgres is enabled but has no connection string (conn_str), so it will not start")
 	}
 
 	// Apply environment variable overrides
@@ -603,6 +663,14 @@ func parse(data []byte) (*Config, error) {
 			return nil, fmt.Errorf("invalid encryption config: %w", err)
 		}
 	}
+	// The vault provider never worked: it decoded Vault's base64 data key as
+	// hex, so startup failed with "encoding/hex: invalid byte", and it asked
+	// Vault for a new key on every fetch, so fixing the decoding alone would
+	// have lost the key on every restart. Refuse it with a message that says so.
+	if cfg.Encryption.Enabled && cfg.Encryption.KMS.Enabled && cfg.Encryption.KMS.Provider == "vault" {
+		return nil, fmt.Errorf("invalid encryption config: the HashiCorp Vault KMS provider is not supported in this release " +
+			"(see docs/CONFIGURATION.md); use encryption.kms.provider: local")
+	}
 
 	return cfg, nil
 }
@@ -616,9 +684,26 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("VAULTS3_SECRET_KEY"); v != "" {
 		cfg.Auth.AdminSecretKey = v
 	}
+	if v := os.Getenv("VAULTS3_LAMBDA_ALLOW_PRIVATE_ENDPOINTS"); v != "" {
+		cfg.Lambda.AllowPrivateEndpoints = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VAULTS3_OIDC_ACCEPT_EMAIL_WITHOUT_VERIFIED_CLAIM"); v != "" {
+		cfg.OIDC.AcceptEmailWithoutVerifiedClaim = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VAULTS3_TRUSTED_PROXIES"); v != "" {
+		cfg.Server.TrustedProxies = splitList(v)
+	}
+	if v := os.Getenv("VAULTS3_ALLOW_PRIVATE_WEBHOOKS"); v != "" {
+		cfg.Notifications.AllowPrivateWebhooks = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VAULTS3_ADMIN_CREDENTIALS_OVERRIDE"); v != "" {
+		cfg.Auth.OverrideStoredCredentials = v == "true" || v == "1"
+	}
 	if v := os.Getenv("VAULTS3_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			cfg.Server.Port = p
+		} else {
+			slog.Warn("config: ignoring VAULTS3_PORT, not a whole number", "value", v)
 		}
 	}
 	if v := os.Getenv("VAULTS3_BASE_PATH"); v != "" {
@@ -630,6 +715,8 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("VAULTS3_CONSOLE_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			cfg.Server.ConsolePort = p
+		} else {
+			slog.Warn("config: ignoring VAULTS3_CONSOLE_PORT, not a whole number", "value", v)
 		}
 	}
 	if v := os.Getenv("VAULTS3_CONSOLE_ADDRESS"); v != "" {
@@ -696,6 +783,8 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("VAULTS3_CLUSTER_RAFT_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			cfg.Cluster.RaftPort = p
+		} else {
+			slog.Warn("config: ignoring VAULTS3_CLUSTER_RAFT_PORT, not a whole number", "value", v)
 		}
 	}
 	if v := os.Getenv("VAULTS3_CLUSTER_DATA_DIR"); v != "" {
@@ -704,16 +793,22 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("VAULTS3_CLUSTER_METADATA_SHARDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Cluster.MetadataShards = n
+		} else {
+			slog.Warn("config: ignoring VAULTS3_CLUSTER_METADATA_SHARDS, not a whole number", "value", v)
 		}
 	}
 	if v := os.Getenv("VAULTS3_CLUSTER_METADATA_REPLICAS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Cluster.MetadataReplicas = n
+		} else {
+			slog.Warn("config: ignoring VAULTS3_CLUSTER_METADATA_REPLICAS, not a whole number", "value", v)
 		}
 	}
 	if v := os.Getenv("VAULTS3_CLUSTER_REPAIR_INTERVAL_SECS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Cluster.Repair.IntervalSecs = n
+		} else {
+			slog.Warn("config: ignoring VAULTS3_CLUSTER_REPAIR_INTERVAL_SECS, not a whole number", "value", v)
 		}
 	}
 	// Per-pod cluster wiring (the Helm StatefulSet derives these from the pod
@@ -749,4 +844,17 @@ func splitList(v string) []string {
 
 func (c *Config) ListenAddr() string {
 	return fmt.Sprintf("%s:%d", c.Server.Address, c.Server.Port)
+}
+
+// warnUnknownKeys reports config keys that match no setting. The config is
+// parsed leniently so an old file keeps loading, but that also meant a
+// misspelled or outdated key was ignored without a word, and the setting the
+// operator thought they had changed kept its default.
+func warnUnknownKeys(data []byte) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var probe Config
+	if err := dec.Decode(&probe); err != nil && !errors.Is(err, io.EOF) {
+		slog.Warn("config: a key matches no setting and is ignored", "detail", err.Error())
+	}
 }

@@ -69,7 +69,12 @@ func computeTCO(storageBytes int64, egressGb float64) tcoResponse {
 func (h *APIHandler) handleTCO(w http.ResponseWriter, r *http.Request) {
 	var storageBytes int64
 	buckets, _ := h.store.ListBuckets()
+	// A non-admin is costed on the buckets they may list, not on everyone's.
+	visible := h.visibleBucketSet(r, buckets)
 	for _, b := range buckets {
+		if visible != nil && !visible[b.Name] {
+			continue
+		}
 		size, _ := h.bucketStatCounter(b.Name)
 		storageBytes += size
 	}

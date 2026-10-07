@@ -48,7 +48,7 @@ encryption:
   key: ""  # 64-character hex string (32 bytes) for SSE-S3
   kms:     # SSE-KMS: a mode of its own, needs no static key
     enabled: false
-    provider: "vault"          # "vault" or "local"
+    provider: "local"          # "local" ("vault" does not work yet, see SSE-KMS below)
     vault_addr: ""
     vault_token: ""
     key_name: "vaults3-dek"
@@ -94,9 +94,6 @@ cluster:
     probe_interval_secs: 5
     suspect_after: 3
     down_after: 6
-  rebalance:
-    max_bandwidth_mbps: 50
-    batch_size: 100
   repair:
     interval_secs: 600       # restore replica counts after a node is lost, negative disables
     max_bandwidth_mbps: 50
@@ -159,14 +156,13 @@ encryption:
   enabled: true
   kms:
     enabled: true
-    provider: "vault"          # "vault" (HashiCorp Vault) or "local" (fallback)
-    vault_addr: "http://vault:8200"
-    vault_token: "hvs.xxx"
-    key_name: "vaults3-dek"    # Transit engine key name
-    local_key: ""              # hex-encoded fallback key (when provider: "local")
+    provider: "local"
+    local_key: ""              # hex-encoded 32-byte key
 ```
 
-SSE-KMS fetches data encryption keys from HashiCorp Vault's Transit engine, caches them in memory, and supports key rotation. It needs no `key` of its own, the keys come from the KMS.
+SSE-KMS takes its data key from the provider and caches it in memory. It needs no `key` of its own.
+
+**The `vault` provider does not work.** It reads Vault's data key in the wrong encoding, so a server configured with it refuses to start (`KMS key fetch failed: encoding/hex: invalid byte`). It also asks Vault for a new data key each time instead of keeping one, so fixing the encoding alone would make every restart lose the key. No data can have been written with it. Use `local` until it is reimplemented.
 
 **Per-bucket keys**, each bucket sealed with its own data key, wrapped by a master key, so a bucket can be rotated or crypto-shredded on its own:
 

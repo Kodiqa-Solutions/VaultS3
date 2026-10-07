@@ -144,3 +144,33 @@ func TestDashboardURLIsReachable(t *testing.T) {
 		}
 	}
 }
+
+// Saved credentials win over configuration, so a leaked or example secret could
+// not be replaced from the environment, while the first-run banner and the
+// upgrade notes told operators to do exactly that. The override puts the
+// configured pair in force and saves it, and without it the saved pair still wins.
+func TestCredentialOverrideReplacesSavedCredentials(t *testing.T) {
+	store := newCredTestStore(t)
+	if err := store.SetAdminCredentials("vaults3-admin", publishedPlaceholderSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	plain := config.Defaults()
+	plain.Auth.AdminAccessKey, plain.Auth.AdminSecretKey = "vaults3-admin", "a-new-secret-0123456789"
+	if _, err := resolveAdminCredentials(plain, store, newCredTestAuth(plain, store)); err != nil {
+		t.Fatal(err)
+	}
+	if plain.Auth.AdminSecretKey != publishedPlaceholderSecret {
+		t.Fatalf("without the override the saved secret must still win, server uses %q", plain.Auth.AdminSecretKey)
+	}
+
+	over := config.Defaults()
+	over.Auth.AdminAccessKey, over.Auth.AdminSecretKey = "vaults3-admin", "a-new-secret-0123456789"
+	over.Auth.OverrideStoredCredentials = true
+	if _, err := resolveAdminCredentials(over, store, newCredTestAuth(over, store)); err != nil {
+		t.Fatal(err)
+	}
+	if _, sk, _ := store.GetAdminCredentials(); sk != "a-new-secret-0123456789" {
+		t.Fatalf("the override did not replace the saved secret, store holds %q", sk)
+	}
+}

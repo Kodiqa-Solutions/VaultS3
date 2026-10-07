@@ -20,6 +20,7 @@ Subcommands:
   create <user> --bucket <name> [--bucket ..]  Issue a key with access to these buckets
   create <user> --all-buckets                  Issue a key with access to every bucket
   create <user> --user-policies                Issue a key limited to the user's own policies
+  create ... --force                           Issue it even when a node's version cannot be confirmed
   delete <access-key>                          Delete an access key
 
 The server generates the access key and secret key. The secret is printed once,
@@ -89,13 +90,18 @@ func keyCreate(args []string) {
 		fatal("key create requires a user name")
 	}
 	user := args[0]
+	// The API creates a missing user, and a name holding '/' could then never
+	// be addressed again, so it could not be deleted from the CLI.
+	refuseUnaddressable(user)
 
 	buckets := []string{}
-	all, userOnly := false, false
+	all, userOnly, force := false, false, false
 	rest := args[1:]
 	for i := 0; i < len(rest); i++ {
 		arg := rest[i]
 		switch {
+		case arg == "--force":
+			force = true
 		case arg == "--all-buckets":
 			all = true
 		case arg == "--user-policies":
@@ -134,10 +140,21 @@ func keyCreate(args []string) {
 	// rewrites what the user's existing keys can reach. Undoing that afterwards
 	// is no better, because deleting a key there deletes its user too. So ask
 	// first. The oldest node counts, since every node authorizes the key.
-	if v, ok := oldestServerVersion(); ok && versionBefore(v, 4, 4, 79) {
+	vc := checkServerVersions()
+	if vc.oldest != "" && versionBefore(vc.oldest, 4, 4, 79) {
 		fatal(fmt.Sprintf("the server runs %s, and key create needs 4.4.79 or later. On older servers a key "+
 			"can get more access than asked for, and a new key changes what the user's other keys can reach. "+
-			"Upgrade the server first", v))
+			"Upgrade the server first", vc.oldest))
+	}
+	// A node whose version cannot be read is exactly the risky case: the
+	// :latest image reports "main", a source build reports "dev", and a node
+	// that does not answer reports nothing, yet each of them may be older than
+	// 4.4.79. Treating that as a pass let the check wave through the servers it
+	// exists for, so it needs an explicit --force.
+	if len(vc.unknown) > 0 && !force {
+		fatal(fmt.Sprintf("cannot confirm every node runs 4.4.79 or later: %s. On an older server a key "+
+			"can get more access than asked for, and a new key changes what the user's other keys can reach. "+
+			"Check the version on each node, then re-run with --force", strings.Join(vc.unknown, ", ")))
 	}
 
 	req := map[string]interface{}{"userId": user}
@@ -182,8 +199,9 @@ func keyCreate(args []string) {
 	case "user":
 		grants = "exactly what the user's own policies allow"
 	default:
-		// Only a server whose version could not be read gets this far without
-		// saying. If it predates 4.4.79 it ignored --user-policies.
+		// Only a server whose version could not be read, accepted with
+		// --force, gets this far without saying. If it predates 4.4.79 it
+		// ignored --user-policies.
 		grants = "not reported by this server"
 		if userOnly {
 			grants += ". WARNING: a server older than 4.4.79 ignores --user-policies and grants every bucket"
@@ -213,37 +231,70 @@ func keyDelete(accessKeyID string) {
 	}
 }
 
-// oldestServerVersion reports the lowest version among the nodes that answer,
-// and false when no node reports a version that can be compared, such as "dev"
-// or "main".
-func oldestServerVersion() (string, bool) {
+// versionCheck is what the cluster said about its versions: the lowest
+// version a node reported, and a description of every node, or of the whole
+// request, whose version could not be learned.
+type versionCheck struct {
+	oldest  string
+	unknown []string
+}
+
+// checkServerVersions asks the cluster which version each node runs. A node
+// that is unreachable or reports a version that cannot be compared, such as
+// "dev" or "main", is listed as unknown, and so is the whole cluster when the
+// question cannot be asked at all.
+func checkServerVersions() versionCheck {
+	var vc versionCheck
 	resp, err := apiRequest("GET", "/cluster/info", nil)
 	if err != nil {
-		return "", false
+		vc.unknown = append(vc.unknown, "the version request failed ("+err.Error()+")")
+		return vc
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return "", false
+		vc.unknown = append(vc.unknown, fmt.Sprintf("the version request returned HTTP %d", resp.StatusCode))
+		return vc
 	}
 	var ci struct {
 		Nodes []struct {
+			NodeID    string `json:"nodeId"`
+			Address   string `json:"address"`
 			Reachable bool   `json:"reachable"`
 			Version   string `json:"version"`
 		} `json:"nodes"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&ci); err != nil {
-		return "", false
+		vc.unknown = append(vc.unknown, "the version answer could not be read ("+err.Error()+")")
+		return vc
 	}
-	oldest, found := "", false
+	if len(ci.Nodes) == 0 {
+		vc.unknown = append(vc.unknown, "the server listed no nodes")
+	}
 	for _, n := range ci.Nodes {
-		if _, ok := parseVersion(n.Version); !ok {
+		name := n.NodeID
+		if name == "" {
+			name = n.Address
+		}
+		if name == "" {
+			name = "this node"
+		}
+		if !n.Reachable {
+			vc.unknown = append(vc.unknown, fmt.Sprintf("node %s is unreachable", name))
 			continue
 		}
-		if !found || versionLess(n.Version, oldest) {
-			oldest, found = n.Version, true
+		if _, ok := parseVersion(n.Version); !ok {
+			v := n.Version
+			if v == "" {
+				v = "nothing"
+			}
+			vc.unknown = append(vc.unknown, fmt.Sprintf("node %s reports version %q", name, v))
+			continue
+		}
+		if vc.oldest == "" || versionLess(n.Version, vc.oldest) {
+			vc.oldest = n.Version
 		}
 	}
-	return oldest, found
+	return vc
 }
 
 // parseVersion reads "v4.4.79", "4.4.79" or "v4.4.79-local" as [4 4 79].

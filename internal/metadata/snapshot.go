@@ -1,44 +1,138 @@
 package metadata
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
+	"sync"
 
 	bolt "go.etcd.io/bbolt"
 )
 
-// WriteSnapshot writes the entire BoltDB database to w for Raft snapshots.
-// Format: sequence of (bucketNameLen uint32, bucketName, numKV uint64, [(keyLen uint32, key, valLen uint32, val)]...)
+// snapshotMagic opens every snapshot this version writes. The first format had
+// no header and began with the length of the first bucket name, a small number,
+// so a stream that starts with these bytes cannot be one of those: the reader
+// tells the two apart by peeking, and a node can still install a snapshot an
+// older version wrote.
+//
+// The last byte is the format version.
+var snapshotMagic = []byte("VS3RAFT\x02")
+
+// Format 2 is:
+//
+//	magic
+//	for each bucket: name length (uint32, never 0), name, bolt sequence (uint64),
+//	    then for each pair: key length (uint32, never 0), key, value length, value,
+//	    then a zero key length closing the bucket
+//	a zero name length closing the snapshot
+//
+// The first format wrote a key count ahead of each bucket. That needed a full
+// extra pass over the bucket before the first byte of it could be written, which
+// doubled the time a snapshot holds its read transaction open (see
+// RaftSnapshot). The end markers make the count unnecessary, and the closing
+// marker means a truncated stream is reported instead of being taken for a
+// complete one. bbolt rejects empty keys and empty bucket names, so a zero
+// length can never be real data.
+//
+// The sequence is carried so a restored bucket keeps handing out IDs above the
+// ones it already holds.
+
+// RaftSnapshot is a point-in-time view of the Raft-owned part of the store.
+//
+// The read transaction is opened when the snapshot is taken, not when it is
+// written out. Raft records the snapshot's index at the moment it asks for the
+// snapshot and keeps applying entries while the bytes are written, so a dump
+// read later contained entries after that index, which were then applied a
+// second time on top of it after a restore. Most commands survive that, but not
+// all of them (an enqueue, for one, used to create a duplicate event).
+//
+// Holding the transaction has a cost: bbolt cannot grow its memory map while a
+// read transaction is open, so a write that needs the file to grow waits for
+// the snapshot to finish. Writing the snapshot in one pass keeps that window as
+// short as it can be.
+type RaftSnapshot struct {
+	tx   *bolt.Tx
+	once sync.Once
+}
+
+// BeginRaftSnapshot opens the read transaction a snapshot will be written from.
+// The caller must call Release.
+func (s *Store) BeginRaftSnapshot() (*RaftSnapshot, error) {
+	tx, err := s.db.Begin(false)
+	if err != nil {
+		return nil, fmt.Errorf("begin snapshot transaction: %w", err)
+	}
+	return &RaftSnapshot{tx: tx}, nil
+}
+
+// Release ends the snapshot's read transaction. Safe to call more than once.
+func (sn *RaftSnapshot) Release() {
+	sn.once.Do(func() { sn.tx.Rollback() })
+}
+
+// Encode writes the snapshot in the current format.
+func (sn *RaftSnapshot) Encode(w io.Writer) error {
+	bw := bufio.NewWriterSize(w, 256<<10)
+	if _, err := bw.Write(snapshotMagic); err != nil {
+		return fmt.Errorf("write snapshot header: %w", err)
+	}
+	write := func(name []byte, keep func(key []byte) bool) error {
+		b := sn.tx.Bucket(name)
+		if b == nil {
+			return nil
+		}
+		if err := writeBytes(bw, name); err != nil {
+			return fmt.Errorf("write bucket name %s: %w", name, err)
+		}
+		if err := binary.Write(bw, binary.BigEndian, b.Sequence()); err != nil {
+			return fmt.Errorf("write bucket sequence %s: %w", name, err)
+		}
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if v == nil {
+				continue // a nested bucket, which this store never creates
+			}
+			if keep != nil && !keep(k) {
+				continue
+			}
+			if err := writeBytes(bw, k); err != nil {
+				return err
+			}
+			if err := writeBytes(bw, v); err != nil {
+				return err
+			}
+		}
+		return binary.Write(bw, binary.BigEndian, uint32(0))
+	}
+	for _, name := range raftOwnedBuckets {
+		if err := write(name, nil); err != nil {
+			return err
+		}
+	}
+	for name := range mixedBuckets {
+		bucket := []byte(name)
+		if err := write(bucket, func(k []byte) bool { return raftOwnsKey(bucket, k) }); err != nil {
+			return err
+		}
+	}
+	if err := binary.Write(bw, binary.BigEndian, uint32(0)); err != nil {
+		return err
+	}
+	return bw.Flush()
+}
+
+// WriteSnapshot writes the Raft-owned part of the store to w, as of the moment
+// it is called.
 func (s *Store) WriteSnapshot(w io.Writer) error {
-	return s.db.View(func(tx *bolt.Tx) error {
-		return tx.ForEach(func(name []byte, b *bolt.Bucket) error {
-			// Write bucket name
-			if err := writeBytes(w, name); err != nil {
-				return fmt.Errorf("write bucket name %s: %w", name, err)
-			}
-
-			// Count keys
-			var count uint64
-			b.ForEach(func(k, v []byte) error {
-				count++
-				return nil
-			})
-
-			// Write key count
-			if err := binary.Write(w, binary.BigEndian, count); err != nil {
-				return fmt.Errorf("write key count: %w", err)
-			}
-
-			// Write each key-value pair
-			return b.ForEach(func(k, v []byte) error {
-				if err := writeBytes(w, k); err != nil {
-					return err
-				}
-				return writeBytes(w, v)
-			})
-		})
-	})
+	sn, err := s.BeginRaftSnapshot()
+	if err != nil {
+		return err
+	}
+	defer sn.Release()
+	return sn.Encode(w)
 }
 
 // restoreStateBucket records that a snapshot restore is under way. It is written
@@ -63,53 +157,131 @@ var (
 	restoreBatchKeys  = 20000
 )
 
-// RestoreSnapshot replaces the entire BoltDB state from a snapshot reader.
+// RestoreSnapshot replaces the Raft-owned part of the store with a snapshot.
+// Node-local buckets are left exactly as they are, including when the snapshot
+// came from an older version that wrote them into it: those are read past and
+// dropped.
 //
 // The restore is NOT atomic: it commits as it goes, so an interrupted restore
-// leaves a partial DB. That is deliberate, and safe, because the state is
-// entirely derived from Raft — the sentinel below marks the DB as incomplete and
-// the next open clears it, after which Raft installs its snapshot again. The
+// leaves a partial DB. That is deliberate, and safe, because the Raft-owned state
+// is entirely derived from Raft: the sentinel below marks the DB as incomplete
+// and the next open clears it, after which Raft installs its snapshot again. The
 // alternative (one transaction) is atomic but allocates without bound, which is
 // the failure this replaced.
 func (s *Store) RestoreSnapshot(r io.Reader) error {
+	br := bufio.NewReaderSize(r, 256<<10)
+	current := false
+	if head, err := br.Peek(len(snapshotMagic)); err == nil && bytes.Equal(head, snapshotMagic) {
+		current = true
+		if _, err := br.Discard(len(snapshotMagic)); err != nil {
+			return fmt.Errorf("read snapshot header: %w", err)
+		}
+	}
+
 	if err := s.beginRestore(); err != nil {
 		return err
 	}
 
 	for {
-		name, err := readBytes(r)
-		if err == io.EOF {
+		name, err := readBytes(br)
+		if err == io.EOF && !current {
+			// The first format simply ended after its last bucket.
 			return s.finishRestore()
 		}
 		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
 			return fmt.Errorf("read bucket name: %w", err)
 		}
-
-		var count uint64
-		if err := binary.Read(r, binary.BigEndian, &count); err != nil {
-			return fmt.Errorf("read key count: %w", err)
+		if current && len(name) == 0 {
+			return s.finishRestore()
 		}
 
-		if err := s.restoreBucket(r, name, count); err != nil {
+		var next func() (key, val []byte, ok bool, err error)
+		var sequence uint64
+		if current {
+			if err := binary.Read(br, binary.BigEndian, &sequence); err != nil {
+				return fmt.Errorf("read bucket sequence: %w", err)
+			}
+			next = func() ([]byte, []byte, bool, error) {
+				key, err := readBytes(br)
+				if err != nil {
+					return nil, nil, false, fmt.Errorf("read key: %w", err)
+				}
+				if len(key) == 0 {
+					return nil, nil, false, nil
+				}
+				val, err := readBytes(br)
+				if err != nil {
+					return nil, nil, false, fmt.Errorf("read value: %w", err)
+				}
+				return key, val, true, nil
+			}
+		} else {
+			var count uint64
+			if err := binary.Read(br, binary.BigEndian, &count); err != nil {
+				return fmt.Errorf("read key count: %w", err)
+			}
+			next = countedPairs(br, count)
+		}
+
+		if err := s.restoreScopedBucket(name, sequence, next); err != nil {
 			return err
 		}
 	}
 }
 
-// beginRestore drops the existing state and marks the DB as mid-restore.
-func (s *Store) beginRestore() error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		var existing [][]byte
-		tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
-			existing = append(existing, append([]byte{}, name...))
-			return nil
-		})
-		for _, name := range existing {
-			if err := tx.DeleteBucket(name); err != nil {
-				return fmt.Errorf("delete bucket %s: %w", name, err)
+// countedPairs reads the key/value pairs of one bucket in the first snapshot
+// format, which gave their number up front.
+func countedPairs(r io.Reader, count uint64) func() ([]byte, []byte, bool, error) {
+	var read uint64
+	return func() ([]byte, []byte, bool, error) {
+		if read >= count {
+			return nil, nil, false, nil
+		}
+		read++
+		key, err := readBytes(r)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("read key: %w", err)
+		}
+		val, err := readBytes(r)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("read value: %w", err)
+		}
+		return key, val, true, nil
+	}
+}
+
+// restoreScopedBucket restores one bucket of a snapshot according to who owns
+// it. A Raft bucket is restored whole, a mixed one only for its Raft keys, and
+// anything else is read past without writing, so a node keeps its own copy.
+func (s *Store) restoreScopedBucket(name []byte, sequence uint64, next func() ([]byte, []byte, bool, error)) error {
+	switch bucketScopeOf(name) {
+	case scopeRaft:
+		return s.restorePairs(name, sequence, next, nil)
+	case scopeMixed:
+		return s.restorePairs(name, 0, next, func(k []byte) bool { return raftOwnsKey(name, k) })
+	default:
+		if bucketScopeOf(name) == scopeUnknown {
+			slog.Warn("metadata: snapshot holds a bucket this version does not know, skipping it", "bucket", string(name))
+		}
+		for {
+			_, _, ok, err := next()
+			if err != nil || !ok {
+				return err
 			}
 		}
-		b, err := tx.CreateBucket(restoreStateBucket)
+	}
+}
+
+// beginRestore drops the Raft-owned state and marks the DB as mid-restore.
+func (s *Store) beginRestore() error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if err := dropRaftState(tx); err != nil {
+			return err
+		}
+		b, err := tx.CreateBucketIfNotExists(restoreStateBucket)
 		if err != nil {
 			return fmt.Errorf("create restore state: %w", err)
 		}
@@ -117,9 +289,46 @@ func (s *Store) beginRestore() error {
 	})
 }
 
-// finishRestore clears the mid-restore marker, making the DB usable.
+// dropRaftState deletes every Raft-owned bucket and the Raft keys of every mixed
+// one, and nothing else.
+func dropRaftState(tx *bolt.Tx) error {
+	for _, name := range raftOwnedBuckets {
+		if tx.Bucket(name) == nil {
+			continue
+		}
+		if err := tx.DeleteBucket(name); err != nil {
+			return fmt.Errorf("delete bucket %s: %w", name, err)
+		}
+	}
+	for name, keys := range mixedBuckets {
+		b := tx.Bucket([]byte(name))
+		if b == nil {
+			continue
+		}
+		for key := range keys {
+			if err := b.Delete([]byte(key)); err != nil {
+				return fmt.Errorf("delete %s/%s: %w", name, key, err)
+			}
+		}
+	}
+	return nil
+}
+
+// finishRestore recreates any Raft bucket the snapshot did not carry, so code
+// that expects it never meets a missing bucket, and then clears the mid-restore
+// marker, making the DB usable.
 func (s *Store) finishRestore() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
+		for _, name := range raftOwnedBuckets {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return fmt.Errorf("create bucket %s: %w", name, err)
+			}
+		}
+		for name := range mixedBuckets {
+			if _, err := tx.CreateBucketIfNotExists([]byte(name)); err != nil {
+				return fmt.Errorf("create bucket %s: %w", name, err)
+			}
+		}
 		if b := tx.Bucket(restoreStateBucket); b != nil {
 			return b.Delete(restoreInProgressKey)
 		}
@@ -127,13 +336,26 @@ func (s *Store) finishRestore() error {
 	})
 }
 
-// restoreBucket reads count key/value pairs for one bucket, committing every
-// restoreBatchKeys keys or restoreBatchBytes of data so peak memory stays bounded
-// by the batch rather than by the size of the snapshot.
+// restoreBucket reads count key/value pairs in the first snapshot format into
+// one bucket.
 func (s *Store) restoreBucket(r io.Reader, name []byte, count uint64) error {
+	return s.restorePairs(name, 0, countedPairs(r, count), nil)
+}
+
+// restorePairs writes the pairs next yields into one bucket, committing every
+// restoreBatchKeys keys or restoreBatchBytes of data so peak memory stays bounded
+// by the batch rather than by the size of the snapshot. keep, when set, picks
+// which keys are written. A non-zero sequence becomes the bucket's sequence.
+func (s *Store) restorePairs(name []byte, sequence uint64, next func() ([]byte, []byte, bool, error), keep func(key []byte) bool) error {
 	if err := s.db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(name)
-		return err
+		b, err := tx.CreateBucketIfNotExists(name)
+		if err != nil {
+			return err
+		}
+		if sequence > b.Sequence() {
+			return b.SetSequence(sequence)
+		}
+		return nil
 	}); err != nil {
 		return fmt.Errorf("create bucket %s: %w", name, err)
 	}
@@ -163,14 +385,16 @@ func (s *Store) restoreBucket(r io.Reader, name []byte, count uint64) error {
 		return err
 	}
 
-	for i := uint64(0); i < count; i++ {
-		key, err := readBytes(r)
+	for {
+		key, val, ok, err := next()
 		if err != nil {
-			return fmt.Errorf("read key: %w", err)
+			return err
 		}
-		val, err := readBytes(r)
-		if err != nil {
-			return fmt.Errorf("read value: %w", err)
+		if !ok {
+			break
+		}
+		if keep != nil && !keep(key) {
+			continue
 		}
 		batch = append(batch, pair{key, val})
 		batchBytes += len(key) + len(val)
@@ -198,21 +422,18 @@ func (s *Store) restoreWasInterrupted() bool {
 	return interrupted
 }
 
-// clearInterruptedRestore empties the DB left by an interrupted restore. Raft
-// installs its snapshot again on the next restore, so starting from empty is the
-// correct recovery; keeping the partial data would mean serving a subset of the
-// cluster's objects as if it were the whole set.
+// clearInterruptedRestore empties the Raft-owned state left by an interrupted
+// restore. Raft installs its snapshot again on the next restore, so starting
+// from empty is the correct recovery. Keeping the partial data would mean serving
+// a subset of the cluster's objects as if it were the whole set. Node-local
+// buckets were never touched by the restore, so they are kept.
 func (s *Store) clearInterruptedRestore() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		var existing [][]byte
-		tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
-			existing = append(existing, append([]byte{}, name...))
-			return nil
-		})
-		for _, name := range existing {
-			if err := tx.DeleteBucket(name); err != nil {
-				return fmt.Errorf("delete bucket %s: %w", name, err)
-			}
+		if err := dropRaftState(tx); err != nil {
+			return err
+		}
+		if tx.Bucket(restoreStateBucket) != nil {
+			return tx.DeleteBucket(restoreStateBucket)
 		}
 		return nil
 	})

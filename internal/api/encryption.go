@@ -27,11 +27,15 @@ func (h *APIHandler) handleBucketEncryption(w http.ResponseWriter, r *http.Reque
 		cfg, _ := h.store.GetEncryptionConfig(bucket)
 		resp := map[string]any{
 			"available": h.keyMgr != nil, // per-bucket encryption configured on the server
-			"enabled":   cfg != nil && cfg.KeyVersion > 0,
+			// A bucket whose default encryption was removed keeps its keys for
+			// the objects already encrypted, so a key version alone does not
+			// mean new objects are encrypted.
+			"enabled": cfg != nil && cfg.KeyVersion > 0 && cfg.SSEAlgorithm == "AES256",
 		}
 		if cfg != nil {
 			resp["keyVersion"] = cfg.KeyVersion
 			resp["algorithm"] = cfg.SSEAlgorithm
+			resp["shredded"] = cfg.Shredded
 		}
 		writeJSON(w, http.StatusOK, resp)
 		return

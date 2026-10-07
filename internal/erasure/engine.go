@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
@@ -99,7 +101,7 @@ func (e *Engine) PutObject(bucket, key string, reader io.Reader, size int64) (in
 	// engine, so it pays neither the parity overhead nor the whole-object buffer
 	// that encoding requires (issue #39).
 	if !e.encodesBucket(bucket) {
-		return e.inner.PutObject(bucket, key, reader, size)
+		return e.putPlain(bucket, key, reader, size)
 	}
 
 	// Stream when the length is known and the object is large enough to be
@@ -120,7 +122,7 @@ func (e *Engine) PutObject(bucket, key string, reader io.Reader, size int64) (in
 
 	// Small objects: store directly without EC
 	if actualSize < e.cfg.BlockSize {
-		return e.inner.PutObject(bucket, key, bytes.NewReader(data), actualSize)
+		return e.putPlain(bucket, key, bytes.NewReader(data), actualSize)
 	}
 
 	// Erasure code the object
@@ -133,7 +135,10 @@ func (e *Engine) PutObject(bucket, key string, reader io.Reader, size int64) (in
 	hash := md5.Sum(data)
 	etag := fmt.Sprintf("%x", hash)
 
-	// Store shard metadata
+	// The shards go under a fresh generation and meta.json is switched last,
+	// exactly as in the streaming path. This path used to write meta.json
+	// FIRST, so for the length of the write every reader was pointed at a
+	// half-written set of shards.
 	meta := &ShardMeta{
 		OriginalSize: actualSize,
 		DataShards:   e.cfg.DataShards,
@@ -142,33 +147,116 @@ func (e *Engine) PutObject(bucket, key string, reader io.Reader, size int64) (in
 		ShardSizes:   make([]int64, len(shards)),
 		ETag:         etag,
 		CreatedAt:    time.Now().UTC(),
-	}
-
-	for i, shard := range shards {
-		meta.ShardSizes[i] = int64(len(shard))
-	}
-
-	metaBytes, err := meta.Marshal()
-	if err != nil {
-		return 0, "", fmt.Errorf("marshal shard meta: %w", err)
-	}
-
-	// Store metadata file
-	mKey := metaKey(key)
-	if _, _, err := e.backendFor(0).PutObject(bucket, mKey, bytes.NewReader(metaBytes), int64(len(metaBytes))); err != nil {
-		return 0, "", fmt.Errorf("store shard meta: %w", err)
+		Generation:   newGeneration(),
+		ShardCRC:     make([]string, len(shards)),
+		CRCStripe:    crcStripeBytes,
 	}
 
 	// Distribute shards across backends
 	for i, shard := range shards {
-		backend := e.backendFor(i)
-		sKey := shardKey(key, i)
-		if _, _, err := backend.PutObject(bucket, sKey, bytes.NewReader(shard), int64(len(shard))); err != nil {
+		meta.ShardSizes[i] = int64(len(shard))
+		sum := newStripeSummer(crcStripeBytes)
+		sum.Write(shard)
+		meta.ShardCRC[i] = sum.encoded()
+		if _, _, err := e.backendFor(i).PutObject(bucket, meta.shardPath(key, i), bytes.NewReader(shard), int64(len(shard))); err != nil {
+			e.removeShards(bucket, key, meta, i+1)
 			return 0, "", fmt.Errorf("store shard %d: %w", i, err)
 		}
 	}
 
+	if err := e.commitMeta(bucket, key, meta); err != nil {
+		e.removeShards(bucket, key, meta, -1)
+		return 0, "", err
+	}
 	return actualSize, etag, nil
+}
+
+// putPlain stores an object whole in the inner engine and then retires any
+// erasure-coded version of the same key. GetObject looks for meta.json first,
+// so leaving it behind kept serving the OLD content after a small object, or
+// any object in a bucket that opted out of erasure, replaced a coded one.
+func (e *Engine) putPlain(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
+	n, etag, err := e.inner.PutObject(bucket, key, reader, size)
+	if err != nil {
+		return n, etag, err
+	}
+	if err := e.dropErasureCopy(bucket, key); err != nil {
+		return 0, "", err
+	}
+	return n, etag, nil
+}
+
+// dropErasureCopy removes an erasure-coded version of key, meta.json first so
+// reads switch to the plain object at once. Failing to remove meta.json is an
+// error, because the old version would still be what every read returns. A
+// shard left behind after that is only unreferenced space, so it is logged.
+func (e *Engine) dropErasureCopy(bucket, key string) error {
+	mKey := metaKey(key)
+	if !e.backendFor(0).ObjectExists(bucket, mKey) {
+		return nil
+	}
+	old, merr := e.readShardMeta(bucket, key)
+	if err := e.backendFor(0).DeleteObject(bucket, mKey); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("retire erasure-coded version: %w", err)
+	}
+	if merr != nil {
+		slog.Warn("erasure: shard meta unreadable, its shards are left behind", "bucket", bucket, "key", key, "error", merr)
+		return nil
+	}
+	if err := e.removeShards(bucket, key, old, -1); err != nil {
+		slog.Warn("erasure: could not remove superseded shards", "bucket", bucket, "key", key, "error", err)
+	}
+	return nil
+}
+
+// commitMeta makes a fully written set of shards the current version by
+// replacing meta.json, which the inner engine does atomically (temp file and
+// rename), and then retires what it replaced: the previous version's shards
+// and any plain copy of the key. A failure after the switch does not fail the
+// write, since the new version is already complete and current, so those
+// leftovers are logged instead.
+func (e *Engine) commitMeta(bucket, key string, meta *ShardMeta) error {
+	var old *ShardMeta
+	if e.backendFor(0).ObjectExists(bucket, metaKey(key)) {
+		old, _ = e.readShardMeta(bucket, key)
+	}
+	metaBytes, err := meta.Marshal()
+	if err != nil {
+		return fmt.Errorf("marshal shard meta: %w", err)
+	}
+	if _, _, err := e.backendFor(0).PutObject(bucket, metaKey(key), bytes.NewReader(metaBytes), int64(len(metaBytes))); err != nil {
+		return fmt.Errorf("store shard meta: %w", err)
+	}
+	if old != nil && old.Generation != meta.Generation {
+		if err := e.removeShards(bucket, key, old, -1); err != nil {
+			slog.Warn("erasure: could not remove superseded shards", "bucket", bucket, "key", key, "error", err)
+		}
+	}
+	// A plain copy left by an earlier small write would otherwise be served
+	// again once this version is deleted.
+	if e.inner.ObjectExists(bucket, key) {
+		if err := e.inner.DeleteObject(bucket, key); err != nil {
+			slog.Warn("erasure: could not remove superseded plain object", "bucket", bucket, "key", key, "error", err)
+		}
+	}
+	return nil
+}
+
+// removeShards deletes the first n shards of a version (all of them when n is
+// negative) and returns the first error. A shard that is already gone is not
+// an error.
+func (e *Engine) removeShards(bucket, key string, meta *ShardMeta, n int) error {
+	total := meta.totalShards()
+	if n < 0 || n > total {
+		n = total
+	}
+	var first error
+	for i := 0; i < n; i++ {
+		if err := e.backendFor(i).DeleteObject(bucket, meta.shardPath(key, i)); err != nil && !os.IsNotExist(err) && first == nil {
+			first = fmt.Errorf("delete shard %d: %w", i, err)
+		}
+	}
+	return first
 }
 
 func (e *Engine) GetObject(bucket, key string) (storage.ReadSeekCloser, int64, error) {
@@ -183,6 +271,10 @@ func (e *Engine) GetObject(bucket, key string) (storage.ReadSeekCloser, int64, e
 }
 
 func (e *Engine) getErasureCoded(bucket, key string) (storage.ReadSeekCloser, int64, error) {
+	return e.openCoded(bucket, key, true)
+}
+
+func (e *Engine) openCoded(bucket, key string, mayRetry bool) (storage.ReadSeekCloser, int64, error) {
 	meta, err := e.readShardMeta(bucket, key)
 	if err != nil {
 		return nil, 0, err
@@ -205,6 +297,12 @@ func (e *Engine) getErasureCoded(bucket, key string) (storage.ReadSeekCloser, in
 
 	data, err := e.reconstruct(bucket, key, meta)
 	if err != nil {
+		// An overwrite that committed between reading meta.json and opening
+		// the shards retires the generation this read was pointed at. That is
+		// not damage, so follow meta.json to the new version once.
+		if cur, merr := e.readShardMeta(bucket, key); mayRetry && merr == nil && meta.Generation != "" && cur.Generation != meta.Generation {
+			return e.openCoded(bucket, key, false)
+		}
 		return nil, 0, err
 	}
 	return newBytesReadSeekCloser(data), meta.OriginalSize, nil
@@ -237,18 +335,8 @@ func (e *Engine) reconstruct(bucket, key string, meta *ShardMeta) ([]byte, error
 	missingCount := 0
 
 	for i := 0; i < totalShards; i++ {
-		backend := e.backendFor(i)
-		sKey := shardKey(key, i)
-
-		reader, _, err := backend.GetObject(bucket, sKey)
-		if err != nil {
-			shards[i] = nil
-			missingCount++
-			continue
-		}
-		data, err := io.ReadAll(reader)
-		reader.Close()
-		if err != nil {
+		data, ok := e.readWholeShard(bucket, key, meta, i)
+		if !ok {
 			shards[i] = nil
 			missingCount++
 			continue
@@ -279,30 +367,54 @@ func (e *Engine) reconstruct(bucket, key string, meta *ShardMeta) ([]byte, error
 	return data, nil
 }
 
-func (e *Engine) DeleteObject(bucket, key string) error {
-	// Delete erasure-coded shards if they exist
-	mKey := metaKey(key)
-	if e.backendFor(0).ObjectExists(bucket, mKey) {
-		// Read meta to know shard count
-		metaReader, _, err := e.backendFor(0).GetObject(bucket, mKey)
-		if err == nil {
-			metaBytes, _ := io.ReadAll(metaReader)
-			metaReader.Close()
-			if meta, err := UnmarshalShardMeta(metaBytes); err == nil {
-				totalShards := meta.DataShards + meta.ParityShards
-				for i := 0; i < totalShards; i++ {
-					backend := e.backendFor(i)
-					_ = backend.DeleteObject(bucket, shardKey(key, i))
-				}
-			}
-		}
-		// Delete metadata
-		_ = e.backendFor(0).DeleteObject(bucket, mKey)
-		return nil
+// readWholeShard reads shard i in full and reports whether it is usable: present,
+// readable, the length meta.json recorded, and matching its checksums when the
+// version has them. An unusable shard is treated as missing, so parity covers it.
+func (e *Engine) readWholeShard(bucket, key string, meta *ShardMeta, i int) ([]byte, bool) {
+	reader, _, err := e.backendFor(i).GetObject(bucket, meta.shardPath(key, i))
+	if err != nil {
+		return nil, false
 	}
+	data, err := io.ReadAll(reader)
+	reader.Close()
+	if err != nil {
+		return nil, false
+	}
+	if i < len(meta.ShardSizes) && int64(len(data)) != meta.ShardSizes[i] {
+		return nil, false
+	}
+	if !meta.stripeOK(i, 0, data) {
+		slog.Warn("erasure: shard failed its checksum", "bucket", bucket, "key", key, "shard", i)
+		return nil, false
+	}
+	return data, true
+}
 
-	// Not erasure-coded
-	return e.inner.DeleteObject(bucket, key)
+func (e *Engine) DeleteObject(bucket, key string) error {
+	mKey := metaKey(key)
+	if !e.backendFor(0).ObjectExists(bucket, mKey) {
+		// Not erasure-coded
+		return e.inner.DeleteObject(bucket, key)
+	}
+	meta, merr := e.readShardMeta(bucket, key)
+	// meta.json goes first: once it is gone the object reads as deleted, and a
+	// shard a later step fails to remove is only unreferenced space. Every
+	// error used to be discarded here and the delete reported success, so a
+	// failed delete left the whole object readable.
+	if err := e.backendFor(0).DeleteObject(bucket, mKey); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete shard meta: %w", err)
+	}
+	var first error
+	if merr != nil {
+		slog.Warn("erasure: shard meta unreadable, its shards are left behind", "bucket", bucket, "key", key, "error", merr)
+	} else if err := e.removeShards(bucket, key, meta, -1); err != nil {
+		first = err
+	}
+	// A plain copy beside the coded one would be served once meta.json is gone.
+	if err := e.inner.DeleteObject(bucket, key); err != nil && !os.IsNotExist(err) && first == nil {
+		first = err
+	}
+	return first
 }
 
 func (e *Engine) ObjectExists(bucket, key string) bool {
@@ -335,26 +447,47 @@ func (e *Engine) ObjectSize(bucket, key string) (int64, error) {
 // --- List operations ---
 
 func (e *Engine) ListObjects(bucket, prefix, startAfter string, maxKeys int) ([]storage.ObjectInfo, bool, error) {
-	objects, truncated, err := e.inner.ListObjects(bucket, prefix, startAfter, maxKeys+100) // over-fetch to filter
-	if err != nil {
-		return nil, false, err
-	}
-
-	// Filter out .ec/ internal files
-	filtered := make([]storage.ObjectInfo, 0, len(objects))
-	for _, obj := range objects {
-		if len(obj.Key) >= 4 && obj.Key[:4] == ".ec/" {
-			continue
+	// The inner listing includes the .ec/ files that hold shards, which are
+	// filtered out here. Two things went wrong with the old fixed over-fetch of
+	// maxKeys+100: maxKeys 0 (unlimited, which backups use) became a limit of
+	// 100 and then returned nothing at all, and a page made entirely of .ec/
+	// files ended the listing early. This pages through the inner engine until
+	// it has enough real objects or runs out.
+	var out []storage.ObjectInfo
+	after := startAfter
+	for {
+		want := 0
+		if maxKeys > 0 {
+			want = maxKeys - len(out) + 1 // one extra to learn whether more exist
 		}
-		filtered = append(filtered, obj)
+		objects, truncated, err := e.inner.ListObjects(bucket, prefix, after, want)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, obj := range objects {
+			if strings.HasPrefix(obj.Key, ".ec/") {
+				continue
+			}
+			out = append(out, obj)
+		}
+		if maxKeys > 0 && len(out) > maxKeys {
+			return out[:maxKeys], true, nil
+		}
+		if !truncated || len(objects) == 0 {
+			return out, false, nil
+		}
+		after = objects[len(objects)-1].Key
+		// Inside the shard tree, jump past all of it rather than paging
+		// through every shard file.
+		if strings.HasPrefix(after, ".ec/") && after < ecListSkip {
+			after = ecListSkip
+		}
 	}
-
-	// Re-apply maxKeys limit
-	if len(filtered) > maxKeys {
-		return filtered[:maxKeys], true, nil
-	}
-	return filtered, truncated && len(filtered) >= maxKeys, nil
 }
+
+// ecListSkip sorts after every key under .ec/ and before any other key: object
+// keys are UTF-8, which never contains the byte 0xff.
+const ecListSkip = ".ec/\xff"
 
 // --- Version operations (delegate — EC applies at object level, not version level for simplicity) ---
 

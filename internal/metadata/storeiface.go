@@ -82,8 +82,8 @@ type StoreAPI interface {
 	GetVersionTag(key string) ([]byte, error)
 	GetWebsiteConfig(bucket string) (*WebsiteConfig, error)
 	HasPublicReadPolicy(bucket string) bool
-	IsBucketPublicList(bucket string) bool
-	IsObjectPublicRead(bucket, key string) bool
+	IsBucketPublicList(bucket string, ctx map[string]string) bool
+	IsObjectPublicRead(bucket, key string, ctx map[string]string) bool
 	IsBucketWebsite(bucket string) bool
 	IterateAllObjects(fn func(bucket, key string, meta ObjectMeta) bool) error
 	LatestObjectVersion(bucket, key string) (*ObjectMeta, error)
@@ -122,6 +122,7 @@ type StoreAPI interface {
 	BucketStats(bucket string) (BucketStat, bool, error)
 	SetBucketStats(bucket string, stat BucketStat) error
 	BackfillBucketStats(bucket string) (BucketStat, error)
+	BackupDB(w io.Writer) (int64, error)
 	SetBucketObjectLockEnabled(bucket string, enabled bool) error
 	ListLatestObjectsDelimited(bucket, prefix, delimiter, startAfter string, maxKeys int) ([]ObjectMeta, []CommonPrefixInfo, bool, string, error)
 	PutPart(uploadID string, part PartInfo) error

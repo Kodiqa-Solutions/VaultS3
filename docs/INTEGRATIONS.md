@@ -46,10 +46,18 @@ requests.put(url, headers=dict(req.headers), data=notif_xml)
 
 Supported events: `s3:ObjectCreated:Put`, `s3:ObjectCreated:Copy`, `s3:ObjectCreated:CompleteMultipartUpload`, `s3:ObjectRemoved:Delete`. Use wildcards like `s3:ObjectCreated:*`. Webhook payloads follow the AWS S3 event notification JSON format.
 
+Webhook URLs are set by bucket owners, so by default a webhook cannot reach a
+private, loopback, link-local or cloud metadata address. The check runs on the
+address actually dialled, after DNS, and redirects are not followed. If your
+receivers are on your own network, set `notifications.allow_private_webhooks:
+true` (or `VAULTS3_ALLOW_PRIVATE_WEBHOOKS=true`). A refused delivery is logged
+with that hint.
+
 Configure webhook delivery in `configs/vaults3.yaml`:
 
 ```yaml
 notifications:
+  allow_private_webhooks: false
   max_workers: 4       # concurrent webhook delivery goroutines
   queue_size: 256      # buffered event queue size
   timeout_secs: 10     # webhook HTTP timeout
@@ -82,7 +90,7 @@ notifications:
     index: "vaults3-events"
 ```
 
-Additional backends: **AMQP/RabbitMQ** (publish to exchanges), **PostgreSQL** (insert into table), **Elasticsearch** (index events). In addition to per-bucket webhooks, you can enable global notification backends. All S3 events are published to every enabled backend. Multiple backends can be active simultaneously. Disabled backends add zero overhead.
+Additional backends: **AMQP/RabbitMQ** (publish to exchanges), **PostgreSQL** (insert into table), **Elasticsearch** (index events). In addition to per-bucket webhooks, you can enable global notification backends. All S3 events are published to every enabled backend, whether or not the bucket has a webhook, off the request path with a per-publish timeout, so a slow backend never delays a PUT. Multiple backends can be active simultaneously. Disabled backends add zero overhead.
 
 ## Async Replication
 
@@ -158,7 +166,7 @@ s3.put_bucket_website(Bucket='my-site',
     })
 ```
 
-Website-enabled buckets serve `index.html` for directory paths and a custom error page for missing objects. No authentication required for GET/HEAD requests.
+Website-enabled buckets serve `index.html` for directory paths and a custom error page for missing objects. Plain GET and HEAD requests need no authentication, which publishes every object in the bucket. Requests with a query string are S3 API calls and still need it.
 
 
 ## Full-Text Search

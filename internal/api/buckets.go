@@ -2,7 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -78,7 +81,7 @@ func (h *APIHandler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, items)
 }
 
-func (h *APIHandler) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
+func (h *APIHandler) handleCreateBucket(w http.ResponseWriter, r *http.Request, user string) {
 	var req createBucketRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -94,6 +97,16 @@ func (h *APIHandler) handleCreateBucket(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Creating a bucket is an IAM action like any other. This route names no
+	// existing bucket, so the per-bucket gate never saw it, and any session,
+	// including one with no policies at all, could create as many buckets as it
+	// liked. Checked before the existence test, so a refused caller cannot use
+	// the 409 to probe which names are taken.
+	if err := h.authorizeConsoleAction(r, user, consoleAction{action: "s3:CreateBucket", bucket: req.Name}); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
 	if h.store.BucketExists(req.Name) {
 		writeError(w, http.StatusConflict, "bucket already exists")
 		return
@@ -104,6 +117,13 @@ func (h *APIHandler) handleCreateBucket(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := h.engine.CreateBucketDir(req.Name); err != nil {
+		// Roll the record back like the S3 path does. It used to stay, so the
+		// bucket listed and answered 409 to a retry while it had no storage
+		// directory behind it.
+		if derr := h.store.DeleteBucket(req.Name); derr != nil {
+			slog.Error("could not roll back a bucket whose storage failed to create",
+				"bucket", req.Name, "error", derr)
+		}
 		writeError(w, http.StatusInternalServerError, "failed to create bucket storage")
 		return
 	}
@@ -153,7 +173,26 @@ func (h *APIHandler) handleDeleteBucket(w http.ResponseWriter, _ *http.Request, 
 		return
 	}
 
-	_, count, _ := h.engine.BucketSize(name)
+	// Emptiness comes from the metadata store, which sees versions and delete
+	// markers. The disk walk alone skips .vs/, so a versioning enabled bucket
+	// always counted as empty and was deleted with every version in it, locked
+	// ones included. An error refuses the delete: an unreadable store is not an
+	// empty bucket. The disk count stays as a second check, and its error used
+	// to be ignored.
+	hasData, err := metadata.BucketHasData(h.store, name)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not confirm the bucket is empty, retry")
+		return
+	}
+	if hasData {
+		writeError(w, http.StatusConflict, "bucket is not empty: delete every object version and delete marker first")
+		return
+	}
+	_, count, err := h.engine.BucketSize(name)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		writeError(w, http.StatusServiceUnavailable, "could not confirm the bucket is empty, retry")
+		return
+	}
 	if count > 0 {
 		writeError(w, http.StatusConflict, "bucket is not empty")
 		return

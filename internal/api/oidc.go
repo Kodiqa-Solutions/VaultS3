@@ -24,11 +24,29 @@ type OIDCClaims struct {
 	Exp   int64       `json:"exp"`
 	Iat   int64       `json:"iat"`
 	Email string      `json:"email"`
-	Name  string      `json:"name"`
+	// EmailVerified is the provider's word that the user proved they own the
+	// address. Most providers send a boolean, some send the string "true", so
+	// it is decoded loosely. Absent is nil.
+	EmailVerified interface{} `json:"email_verified"`
+	Name          string      `json:"name"`
 	// Nonce ties an ID token to the specific login request that asked for it.
 	Nonce  string   `json:"nonce"`
 	Groups []string `json:"groups"`
 	HD     string   `json:"hd"` // Google hosted domain
+}
+
+// EmailIsVerified reports whether the email_verified claim says yes, and
+// whether the claim was present at all.
+func (c *OIDCClaims) EmailIsVerified() (verified, present bool) {
+	switch v := c.EmailVerified.(type) {
+	case bool:
+		return v, true
+	case string:
+		return strings.EqualFold(v, "true"), true
+	case nil:
+		return false, false
+	}
+	return false, true
 }
 
 // Audiences returns the audience claim as a string slice.

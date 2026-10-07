@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -412,7 +411,7 @@ func (h *ObjectHandler) fifoEvict(bucket string, countToFree int64, bytesToFree 
 		if err != nil {
 			continue
 		}
-		metas = append(metas, objMeta{key: obj.Key, size: meta.Size, mod: time.Unix(0, meta.LastModified)})
+		metas = append(metas, objMeta{key: obj.Key, size: meta.Size, mod: time.Unix(meta.LastModified, 0)})
 	}
 	// Sort oldest first
 	for i := 0; i < len(metas); i++ {
@@ -436,8 +435,22 @@ func (h *ObjectHandler) fifoEvict(bucket string, countToFree int64, bytesToFree 
 			break
 		}
 
-		h.engine.DeleteObject(bucket, m.key)
-		h.store.DeleteObjectMeta(bucket, m.key)
+		// Eviction is a delete like any other, so object lock applies to it.
+		// It used to remove objects under legal hold and COMPLIANCE retention,
+		// and to count a failed delete as freed space.
+		if err := h.checkObjectLock(bucket, m.key, ""); err != nil {
+			continue
+		}
+		if err := h.engine.DeleteObject(bucket, m.key); err != nil {
+			slog.Warn("fifo quota: could not evict an object", "bucket", bucket, "key", m.key, "error", err)
+			continue
+		}
+		if err := h.store.DeleteObjectMeta(bucket, m.key); err != nil {
+			slog.Error("fifo quota: evicted an object's data but could not remove its metadata",
+				"bucket", bucket, "key", m.key, "error", err)
+			continue
+		}
+		h.reapElsewhere(bucket, m.key, "")
 		freedCount++
 		freedBytes += m.size
 
@@ -466,73 +479,6 @@ func detectContentType(r *http.Request, key string) string {
 		return "application/octet-stream"
 	}
 	return ct
-}
-
-// settleUpload validates a streamed upload after its bytes have been written and
-// undoes the write if the client's promise was not kept.
-//
-// Streaming means validation can no longer happen before the write (issue #46),
-// so a rejected upload is removed here. No metadata has been stored at this
-// point, and metadata is authoritative (issue #34), so the object is invisible
-// either way; deleting the bytes keeps the disk honest as well. versionID is ""
-// for the non-versioned path.
-//
-// Returns false once it has written the error response, meaning the caller must
-// stop.
-func (h *ObjectHandler) settleUpload(w http.ResponseWriter, r *http.Request, bucket, key, versionID string, d *putDigests) (objectChecksums, bool) {
-	discard := func() {
-		var err error
-		if versionID != "" {
-			err = h.engine.DeleteObjectVersion(bucket, key, versionID)
-		} else {
-			err = h.engine.DeleteObject(bucket, key)
-		}
-		if err != nil {
-			// Not fatal: without metadata the bytes are unreachable over S3, and
-			// `vaults3-cli object verify` finds them. Say so rather than hide it.
-			slog.Warn("could not remove the data of a rejected upload; it has no metadata so it is not served, run `vaults3-cli object verify --repair` to reclaim it",
-				"bucket", bucket, "key", key, "version", versionID, "error", err)
-		}
-	}
-
-	sums, code, message, ok := d.verify(r)
-	if !ok {
-		discard()
-		status := http.StatusBadRequest
-		writeS3Error(w, code, message, status)
-		return sums, false
-	}
-
-	// The pre-write quota check used the declared Content-Length, which an
-	// aws-chunked client controls via X-Amz-Decoded-Content-Length. Re-check
-	// against the length that actually arrived so a bucket quota cannot be
-	// undercut by a false declared length.
-	if d.size() > r.ContentLength && !h.quotaAllowsAfterWrite(bucket) {
-		discard()
-		writeS3Error(w, "QuotaExceeded", "Maximum bucket size exceeded", http.StatusForbidden)
-		return sums, false
-	}
-	return sums, true
-}
-
-// quotaAllowsAfterWrite reports whether a bucket is still inside its limits once
-// a streamed upload has landed. It differs from checkQuota in being a post-write
-// check: the object is already counted in the engine's totals, so the comparison
-// is against the totals themselves rather than totals-plus-incoming. FIFO buckets
-// make room instead of rejecting, so they always pass.
-func (h *ObjectHandler) quotaAllowsAfterWrite(bucket string) bool {
-	info, err := h.store.GetBucket(bucket)
-	if err != nil || (info.MaxSizeBytes == 0 && info.MaxObjects == 0) || info.FIFOQuota {
-		return true
-	}
-	currentSize, currentCount, _ := h.engine.BucketSize(bucket)
-	if info.MaxObjects > 0 && currentCount > info.MaxObjects {
-		return false
-	}
-	if info.MaxSizeBytes > 0 && currentSize > info.MaxSizeBytes {
-		return false
-	}
-	return true
 }
 
 // PutObject handles PUT /{bucket}/{key}.
@@ -572,9 +518,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	versioning, _ := h.store.GetBucketVersioning(bucket)
 	ct := detectContentType(r, key)
-	now := time.Now().UTC()
 
 	// Parse extended metadata from headers
 	userMeta := parseUserMetadata(r)
@@ -590,54 +534,22 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 		writeS3Error(w, "InvalidArgument", ssecErr.Error(), http.StatusBadRequest)
 		return
 	}
-	if ssecKey != nil && (versioning == "Enabled" || versioning == "Suspended") {
-		writeS3Error(w, "NotImplemented", "SSE-C is not yet supported on versioned buckets", http.StatusNotImplemented)
-		return
-	}
 
 	// The body streams to the engine while its digests are computed in passing,
 	// so a large upload costs a copy buffer rather than its whole size in memory
-	// (issue #46). Validation therefore happens AFTER the bytes are written, and a
-	// rejected upload is undone below. That is safe because metadata is written
-	// only after validation and metadata is authoritative (issue #34): an object
-	// whose bytes exist without metadata is invisible to every API, and
-	// `vaults3-cli object verify` reports it.
+	// (issue #46). The digests and the quota are checked INSIDE the reader, so a
+	// rejected upload fails the engine's own write and the object already at the
+	// key is left exactly as it was.
 	digests := newPutDigests(r, r.Body)
+	digests.checkInline(r, h.quotaByteLimit(bucket))
 
-	if versioning == "Enabled" {
-		versionID := generateVersionID()
-
-		written, etag, err := h.engine.PutObjectVersion(bucket, key, versionID, digests, r.ContentLength)
-		if err != nil {
-			writePutError(w, err)
-			return
-		}
-		sums, ok := h.settleUpload(w, r, bucket, key, versionID, digests)
-		if !ok {
-			return
-		}
-		csha256, ccrc32, ccrc32c, csha1 := sums.SHA256, sums.CRC32, sums.CRC32C, sums.SHA1
-
-		// Mark previous latest as not latest
-		if oldMeta, err := h.store.GetObjectMeta(bucket, key); err == nil && oldMeta.VersionID != "" {
-			oldMeta.IsLatest = false
-			if err := h.store.PutObjectVersion(*oldMeta); err != nil {
-				// Losing this write would leave two versions both claiming to be
-				// latest, so the request fails rather than half-applying.
-				metaWriteFailed(w, err, "demote previous version", bucket, key)
-				return
-			}
-		}
-
-		meta := metadata.ObjectMeta{
-			Bucket:             bucket,
-			Key:                key,
+	meta, err := h.writeObject(newObject{
+		bucket: bucket,
+		key:    key,
+		body:   digests,
+		size:   r.ContentLength,
+		meta: metadata.ObjectMeta{
 			ContentType:        ct,
-			ETag:               etag,
-			Size:               written,
-			LastModified:       now.Unix(),
-			VersionID:          versionID,
-			IsLatest:           true,
 			Tags:               tags,
 			UserMetadata:       userMeta,
 			ContentEncoding:    r.Header.Get("Content-Encoding"),
@@ -645,187 +557,21 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 			CacheControl:       r.Header.Get("Cache-Control"),
 			ContentLanguage:    r.Header.Get("Content-Language"),
 			WebsiteRedirect:    r.Header.Get("X-Amz-Website-Redirect-Location"),
-			ChecksumSHA256:     csha256,
-			ChecksumCRC32:      ccrc32,
-			ChecksumCRC32C:     ccrc32c,
-			ChecksumSHA1:       csha1,
-		}
-
-		h.applyObjectLock(r, &meta, bucket, now)
-
-		if err := h.store.PutObjectVersion(meta); err != nil {
-			metaWriteFailed(w, err, "PutObjectVersion", bucket, key)
-			return
-		}
-		if err := h.store.PutObjectMeta(meta); err != nil { // update "latest pointer"
-			metaWriteFailed(w, err, "PutObjectMeta", bucket, key)
-			return
-		}
-
-		w.Header().Set("ETag", etag)
-		w.Header().Set("X-Amz-Version-Id", versionID)
-		if h.sseHeaderApplies(bucket) {
-			w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
-		}
-		setChecksumHeaders(w, &meta)
-		w.WriteHeader(http.StatusOK)
-		if h.onNotification != nil {
-			h.onNotification("s3:ObjectCreated:Put", bucket, key, written, etag, versionID)
-		}
-		if h.onReplication != nil {
-			h.onReplication("s3:ObjectCreated:Put", bucket, key, written, etag, versionID)
-		}
-		if h.onLambda != nil {
-			h.onLambda("s3:ObjectCreated:Put", bucket, key, written, etag, versionID)
-		}
-		if h.onScan != nil {
-			h.onScan(bucket, key, written)
-		}
-		if h.onSearchUpdate != nil {
-			h.onSearchUpdate("put", bucket, key)
-		}
-		return
-	}
-
-	if versioning == "Suspended" {
-		// Suspended versioning: overwrite the "null" version
-		written, etag, err := h.engine.PutObjectVersion(bucket, key, "null", digests, r.ContentLength)
-		if err != nil {
-			writePutError(w, err)
-			return
-		}
-		sums, ok := h.settleUpload(w, r, bucket, key, "null", digests)
-		if !ok {
-			return
-		}
-		csha256, ccrc32, ccrc32c, csha1 := sums.SHA256, sums.CRC32, sums.CRC32C, sums.SHA1
-
-		// Remove any existing null version
-		if oldMeta, err := h.store.GetObjectVersion(bucket, key, "null"); err == nil {
-			oldMeta.IsLatest = false
-			if err := h.store.PutObjectVersion(*oldMeta); err != nil {
-				metaWriteFailed(w, err, "demote null version", bucket, key)
-				return
-			}
-		}
-
-		meta := metadata.ObjectMeta{
-			Bucket:             bucket,
-			Key:                key,
-			ContentType:        ct,
-			ETag:               etag,
-			Size:               written,
-			LastModified:       now.Unix(),
-			VersionID:          "null",
-			IsLatest:           true,
-			Tags:               tags,
-			UserMetadata:       userMeta,
-			ContentEncoding:    r.Header.Get("Content-Encoding"),
-			ContentDisposition: r.Header.Get("Content-Disposition"),
-			CacheControl:       r.Header.Get("Cache-Control"),
-			ContentLanguage:    r.Header.Get("Content-Language"),
-			WebsiteRedirect:    r.Header.Get("X-Amz-Website-Redirect-Location"),
-			ChecksumSHA256:     csha256,
-			ChecksumCRC32:      ccrc32,
-			ChecksumCRC32C:     ccrc32c,
-			ChecksumSHA1:       csha1,
-		}
-		h.applyObjectLock(r, &meta, bucket, now)
-
-		if err := h.store.PutObjectVersion(meta); err != nil {
-			metaWriteFailed(w, err, "PutObjectVersion", bucket, key)
-			return
-		}
-		if err := h.store.PutObjectMeta(meta); err != nil {
-			metaWriteFailed(w, err, "PutObjectMeta", bucket, key)
-			return
-		}
-
-		w.Header().Set("ETag", etag)
-		w.Header().Set("X-Amz-Version-Id", "null")
-		if h.sseHeaderApplies(bucket) {
-			w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
-		}
-		setChecksumHeaders(w, &meta)
-		w.WriteHeader(http.StatusOK)
-		if h.onNotification != nil {
-			h.onNotification("s3:ObjectCreated:Put", bucket, key, written, etag, "null")
-		}
-		if h.onReplication != nil {
-			h.onReplication("s3:ObjectCreated:Put", bucket, key, written, etag, "null")
-		}
-		if h.onLambda != nil {
-			h.onLambda("s3:ObjectCreated:Put", bucket, key, written, etag, "null")
-		}
-		if h.onScan != nil {
-			h.onScan(bucket, key, written)
-		}
-		if h.onSearchUpdate != nil {
-			h.onSearchUpdate("put", bucket, key)
-		}
-		return
-	}
-
-	// Non-versioned path.
-	var written int64
-	var etag string
-	var err error
-	if ssecKey != nil {
-		// SSE-C seals with the customer key in the same chunked streaming format
-		// the encrypting engines use, so the body flows to the engine a chunk at
-		// a time. It used to be sealed as one AEAD message, which meant buffering
-		// the whole object per request: the shape of issue #49, fixed for
-		// server-side encryption in 4.4.53 and here for customer keys. `written`
-		// is the plaintext length; the engine stored a little more.
-		written, etag, err = ssecSealStream(ssecKey, digests, r.ContentLength, func(sealed io.Reader, storedSize int64) (int64, string, error) {
-			return h.engine.PutObject(bucket, key, sealed, storedSize)
-		})
-	} else {
-		written, etag, err = h.engine.PutObject(bucket, key, digests, r.ContentLength)
-	}
+		},
+		ssec:             ssecKey,
+		digests:          digests,
+		bypassGovernance: h.governanceBypass(r, bucket, key),
+		lockFrom:         r,
+	})
 	if err != nil {
-		writePutError(w, err)
+		answerWriteError(w, err, bucket, key)
 		return
 	}
-	sums, ok := h.settleUpload(w, r, bucket, key, "", digests)
-	if !ok {
-		return
-	}
-	csha256, ccrc32, ccrc32c, csha1 := sums.SHA256, sums.CRC32, sums.CRC32C, sums.SHA1
 
-	meta := metadata.ObjectMeta{
-		Bucket:             bucket,
-		Key:                key,
-		ContentType:        ct,
-		ETag:               etag,
-		Size:               written,
-		LastModified:       now.Unix(),
-		Tags:               tags,
-		UserMetadata:       userMeta,
-		ContentEncoding:    r.Header.Get("Content-Encoding"),
-		ContentDisposition: r.Header.Get("Content-Disposition"),
-		CacheControl:       r.Header.Get("Cache-Control"),
-		ContentLanguage:    r.Header.Get("Content-Language"),
-		WebsiteRedirect:    r.Header.Get("X-Amz-Website-Redirect-Location"),
-		ChecksumSHA256:     csha256,
-		ChecksumCRC32:      ccrc32,
-		ChecksumCRC32C:     ccrc32c,
-		ChecksumSHA1:       csha1,
+	w.Header().Set("ETag", meta.ETag)
+	if meta.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", meta.VersionID)
 	}
-	if ssecKey != nil {
-		meta.SSECustomerKeyMD5 = ssecKey.keyMD5
-	}
-	h.applyObjectLock(r, &meta, bucket, now)
-
-	if err := h.store.PutObjectMeta(meta); err != nil {
-		metaWriteFailed(w, err, "PutObjectMeta", bucket, key)
-		return
-	}
-	if h.replicatePlacement != nil {
-		h.replicatePlacement(bucket, key) // copy data to replica-set peers (issue #37)
-	}
-
-	w.Header().Set("ETag", etag)
 	if ssecKey != nil {
 		w.Header().Set(hdrSSECAlgo, "AES256")
 		w.Header().Set(hdrSSECKeyMD5, ssecKey.keyMD5)
@@ -834,20 +580,25 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	setChecksumHeaders(w, &meta)
 	w.WriteHeader(http.StatusOK)
+	h.notifyCreated("s3:ObjectCreated:Put", meta)
+}
+
+// notifyCreated fires the hooks for a new object.
+func (h *ObjectHandler) notifyCreated(event string, meta metadata.ObjectMeta) {
 	if h.onNotification != nil {
-		h.onNotification("s3:ObjectCreated:Put", bucket, key, written, etag, "")
+		h.onNotification(event, meta.Bucket, meta.Key, meta.Size, meta.ETag, meta.VersionID)
 	}
 	if h.onReplication != nil {
-		h.onReplication("s3:ObjectCreated:Put", bucket, key, written, etag, "")
+		h.onReplication(event, meta.Bucket, meta.Key, meta.Size, meta.ETag, meta.VersionID)
 	}
 	if h.onLambda != nil {
-		h.onLambda("s3:ObjectCreated:Put", bucket, key, written, etag, "")
+		h.onLambda(event, meta.Bucket, meta.Key, meta.Size, meta.ETag, meta.VersionID)
 	}
 	if h.onScan != nil {
-		h.onScan(bucket, key, written)
+		h.onScan(meta.Bucket, meta.Key, meta.Size)
 	}
 	if h.onSearchUpdate != nil {
-		h.onSearchUpdate("put", bucket, key)
+		h.onSearchUpdate("put", meta.Bucket, meta.Key)
 	}
 }
 
@@ -991,11 +742,21 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// The Range is read before any header is set, because an ignored one means
+	// a full 200 response, checksums included.
+	rangeHeader := r.Header.Get("Range")
+	rangeStart, rangeEnd, rangeKind := parseRange(rangeHeader, size)
+	if rangeHeader != "" && rangeKind == rangeUnsatisfiable && r.URL.Query().Get("partNumber") == "" {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		writeS3Error(w, "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+
 	// A whole-object checksum must not be sent on a partial (206) response: modern
 	// SDKs (boto3 >= 1.36, aws-cli v2) validate x-amz-checksum-* against the bytes
 	// they actually receive, and a whole-object checksum never matches a range or a
 	// single part, so range downloads would fail with a checksum mismatch.
-	isPartial := r.Header.Get("Range") != "" || r.URL.Query().Get("partNumber") != ""
+	isPartial := rangeKind == rangeSatisfiable || r.URL.Query().Get("partNumber") != ""
 	if meta != nil {
 		w.Header().Set("Content-Type", meta.ContentType)
 		w.Header().Set("ETag", meta.ETag)
@@ -1059,9 +820,8 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		h.serveRange(w, reader, size, rangeHeader)
+	if rangeKind == rangeSatisfiable {
+		h.serveRange(w, reader, size, rangeStart, rangeEnd)
 		return
 	}
 
@@ -1070,61 +830,72 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 	io.Copy(w, reader)
 }
 
-// serveRange handles partial content responses.
-func (h *ObjectHandler) serveRange(w http.ResponseWriter, reader storage.ReadSeekCloser, totalSize int64, rangeHeader string) {
-	// Parse "bytes=START-END"
+// rangeOutcome says what a Range header asks for.
+type rangeOutcome int
+
+const (
+	rangeIgnored       rangeOutcome = iota // no usable range: serve the whole object
+	rangeSatisfiable                       // serve start..end
+	rangeUnsatisfiable                     // well formed but outside the object: 416
+)
+
+// parseRange reads a Range header against an object of totalSize bytes.
+//
+// RFC 7233 says a Range that is not a valid single byte range is IGNORED and the
+// whole object served with 200. "bytes=5-2", a multi-range list and an unknown
+// unit used to be answered 416 instead, which a client asking for a range it
+// did not need could not recover from. A valid range that starts past the end
+// is still unsatisfiable.
+func parseRange(rangeHeader string, totalSize int64) (start, end int64, outcome rangeOutcome) {
 	if !strings.HasPrefix(rangeHeader, "bytes=") {
-		writeS3Error(w, "InvalidRange", "Invalid Range header", http.StatusRequestedRangeNotSatisfiable)
-		return
+		return 0, 0, rangeIgnored
 	}
-	spec := strings.TrimPrefix(rangeHeader, "bytes=")
+	spec := strings.TrimSpace(strings.TrimPrefix(rangeHeader, "bytes="))
+	if strings.Contains(spec, ",") {
+		return 0, 0, rangeIgnored
+	}
 	parts := strings.SplitN(spec, "-", 2)
 	if len(parts) != 2 {
-		writeS3Error(w, "InvalidRange", "Invalid Range header", http.StatusRequestedRangeNotSatisfiable)
-		return
+		return 0, 0, rangeIgnored
 	}
-
-	var start, end int64
-
 	if parts[0] == "" {
 		// Suffix range: bytes=-500 (last 500 bytes)
 		suffix, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil || suffix <= 0 {
-			writeS3Error(w, "InvalidRange", "Invalid Range header", http.StatusRequestedRangeNotSatisfiable)
-			return
+		if err != nil || suffix < 0 {
+			return 0, 0, rangeIgnored
+		}
+		if suffix == 0 || totalSize == 0 {
+			return 0, 0, rangeUnsatisfiable
 		}
 		start = totalSize - suffix
 		if start < 0 {
 			start = 0
 		}
-		end = totalSize - 1
+		return start, totalSize - 1, rangeSatisfiable
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, rangeIgnored
+	}
+	if parts[1] == "" {
+		end = totalSize - 1 // Open-ended: bytes=500-
 	} else {
-		var err error
-		start, err = strconv.ParseInt(parts[0], 10, 64)
-		if err != nil || start < 0 {
-			writeS3Error(w, "InvalidRange", "Invalid Range header", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-		if parts[1] == "" {
-			// Open-ended: bytes=500-
-			end = totalSize - 1
-		} else {
-			end, err = strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				writeS3Error(w, "InvalidRange", "Invalid Range header", http.StatusRequestedRangeNotSatisfiable)
-				return
-			}
+		end, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || end < start {
+			return 0, 0, rangeIgnored
 		}
 	}
-
-	if start > end || start >= totalSize {
-		writeS3Error(w, "InvalidRange", "Range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
-		return
+	if start >= totalSize {
+		return 0, 0, rangeUnsatisfiable
 	}
 	if end >= totalSize {
 		end = totalSize - 1
 	}
+	return start, end, rangeSatisfiable
+}
 
+// serveRange handles partial content responses for a range parseRange accepted.
+func (h *ObjectHandler) serveRange(w http.ResponseWriter, reader storage.ReadSeekCloser, totalSize, start, end int64) {
 	length := end - start + 1
 
 	if _, err := reader.Seek(start, io.SeekStart); err != nil {
@@ -1147,13 +918,15 @@ func (h *ObjectHandler) DeleteObject(w http.ResponseWriter, r *http.Request, buc
 
 	versionID := r.URL.Query().Get("versionId")
 	versioning, _ := h.store.GetBucketVersioning(bucket)
-	bypassGov := strings.EqualFold(r.Header.Get("X-Amz-Bypass-Governance-Retention"), "true")
+	bypassGov := h.governanceBypass(r, bucket, key)
 
 	del, err := h.deleteOneObject(bucket, key, versionID, versioning, bypassGov)
 	if err != nil {
 		var refused *deleteRefused
 		if errors.As(err, &refused) {
-			writeS3Error(w, "AccessDenied", refused.Error(), http.StatusForbidden)
+			if !writeReqError(w, refused.err) {
+				writeS3Error(w, "AccessDenied", refused.Error(), http.StatusForbidden)
+			}
 			return
 		}
 		var notRecorded *deleteNotRecorded
@@ -1235,14 +1008,34 @@ func (h *ObjectHandler) deleteOneObject(bucket, key, versionID, versioning strin
 		return h.writeDeleteMarker(bucket, key, generateVersionID())
 	case "Suspended":
 		// Suspended versioning replaces the null version with a null delete
-		// marker, so the previous null version's data does go.
+		// marker, so the previous null version's data does go. That destroys it,
+		// so its lock is checked first. It used to be removed with no lock check
+		// at all.
+		if err := h.checkReplaceLock(bucket, key, versioning, bypassGovernance); err != nil {
+			return objectDeletion{}, &deleteRefused{err: err}
+		}
+		// A null version written before versioning was turned on has its bytes
+		// at the plain object path, not under .vs/.
+		preVersioning := false
+		if cur, err := h.store.GetObjectMeta(bucket, key); err == nil && cur != nil && cur.VersionID == "" && !cur.DeleteMarker {
+			preVersioning = true
+		}
 		h.engine.DeleteObjectVersion(bucket, key, "null")
+		if preVersioning {
+			if err := h.engine.DeleteObject(bucket, key); err != nil && !errors.Is(err, os.ErrNotExist) {
+				slog.Warn("could not remove the data of a pre-versioning null version",
+					"bucket", bucket, "key", key, "error", err)
+			}
+		}
 		if err := h.store.DeleteObjectVersion(bucket, key, "null"); err != nil {
 			return objectDeletion{}, &deleteNotRecorded{op: "DeleteObjectVersion", err: err}
 		}
 		del, err := h.writeDeleteMarker(bucket, key, "null")
 		if err != nil {
 			return del, err
+		}
+		if preVersioning {
+			h.reapElsewhere(bucket, key, "")
 		}
 		del.Reap, del.ReapVersion = true, "null"
 		return del, nil
@@ -1266,6 +1059,14 @@ func (h *ObjectHandler) deleteObjectVersion(bucket, key, versionID string, bypas
 		if meta, err := h.store.GetObjectMeta(bucket, key); err == nil && meta != nil && meta.VersionID == "" {
 			return h.deleteCurrentObject(bucket, key, bypassGovernance)
 		}
+	}
+	// The lock is checked before ANY bytes go. The null branch below used to
+	// delete first and check after, so a locked null version lost its data
+	// while the refusal left its metadata in place.
+	if err := h.checkObjectLock(bucket, key, versionID, bypassGovernance); err != nil {
+		return objectDeletion{}, &deleteRefused{err: err}
+	}
+	if versionID == nullVersionID {
 		// The null version can also be hidden behind a delete marker, in which
 		// case the latest pointer names the marker rather than the object and the
 		// branch above does not fire. Its bytes are still at the ordinary object
@@ -1275,9 +1076,6 @@ func (h *ObjectHandler) deleteObjectVersion(bucket, key, versionID string, bypas
 			slog.Warn("could not remove the data of a null version hidden by a delete marker",
 				"bucket", bucket, "key", key, "error", err)
 		}
-	}
-	if err := h.checkObjectLock(bucket, key, versionID, bypassGovernance); err != nil {
-		return objectDeletion{}, &deleteRefused{err: err}
 	}
 	h.engine.DeleteObjectVersion(bucket, key, versionID)
 	if err := h.store.DeleteObjectVersion(bucket, key, versionID); err != nil {
@@ -1391,6 +1189,9 @@ func (h *ObjectHandler) notifyDeleted(bucket, key, versionID string) {
 // versioned path applied these, so inline locks were silently dropped on
 // non-versioned buckets.
 func (h *ObjectHandler) applyObjectLock(r *http.Request, meta *metadata.ObjectMeta, bucket string, now time.Time) {
+	if r == nil {
+		r = &http.Request{Header: http.Header{}}
+	}
 	if mode := r.Header.Get("X-Amz-Object-Lock-Mode"); mode != "" {
 		meta.RetentionMode = mode
 		if until := r.Header.Get("X-Amz-Object-Lock-Retain-Until-Date"); until != "" {
@@ -1413,8 +1214,34 @@ func (h *ObjectHandler) applyObjectLock(r *http.Request, meta *metadata.ObjectMe
 }
 
 // checkObjectLock checks if an object version is locked (legal hold or retention).
-// If bypassGovernance is true, GOVERNANCE retention is skipped (requires s3:BypassGovernanceRetention).
+// If bypassGovernance is true, GOVERNANCE retention is skipped. Callers pass the
+// result of governanceBypass, which requires s3:BypassGovernanceRetention.
+//
+// It refuses with AccessDenied for a lock, and with 503 when the lock cannot be
+// read. Any metadata error used to count as "no such object, allow", so a
+// metadata store that was briefly unreachable let a locked object be destroyed.
+// freshReader is a store that can bring this node up to the cluster leader
+// before a read whose answer decides a protection.
+type freshReader interface {
+	ReadBarrier() error
+}
+
+// catchUp makes the next metadata read on this node reflect every write the
+// cluster has committed. On a follower the local copy can lag by a moment, and
+// a lock decision made on it allowed, for example, a COMPLIANCE retention set
+// a moment earlier through another request to be downgraded.
+func (h *ObjectHandler) catchUp() {
+	if f, ok := h.store.(freshReader); ok {
+		if err := f.ReadBarrier(); err != nil {
+			slog.Warn("s3: could not catch up with the cluster before a lock decision", "error", err)
+		}
+	}
+}
+
 func (h *ObjectHandler) checkObjectLock(bucket, key, versionID string, bypassGovernance ...bool) error {
+	if info, err := h.store.GetBucket(bucket); err == nil && info != nil && info.ObjectLockEnabled {
+		h.catchUp()
+	}
 	var meta *metadata.ObjectMeta
 	var err error
 	if versionID == "" {
@@ -1426,11 +1253,19 @@ func (h *ObjectHandler) checkObjectLock(bucket, key, versionID string, bypassGov
 		meta, err = h.store.GetObjectVersion(bucket, key, versionID)
 	}
 	if err != nil {
-		return nil // object/version doesn't exist in metadata, allow delete
+		if isMetaNotFound(err) {
+			return nil // nothing recorded under this name, so nothing is locked
+		}
+		slog.Error("object lock: could not read the lock state, refusing", "bucket", bucket, "key", key,
+			"version", versionID, "error", err)
+		return &reqError{"ServiceUnavailable", "The object lock state could not be read, please retry", http.StatusServiceUnavailable}
+	}
+	if meta == nil {
+		return nil
 	}
 
 	if meta.LegalHold {
-		return fmt.Errorf("object is under legal hold")
+		return &reqError{"AccessDenied", "Access Denied because object protected by object lock (legal hold)", http.StatusForbidden}
 	}
 
 	if meta.RetentionMode != "" && meta.RetentionUntil > 0 {
@@ -1439,13 +1274,25 @@ func (h *ObjectHandler) checkObjectLock(bucket, key, versionID string, bypassGov
 			if meta.RetentionMode == "GOVERNANCE" && len(bypassGovernance) > 0 && bypassGovernance[0] {
 				return nil
 			}
-			return fmt.Errorf("object is under %s retention until %s",
-				meta.RetentionMode,
-				time.Unix(meta.RetentionUntil, 0).UTC().Format(time.RFC3339))
+			return &reqError{"AccessDenied", fmt.Sprintf("Access Denied because object protected by object lock (%s retention until %s)",
+				meta.RetentionMode, time.Unix(meta.RetentionUntil, 0).UTC().Format(time.RFC3339)), http.StatusForbidden}
 		}
 	}
 
 	return nil
+}
+
+// governanceBypass reports whether this request may bypass GOVERNANCE
+// retention. It has to ask, with x-amz-bypass-governance-retention: true, and
+// the caller has to hold s3:BypassGovernanceRetention on the object. The header
+// used to be honoured on its own, so anyone allowed to delete an object could
+// delete it through a GOVERNANCE lock, which is the one thing that mode exists
+// to require a separate permission for.
+func (h *ObjectHandler) governanceBypass(r *http.Request, bucket, key string) bool {
+	if r == nil || !strings.EqualFold(r.Header.Get("X-Amz-Bypass-Governance-Retention"), "true") {
+		return false
+	}
+	return h.authorizeEntry(r, "s3:BypassGovernanceRetention", formatResource(bucket, key)) == nil
 }
 
 // HeadObject handles HEAD /{bucket}/{key}.
@@ -1558,79 +1405,30 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	// Parse x-amz-copy-source: /source-bucket/source-key or source-bucket/source-key
-	copySource := r.Header.Get("X-Amz-Copy-Source")
-	copySource, _ = url.PathUnescape(copySource)
-	copySource = strings.TrimPrefix(copySource, "/")
-
-	srcBucket, srcKey := parseCopySource(copySource)
-	if srcBucket == "" || srcKey == "" {
+	// The same parser the router authorized the source with, so the object read
+	// here is the one that was authorized.
+	src, perr := parseCopySourceHeader(r.Header.Get("X-Amz-Copy-Source"))
+	if perr != nil {
 		writeS3Error(w, "InvalidArgument", "Invalid x-amz-copy-source", http.StatusBadRequest)
 		return
 	}
-	// Validate source key against path traversal (check after unescaping AND
-	// also check for double-encoded traversals by unescaping again)
-	for _, segment := range strings.Split(srcKey, "/") {
-		if segment == ".." {
-			writeS3Error(w, "InvalidArgument", "Invalid x-amz-copy-source key", http.StatusBadRequest)
-			return
-		}
-	}
-	// Reject double-encoded path traversal (e.g. %252e%252e → %2e%2e → ..)
-	if decoded, err := url.PathUnescape(srcKey); err == nil && decoded != srcKey {
-		for _, segment := range strings.Split(decoded, "/") {
-			if segment == ".." {
-				writeS3Error(w, "InvalidArgument", "Invalid x-amz-copy-source key", http.StatusBadRequest)
-				return
-			}
-		}
-	}
-	// Reject null bytes
-	if strings.ContainsRune(srcKey, 0) {
-		writeS3Error(w, "InvalidArgument", "Invalid x-amz-copy-source key", http.StatusBadRequest)
+
+	// The destination's own SSE-C key, if it is to be sealed with one.
+	destKey, derr := parseSSECHeaders(r)
+	if derr != nil {
+		writeS3Error(w, "InvalidArgument", derr.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if !h.store.BucketExists(srcBucket) {
-		writeS3Error(w, "NoSuchBucket", "Source bucket does not exist", http.StatusNotFound)
-		return
-	}
-
-	// Get source metadata for conditional copy checks and metadata copy
-	srcMeta, _ := h.store.GetObjectMeta(srcBucket, srcKey)
-
-	// Check conditional copy preconditions
-	if checkCopyPreconditions(w, r, srcMeta) {
-		return
-	}
-
-	// Read source object
-	reader, size, err := h.engine.GetObject(srcBucket, srcKey)
-	if err != nil {
-		writeS3Error(w, "NoSuchKey", "Source object not found", http.StatusNotFound)
+	srcMeta, reader, size, ok := h.openCopySource(w, r, src)
+	if !ok {
 		return
 	}
 	defer reader.Close()
 
-	// Write to destination
-	written, etag, err := h.engine.PutObject(bucket, key, reader, size)
-	if err != nil {
-		slog.Error("internal error", "error", err)
-		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+	// Check conditional copy preconditions
+	if checkCopyPreconditions(w, r, srcMeta) {
 		return
-	}
-
-	now := time.Now().UTC()
-
-	// Determine metadata: REPLACE uses request headers, COPY (default) uses source
-	metadataDirective := r.Header.Get("X-Amz-Metadata-Directive")
-
-	meta := metadata.ObjectMeta{
-		Bucket:       bucket,
-		Key:          key,
-		ETag:         etag,
-		Size:         written,
-		LastModified: now.Unix(),
 	}
 
 	// The tag set is governed by its own directive, independently of the metadata
@@ -1648,12 +1446,13 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 			return
 		}
 		copyTags = headerTags
-	} else if srcMeta != nil {
+	} else {
 		copyTags = srcMeta.Tags
 	}
 
-	if strings.EqualFold(metadataDirective, "REPLACE") {
-		// Use metadata from request headers
+	// Determine metadata: REPLACE uses request headers, COPY (default) uses source
+	var meta metadata.ObjectMeta
+	if strings.EqualFold(r.Header.Get("X-Amz-Metadata-Directive"), "REPLACE") {
 		meta.ContentType = detectContentType(r, key)
 		meta.UserMetadata = parseUserMetadata(r)
 		meta.ContentEncoding = r.Header.Get("Content-Encoding")
@@ -1661,8 +1460,7 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 		meta.CacheControl = r.Header.Get("Cache-Control")
 		meta.ContentLanguage = r.Header.Get("Content-Language")
 		meta.WebsiteRedirect = r.Header.Get("X-Amz-Website-Redirect-Location")
-	} else if srcMeta != nil {
-		// COPY (default): copy metadata from source
+	} else {
 		meta.ContentType = srcMeta.ContentType
 		meta.UserMetadata = srcMeta.UserMetadata
 		meta.ContentEncoding = srcMeta.ContentEncoding
@@ -1670,18 +1468,27 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 		meta.CacheControl = srcMeta.CacheControl
 		meta.ContentLanguage = srcMeta.ContentLanguage
 		meta.WebsiteRedirect = srcMeta.WebsiteRedirect
-		meta.ChecksumSHA256 = srcMeta.ChecksumSHA256
-		meta.ChecksumCRC32 = srcMeta.ChecksumCRC32
-		meta.ChecksumCRC32C = srcMeta.ChecksumCRC32C
-		meta.ChecksumSHA1 = srcMeta.ChecksumSHA1
-	} else {
-		meta.ContentType = "application/octet-stream"
 	}
-
+	// The checksums describe the bytes, which a copy keeps whatever the
+	// directive says.
+	meta.ChecksumSHA256 = srcMeta.ChecksumSHA256
+	meta.ChecksumCRC32 = srcMeta.ChecksumCRC32
+	meta.ChecksumCRC32C = srcMeta.ChecksumCRC32C
+	meta.ChecksumSHA1 = srcMeta.ChecksumSHA1
 	meta.Tags = copyTags
 
-	if err := h.store.PutObjectMeta(meta); err != nil {
-		metaWriteFailed(w, err, "PutObjectMeta (copy)", bucket, key)
+	written, err := h.writeObject(newObject{
+		bucket:           bucket,
+		key:              key,
+		body:             reader,
+		size:             size,
+		meta:             meta,
+		ssec:             destKey,
+		bypassGovernance: h.governanceBypass(r, bucket, key),
+		lockFrom:         r,
+	})
+	if err != nil {
+		answerWriteError(w, err, bucket, key)
 		return
 	}
 
@@ -1691,33 +1498,21 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 		LastModified string   `xml:"LastModified"`
 	}
 
+	if srcMeta.VersionID != "" {
+		w.Header().Set("X-Amz-Copy-Source-Version-Id", srcMeta.VersionID)
+	}
+	if written.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", written.VersionID)
+	}
+	if destKey != nil {
+		w.Header().Set(hdrSSECAlgo, "AES256")
+		w.Header().Set(hdrSSECKeyMD5, destKey.keyMD5)
+	}
 	writeXML(w, http.StatusOK, copyResult{
-		ETag:         etag,
-		LastModified: now.Format(time.RFC3339),
+		ETag:         written.ETag,
+		LastModified: time.Unix(written.LastModified, 0).UTC().Format(time.RFC3339),
 	})
-	if h.onNotification != nil {
-		h.onNotification("s3:ObjectCreated:Copy", bucket, key, written, etag, "")
-	}
-	if h.onReplication != nil {
-		h.onReplication("s3:ObjectCreated:Copy", bucket, key, written, etag, "")
-	}
-	if h.onLambda != nil {
-		h.onLambda("s3:ObjectCreated:Copy", bucket, key, written, etag, "")
-	}
-	if h.onScan != nil {
-		h.onScan(bucket, key, written)
-	}
-	if h.onSearchUpdate != nil {
-		h.onSearchUpdate("put", bucket, key)
-	}
-}
-
-func parseCopySource(source string) (bucket, key string) {
-	parts := strings.SplitN(source, "/", 2)
-	if len(parts) != 2 {
-		return "", ""
-	}
-	return parts[0], parts[1]
+	h.notifyCreated("s3:ObjectCreated:Copy", written)
 }
 
 // maxDeleteRequestBody bounds a multi-object delete body. S3 caps the request
@@ -1745,7 +1540,6 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	versioning, _ := h.store.GetBucketVersioning(bucket)
-	bypassGov := strings.EqualFold(r.Header.Get("X-Amz-Bypass-Governance-Retention"), "true")
 
 	var result deleteResult
 	// Keys whose data must also be dropped on the other nodes. This request was
@@ -1755,15 +1549,17 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 	// That is how a delete-heavy workload grew to ~9x its logical size (issue #47).
 	var reaped []string
 	for _, obj := range req.Objects {
-		// Validate key against path traversal
-		invalid := false
-		for _, segment := range strings.Split(obj.Key, "/") {
-			if segment == ".." {
-				invalid = true
-				break
-			}
+		// The keys come from the body, so the router never checked them. An
+		// empty <Key></Key> used to reach the engine as a delete of "".
+		if obj.Key == "" {
+			result.Errors = append(result.Errors, deleteError{
+				Key:     obj.Key,
+				Code:    "UserKeyMustBeSpecified",
+				Message: "The request was missing a required key",
+			})
+			continue
 		}
-		if invalid {
+		if msg := objectKeyProblem(obj.Key); msg != "" {
 			result.Errors = append(result.Errors, deleteError{
 				Key:     obj.Key,
 				Code:    "InvalidArgument",
@@ -1784,15 +1580,16 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 		if err := h.authorizeEntry(r, entryAction, formatResource(bucket, obj.Key)); err != nil {
 			// AWS reports a per-key error rather than failing the whole request,
 			// so one denied key does not hide the outcome of the others.
+			slog.Info("s3: multi-object delete entry refused by policy", "key", obj.Key, "reason", err.Error())
 			result.Errors = append(result.Errors, deleteError{
 				Key:     obj.Key,
 				Code:    "AccessDenied",
-				Message: err.Error(),
+				Message: "Access Denied",
 			})
 			continue
 		}
 
-		del, err := h.deleteOneObject(bucket, obj.Key, obj.VersionID, versioning, bypassGov)
+		del, err := h.deleteOneObject(bucket, obj.Key, obj.VersionID, versioning, h.governanceBypass(r, bucket, obj.Key))
 		if err != nil {
 			result.Errors = append(result.Errors, batchDeleteError(obj, err))
 			continue
@@ -1842,6 +1639,10 @@ func batchDeleteError(obj deleteObject, err error) deleteError {
 	var refused *deleteRefused
 	if errors.As(err, &refused) {
 		entry.Code, entry.Message = "AccessDenied", refused.Error()
+		var re *reqError
+		if errors.As(refused.err, &re) {
+			entry.Code, entry.Message = re.code, re.msg
+		}
 		return entry
 	}
 	var notRecorded *deleteNotRecorded
@@ -1857,14 +1658,72 @@ func batchDeleteError(obj deleteObject, err error) deleteError {
 	return entry
 }
 
+// taggingTarget resolves the object version a tagging request acts on, through
+// the metadata store, which is where tags live.
+//
+// Tagging used to gate on the local engine having a file at the plain object
+// path. An object in a versioned bucket keeps its bytes under .vs/, so every
+// one of them answered NoSuchKey, and on a cluster so did every node that does
+// not hold the bytes, even though HEAD and GET answered on all of them.
+//
+// On failure the response has been written and ok is false.
+func (h *ObjectHandler) taggingTarget(w http.ResponseWriter, r *http.Request, bucket, key string) (*metadata.ObjectMeta, bool) {
+	versionID := r.URL.Query().Get("versionId")
+	if versionID != "" {
+		meta, err := h.store.GetObjectVersion(bucket, key, versionID)
+		if err != nil && versionID == nullVersionID {
+			// An object written before versioning was turned on is the null
+			// version, recorded only in the latest pointer.
+			if cur, cerr := h.store.GetObjectMeta(bucket, key); cerr == nil && cur != nil && cur.VersionID == "" {
+				meta, err = cur, nil
+			}
+		}
+		if err != nil || meta == nil {
+			if metadataUnavailable(w, err) {
+				return nil, false
+			}
+			writeS3Error(w, "NoSuchVersion", "The specified version does not exist", http.StatusNotFound)
+			return nil, false
+		}
+		if meta.DeleteMarker {
+			writeS3Error(w, "MethodNotAllowed", "The specified method is not allowed against a delete marker", http.StatusMethodNotAllowed)
+			return nil, false
+		}
+		return meta, true
+	}
+	meta, err := h.store.GetObjectMetaConsistent(bucket, key)
+	if meta == nil && metadataUnavailable(w, err) {
+		return nil, false
+	}
+	if meta == nil || meta.DeleteMarker {
+		writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
+		return nil, false
+	}
+	return meta, true
+}
+
+// saveTagging records a version's changed tags. A versioned record is updated
+// in the version index, which also moves the latest pointer when it is the
+// current version.
+func (h *ObjectHandler) saveTagging(meta *metadata.ObjectMeta) error {
+	if meta.VersionID == "" {
+		return h.store.PutObjectMeta(*meta)
+	}
+	if !meta.IsLatest {
+		// The latest pointer carries its own copy of the record, so a request
+		// that named the current version by id still has to move it.
+		if cur, err := h.store.GetObjectMeta(meta.Bucket, meta.Key); err == nil && cur != nil && cur.VersionID == meta.VersionID {
+			meta.IsLatest = true
+		}
+	}
+	return h.store.UpdateObjectVersionMeta(*meta)
+}
+
 // PutObjectTagging handles PUT /{bucket}/{key}?tagging.
 func (h *ObjectHandler) PutObjectTagging(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	h.catchUp()
 	if !h.store.BucketExists(bucket) {
 		writeS3Error(w, "NoSuchBucket", "Bucket does not exist", http.StatusNotFound)
-		return
-	}
-	if !h.engine.ObjectExists(bucket, key) {
-		writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
 		return
 	}
 
@@ -1879,10 +1738,8 @@ func (h *ObjectHandler) PutObjectTagging(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	meta, err := h.store.GetObjectMeta(bucket, key)
-	if err != nil {
-		slog.Error("internal error", "error", err)
-		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+	meta, ok := h.taggingTarget(w, r, bucket, key)
+	if !ok {
 		return
 	}
 
@@ -1891,12 +1748,14 @@ func (h *ObjectHandler) PutObjectTagging(w http.ResponseWriter, r *http.Request,
 		meta.Tags[tag.Key] = tag.Value
 	}
 
-	if err := h.store.PutObjectMeta(*meta); err != nil {
-		slog.Error("internal error", "error", err)
-		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+	if err := h.saveTagging(meta); err != nil {
+		metaWriteFailed(w, err, "PutObjectTagging", bucket, key)
 		return
 	}
 
+	if meta.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", meta.VersionID)
+	}
 	w.WriteHeader(http.StatusOK)
 	if h.onSearchUpdate != nil {
 		h.onSearchUpdate("put", bucket, key)
@@ -1909,17 +1768,9 @@ func (h *ObjectHandler) GetObjectTagging(w http.ResponseWriter, r *http.Request,
 		writeS3Error(w, "NoSuchBucket", "Bucket does not exist", http.StatusNotFound)
 		return
 	}
-	if !h.engine.ObjectExists(bucket, key) {
-		writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
-		return
-	}
 
-	meta, err := h.store.GetObjectMeta(bucket, key)
-	if err != nil {
-		// No metadata yet — return empty tag set
-		writeXML(w, http.StatusOK, taggingResponse{
-			Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
-		})
+	meta, ok := h.taggingTarget(w, r, bucket, key)
+	if !ok {
 		return
 	}
 
@@ -1930,30 +1781,32 @@ func (h *ObjectHandler) GetObjectTagging(w http.ResponseWriter, r *http.Request,
 		resp.TagSet.Tags = append(resp.TagSet.Tags, xmlTag{Key: k, Value: v})
 	}
 
+	if meta.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", meta.VersionID)
+	}
 	writeXML(w, http.StatusOK, resp)
 }
 
 // DeleteObjectTagging handles DELETE /{bucket}/{key}?tagging.
 func (h *ObjectHandler) DeleteObjectTagging(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	h.catchUp()
 	if !h.store.BucketExists(bucket) {
 		writeS3Error(w, "NoSuchBucket", "Bucket does not exist", http.StatusNotFound)
 		return
 	}
-	if !h.engine.ObjectExists(bucket, key) {
-		writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
-		return
-	}
 
-	meta, err := h.store.GetObjectMeta(bucket, key)
-	if err != nil {
-		w.WriteHeader(http.StatusNoContent)
+	meta, ok := h.taggingTarget(w, r, bucket, key)
+	if !ok {
 		return
 	}
 
 	meta.Tags = nil
-	if err := h.store.PutObjectMeta(*meta); err != nil {
+	if err := h.saveTagging(meta); err != nil {
 		metaWriteFailed(w, err, "DeleteObjectTagging", bucket, key)
 		return
+	}
+	if meta.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", meta.VersionID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 	if h.onSearchUpdate != nil {
@@ -2052,6 +1905,15 @@ func (h *ObjectHandler) ListObjectVersions(w http.ResponseWriter, r *http.Reques
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 		return
 	}
+	// The store resumes from a (key, version) position in its own index order,
+	// so the next page has to start after the last entry IT returned. Within a
+	// key that order is not the newest-first order the response is sorted
+	// into, and the last entry shown can be one the store has already gone past.
+	var storeLast *metadata.ObjectMeta
+	if truncated && len(versions) > 0 {
+		last := versions[len(versions)-1]
+		storeLast = &last
+	}
 
 	// Objects written while a bucket was NOT versioned have no version record at
 	// all: they live only in the latest-pointer index with an empty VersionID.
@@ -2092,16 +1954,21 @@ func (h *ObjectHandler) ListObjectVersions(w http.ResponseWriter, r *http.Reques
 		LastModified string `xml:"LastModified"`
 	}
 	type xmlListVersionsResult struct {
-		XMLName         xml.Name          `xml:"ListVersionsResult"`
-		Xmlns           string            `xml:"xmlns,attr"`
-		Name            string            `xml:"Name"`
-		Prefix          string            `xml:"Prefix,omitempty"`
-		KeyMarker       string            `xml:"KeyMarker"`
-		VersionIdMarker string            `xml:"VersionIdMarker"`
-		MaxKeys         int               `xml:"MaxKeys"`
-		IsTruncated     bool              `xml:"IsTruncated"`
-		Versions        []xmlVersion      `xml:"Version,omitempty"`
-		DeleteMarkers   []xmlDeleteMarker `xml:"DeleteMarker,omitempty"`
+		XMLName         xml.Name `xml:"ListVersionsResult"`
+		Xmlns           string   `xml:"xmlns,attr"`
+		Name            string   `xml:"Name"`
+		Prefix          string   `xml:"Prefix,omitempty"`
+		KeyMarker       string   `xml:"KeyMarker"`
+		VersionIdMarker string   `xml:"VersionIdMarker"`
+		MaxKeys         int      `xml:"MaxKeys"`
+		IsTruncated     bool     `xml:"IsTruncated"`
+		// The two Next markers are where the following page starts. They were
+		// never sent, so an SDK paginator stopped after the first page and
+		// every version past it was invisible to it.
+		NextKeyMarker       string            `xml:"NextKeyMarker,omitempty"`
+		NextVersionIdMarker string            `xml:"NextVersionIdMarker,omitempty"`
+		Versions            []xmlVersion      `xml:"Version,omitempty"`
+		DeleteMarkers       []xmlDeleteMarker `xml:"DeleteMarker,omitempty"`
 	}
 
 	resp := xmlListVersionsResult{
@@ -2112,6 +1979,19 @@ func (h *ObjectHandler) ListObjectVersions(w http.ResponseWriter, r *http.Reques
 		VersionIdMarker: versionMarker,
 		MaxKeys:         maxKeys,
 		IsTruncated:     truncated,
+	}
+	if truncated && len(versions) > 0 {
+		last := versions[len(versions)-1]
+		if storeLast != nil {
+			for _, v := range versions {
+				if v.Key == storeLast.Key && v.VersionID == storeLast.VersionID {
+					last = *storeLast
+					break
+				}
+			}
+		}
+		resp.NextKeyMarker = last.Key
+		resp.NextVersionIdMarker = last.VersionID
 	}
 
 	for _, v := range versions {

@@ -344,15 +344,17 @@ func TestRepairReportsUnrecoverableAndDeletesNothing(t *testing.T) {
 	}
 }
 
-func TestRepairDefersToRunningRebalance(t *testing.T) {
+// Rebalance no longer moves data, so nothing it reports may hold repair off:
+// repair is what restores lost copies now.
+func TestRepairIsNotSuppressedByRebalanceGuard(t *testing.T) {
 	f := newRepairFixture(t, 2)
 	f.engine.put(f.bucket, f.key, []byte("data"))
 	f.repairer.SetRebalanceGuard(func() bool { return true })
 
 	st := f.runScan()
 
-	if st.Scanned != 0 || f.peer.puts() != 0 {
-		t.Fatalf("repair must not run alongside a rebalance, got %+v", st)
+	if st.Scanned == 0 || f.peer.puts() == 0 {
+		t.Fatalf("repair was suppressed by the retired rebalance guard, got %+v", st)
 	}
 }
 

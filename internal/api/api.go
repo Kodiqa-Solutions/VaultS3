@@ -31,47 +31,48 @@ import (
 
 // APIHandler serves the dashboard REST API at /api/v1/.
 type APIHandler struct {
-	store            metadata.StoreAPI
-	engine           storage.Engine
-	keyMgr           *bucketcrypto.Manager // per-bucket encryption keys (nil if unconfigured)
-	metrics          *metrics.Collector
-	cfg              *config.Config
-	jwt              *JWTService
-	activity         *ActivityLog
-	searchIndex      *search.Index
-	vectorMgr        *vector.Manager
-	migrator         *migrate.Manager
-	updater          *selfupdate.Updater
-	snapshots        *snapshot.Manager
-	scanner          *scanner.Scanner
-	tieringMgr       *tiering.Manager
-	ecHealer         *erasure.Healer
-	peerScheme       string
-	peerAddr         func(nodeID string) string
-	bucketEncrypted  func(bucket string) bool
-	metaBarrier      func() error
-	backupSched      *backup.Scheduler
-	rateLimiter      *ratelimit.Limiter
-	oidc             *OIDCValidator
-	lambdaMgr        *lambda.TriggerManager
-	eventBus         *EventBus
-	logBroadcaster   *LogBroadcaster
-	traceBroadcaster *TraceBroadcaster
-	s3Auth           *s3auth.Authenticator
-	onReplication    ReplicationFunc
-	clusterProxy     ClusterProxyFunc                        // proxy a single-object request to its owner (download/delete)
-	clusterOwner     func(bucket, key string) (string, bool) // owner API addr for placement (upload); ("",false) if local
-	clusterSelfID    string                                  // this node's cluster ID ("" if single-node)
-	clusterNodeAddrs func() map[string]string                // nodeID -> peer addr for all cluster nodes (nil if single-node)
-	clusterSecret    string                                  // shared secret for the inter-node /cluster/sysinfo call
-	clusterCtl       ClusterController                       // membership ops (join/leave/status); nil if single-node
-	usage            *sysinfo.UsageCache                     // measured on-disk footprint; built lazily, nil when disabled
-	usageOnce        sync.Once                               // guards building usage
-	writable         *atomic.Bool                            // node-local write gate (drain); nil ⇒ always writable
-	triggerRebalance func()                                  // kick a background rebalance pass (nil if single-node)
-	triggerRepair    func()                                  // kick a background replica repair pass (nil if single-node)
-	repairStatus     func() any                              // last repair scan outcome
-	rebalanceRunning func() bool                             // whether a rebalance is in progress
+	allowPrivateLambda bool
+	store              metadata.StoreAPI
+	engine             storage.Engine
+	keyMgr             *bucketcrypto.Manager // per-bucket encryption keys (nil if unconfigured)
+	metrics            *metrics.Collector
+	cfg                *config.Config
+	jwt                *JWTService
+	activity           *ActivityLog
+	searchIndex        *search.Index
+	vectorMgr          *vector.Manager
+	migrator           *migrate.Manager
+	updater            *selfupdate.Updater
+	snapshots          *snapshot.Manager
+	scanner            *scanner.Scanner
+	tieringMgr         *tiering.Manager
+	ecHealer           *erasure.Healer
+	peerScheme         string
+	peerAddr           func(nodeID string) string
+	bucketEncrypted    func(bucket string) bool
+	metaBarrier        func() error
+	backupSched        *backup.Scheduler
+	rateLimiter        *ratelimit.Limiter
+	oidc               *OIDCValidator
+	lambdaMgr          *lambda.TriggerManager
+	eventBus           *EventBus
+	logBroadcaster     *LogBroadcaster
+	traceBroadcaster   *TraceBroadcaster
+	s3Auth             *s3auth.Authenticator
+	onReplication      ReplicationFunc
+	clusterProxy       ClusterProxyFunc                        // proxy a single-object request to its owner (download/delete)
+	clusterOwner       func(bucket, key string) (string, bool) // owner API addr for placement (upload); ("",false) if local
+	clusterSelfID      string                                  // this node's cluster ID ("" if single-node)
+	clusterNodeAddrs   func() map[string]string                // nodeID -> peer addr for all cluster nodes (nil if single-node)
+	clusterSecret      string                                  // shared secret for the inter-node /cluster/sysinfo call
+	clusterCtl         ClusterController                       // membership ops (join/leave/status); nil if single-node
+	usage              *sysinfo.UsageCache                     // measured on-disk footprint; built lazily, nil when disabled
+	usageOnce          sync.Once                               // guards building usage
+	writable           *atomic.Bool                            // node-local write gate (drain); nil ⇒ always writable
+	triggerRebalance   func()                                  // kick a background rebalance pass (nil if single-node)
+	triggerRepair      func()                                  // kick a background replica repair pass (nil if single-node)
+	repairStatus       func() any                              // last repair scan outcome
+	rebalanceRunning   func() bool                             // whether a rebalance is in progress
 	// localStore is the node-local metadata store, which differs from store only
 	// in a cluster (store is then Raft-backed). In-progress multipart state is kept
 	// node-local (issue #32), so anything asking "does this upload exist here?"
@@ -83,6 +84,28 @@ type APIHandler struct {
 	// logins throttles the credential endpoints, always on and independent of
 	// the general rate limiter.
 	logins *loginThrottle
+	// authMu guards the admin credential pair in cfg.Auth and the console signer
+	// in jwt. Changing the admin password replaces both while logins and every
+	// authenticated request read them, and it used to do so with no
+	// synchronization at all.
+	authMu sync.RWMutex
+	// speedtestRunning and reencryptRunning let one run of each at a time.
+	speedtestRunning atomic.Bool
+	reencryptRunning atomic.Bool
+}
+
+// adminCredentials returns the current admin access and secret key.
+func (h *APIHandler) adminCredentials() (accessKey, secretKey string) {
+	h.authMu.RLock()
+	defer h.authMu.RUnlock()
+	return h.cfg.Auth.AdminAccessKey, h.cfg.Auth.AdminSecretKey
+}
+
+// jwtService returns the console session signer in use.
+func (h *APIHandler) jwtService() *JWTService {
+	h.authMu.RLock()
+	defer h.authMu.RUnlock()
+	return h.jwt
 }
 
 // jwtKeyStore is the slice of the metadata store that holds the console signing
@@ -94,7 +117,12 @@ type jwtKeyStore interface {
 
 // SetJWTSigningKey installs the per-installation console signing key, which the
 // server loads or generates at startup and persists. Called before serving.
-func (h *APIHandler) SetJWTSigningKey(key []byte) { h.jwt = NewJWTService(key) }
+func (h *APIHandler) SetJWTSigningKey(key []byte) {
+	svc := NewJWTService(key)
+	h.authMu.Lock()
+	h.jwt = svc
+	h.authMu.Unlock()
+}
 
 // SetJWTKeyStore wires where a rotated signing key is persisted.
 func (h *APIHandler) SetJWTKeyStore(s jwtKeyStore) { h.jwtKeyStore = s }
@@ -195,6 +223,10 @@ func (h *APIHandler) SetTraceBroadcaster(tb *TraceBroadcaster) {
 }
 
 // SetS3Authenticator sets the S3 authenticator reference for credential updates.
+// SetAllowPrivateLambda mirrors lambda.allow_private_endpoints for the
+// dashboard's trigger configuration.
+func (h *APIHandler) SetAllowPrivateLambda(allow bool) { h.allowPrivateLambda = allow }
+
 func (h *APIHandler) SetS3Authenticator(auth *s3auth.Authenticator) {
 	h.s3Auth = auth
 }
@@ -258,46 +290,30 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// All other routes require JWT
-	if err := h.authenticate(r); err != nil {
+	user, err := h.authenticateUser(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	// Admin-only routes: IAM, keys, STS, audit, backups, settings, lambda, presign, replication, scanner, tiering
-	adminPaths := strings.HasPrefix(path, "/keys") ||
-		strings.HasPrefix(path, "/iam/") ||
-		strings.HasPrefix(path, "/sts/") ||
-		path == "/audit" ||
-		strings.HasPrefix(path, "/backups") ||
-		strings.HasPrefix(path, "/lambda/") ||
-		strings.HasPrefix(path, "/replication/") ||
-		strings.HasPrefix(path, "/scanner/") ||
-		strings.HasPrefix(path, "/tiering/") ||
-		strings.HasPrefix(path, "/settings") ||
-		// Maintenance and cross-bucket routes. Each of these was reachable by any
-		// authenticated subject: version rollback silently rewrote live object
-		// content, tags mutated persistent metadata, reclaim deletes data files,
-		// heal and speedtest burn disk, migrate drives server-side HTTP requests
-		// to any address the caller names, and search and versions answer across
-		// every bucket (security assessment findings 6 and 8).
-		strings.HasPrefix(path, "/versions") ||
-		strings.HasPrefix(path, "/migrate") ||
-		path == "/reclaim" ||
-		path == "/reencrypt" ||
-		path == "/heal" ||
-		path == "/speedtest" ||
-		path == "/search" ||
-		path == "/compact" ||
-		path == "/presign" ||
-		path == "/cluster/join" ||
-		path == "/cluster/leave" ||
-		path == "/cluster/drain" ||
-		path == "/cluster/undrain" ||
-		path == "/cluster/rebalance"
-
-	if adminPaths && !h.isAdminUser(r) {
-		writeError(w, http.StatusForbidden, "admin access required")
-		return
+	// Everything is admin-only unless it is on the short list a non-admin
+	// session needs to use the dashboard. The gate used to be the other way
+	// round, a list of admin prefixes, so every route nobody remembered to add
+	// was open to any session, OIDC auto-created users with no policies
+	// included: the live log and trace streams, every recent S3 call with its
+	// client address, every bucket's name and size, semantic search across all
+	// buckets, webhook URLs carrying their tokens, the data directories, and a
+	// replica repair anyone could start. A new route is now admin-only until
+	// someone decides otherwise.
+	if user != "admin" {
+		if !nonAdminRoute(r.Method, path) {
+			writeError(w, http.StatusForbidden, "admin access required")
+			return
+		}
+		if err := h.checkConsoleIP(r, user); err != nil {
+			writeError(w, http.StatusForbidden, "access denied: "+err.Error())
+			return
+		}
 	}
 
 	// Every route that names a bucket is authorized against the caller's IAM
@@ -321,7 +337,7 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleListBuckets(w, r)
 
 	case path == "/buckets" && r.Method == http.MethodPost:
-		h.handleCreateBucket(w, r)
+		h.handleCreateBucket(w, r, user)
 
 	case strings.HasPrefix(path, "/buckets/"):
 		h.routeBucket(w, r, strings.TrimPrefix(path, "/buckets/"))
@@ -751,6 +767,28 @@ func (h *APIHandler) isAllowedOrigin(origin string, _ *http.Request) bool {
 	}
 	// Allow localhost on server port (always, for dev)
 	if (originHost == "localhost" || originHost == "127.0.0.1") && originPort == serverPort {
+		return true
+	}
+	return false
+}
+
+// nonAdminRoute reports whether a route may be called by a session that is not
+// the admin. Everything else is admin-only.
+//
+// Bucket routes are on the list because each one is authorized against the
+// caller's IAM policies by authorizeConsoleBucket. The cross-bucket read routes
+// are on it because their handlers filter what they return to the buckets the
+// caller may list. Creating a bucket is checked in its handler, since the
+// bucket it names does not exist yet.
+func nonAdminRoute(method, path string) bool {
+	switch {
+	case path == "/auth/me" && method == http.MethodGet,
+		path == "/version" && method == http.MethodGet,
+		path == "/buckets" && (method == http.MethodGet || method == http.MethodPost),
+		strings.HasPrefix(path, "/buckets/"),
+		path == "/stats" && method == http.MethodGet,
+		path == "/activity" && method == http.MethodGet,
+		path == "/tco" && method == http.MethodGet:
 		return true
 	}
 	return false

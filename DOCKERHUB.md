@@ -22,7 +22,7 @@ S3 API: `http://localhost:9000`
 
 - **Full S3 API** -- 80+ operations, works with AWS CLI, mc, boto3, any S3 client
 - **Built-in web dashboard** -- file browser, IAM management, audit trail, search, stats
-- **SSE-S3 and SSE-KMS encryption** -- AES-256-GCM with static key or HashiCorp Vault KMS
+- **SSE-S3 and SSE-KMS encryption** -- AES-256-GCM with a static key or a local KMS key provider
 - **Object versioning** -- per-bucket versioning with version IDs, delete markers, diff/rollback
 - **Object locking (WORM)** -- legal hold and retention (GOVERNANCE/COMPLIANCE)
 - **Multipart upload** -- full lifecycle with UploadPartCopy
@@ -31,7 +31,7 @@ S3 API: `http://localhost:9000`
 - **STS temporary credentials** -- short-lived, auto-expiring access keys
 - **OIDC/SSO** -- Google, Keycloak, Auth0 via OpenID Connect
 - **External authorization webhook** -- delegate each access decision to an endpoint you run
-- **Lifecycle rules** -- expiration, noncurrent version cleanup, abort incomplete multipart
+- **Lifecycle rules** -- expiration by prefix, abort incomplete multipart
 - **Event notifications** -- Kafka, NATS, Redis, AMQP/RabbitMQ, PostgreSQL, Elasticsearch, webhooks
 - **Replication** -- async push and active-active bidirectional with vector clocks
 - **Raft clustering** -- multi-node with consistent hashing and automatic failover, replica repair that restores copies after a node is lost for good, and optional sharded metadata so the index grows with the cluster
@@ -43,10 +43,8 @@ S3 API: `http://localhost:9000`
 - **Data tiering** -- automatic hot/cold migration with remote S3-compatible tier
 - **Backup scheduler** -- cron-based full/incremental backups
 - **Lambda triggers** -- webhook functions on S3 events
-- **Batch operations** -- bulk delete and copy processor
 - **Orphan reclaim** -- `vaults3-cli storage reclaim` frees data files that no metadata refers to, across every node
 - **Rate limiting** -- per-IP and per-access-key token bucket, on by default
-- **Auto-TLS** -- Let's Encrypt with self-signed fallback
 - **PROXY protocol** -- real client IP behind load balancers
 - **Prometheus metrics** -- per-bucket request counts, bytes, errors at `/metrics`
 - **Health checks** -- `/health` (liveness) and `/ready` (readiness)

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -42,6 +43,12 @@ func (h *ObjectHandler) PostUpload(w http.ResponseWriter, r *http.Request, bucke
 	if strings.Contains(key, "${filename}") {
 		key = strings.ReplaceAll(key, "${filename}", header.Filename)
 	}
+	// The key comes from a form field, not the request path, so the router never
+	// saw it. "../victim/a.txt" here wrote into another bucket.
+	if msg := objectKeyProblem(key); msg != "" {
+		writeS3Error(w, "InvalidArgument", msg, http.StatusBadRequest)
+		return
+	}
 
 	// Validate policy if present
 	policyB64 := r.FormValue("Policy")
@@ -59,15 +66,16 @@ func (h *ObjectHandler) PostUpload(w http.ResponseWriter, r *http.Request, bucke
 		}
 	}
 
-	// Check quota
-	if !h.checkQuota(w, bucket, header.Size) {
+	// The router could only authorize the bucket, because the key is a form
+	// field. Authorize the key itself now that it is known.
+	if err := h.authorizeEntry(r, "s3:PutObject", formatResource(bucket, key)); err != nil {
+		slog.Info("s3: form upload refused by policy", "bucket", bucket, "key", key, "reason", err.Error())
+		writeS3Error(w, "AccessDenied", "Access Denied", http.StatusForbidden)
 		return
 	}
 
-	// Store the object
-	size, etag, err := h.engine.PutObject(bucket, key, file, header.Size)
-	if err != nil {
-		writeS3Error(w, "InternalError", err.Error(), http.StatusInternalServerError)
+	// Check quota
+	if !h.checkQuota(w, bucket, header.Size) {
 		return
 	}
 
@@ -76,21 +84,30 @@ func (h *ObjectHandler) PostUpload(w http.ResponseWriter, r *http.Request, bucke
 		ct = "application/octet-stream"
 	}
 
-	if err := h.store.PutObjectMeta(metadata.ObjectMeta{
-		Bucket:       bucket,
-		Key:          key,
-		Size:         size,
-		ETag:         etag,
-		ContentType:  ct,
-		LastModified: time.Now().UTC().UnixNano(),
-	}); err != nil {
-		metaWriteFailed(w, err, "POST upload", bucket, key)
+	// Through writeObject like every other write, so a form upload honours the
+	// bucket's versioning and cannot replace a locked object.
+	meta, err := h.writeObject(newObject{
+		bucket:   bucket,
+		key:      key,
+		body:     file,
+		size:     header.Size,
+		meta:     metadata.ObjectMeta{ContentType: ct},
+		lockFrom: r,
+	})
+	if err != nil {
+		answerWriteError(w, err, bucket, key)
 		return
 	}
 
-	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, etag))
+	// The engine's ETag is already quoted. Quoting it again sent the client
+	// ""<md5>"", which no SDK recognises as the ETag of what it uploaded.
+	w.Header().Set("ETag", meta.ETag)
+	if meta.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", meta.VersionID)
+	}
 	w.Header().Set("Location", fmt.Sprintf("/%s/%s", bucket, key))
 	w.WriteHeader(http.StatusNoContent)
+	h.notifyCreated("s3:ObjectCreated:Post", meta)
 }
 
 func (h *ObjectHandler) validatePostPolicy(policyB64, signature, credential string, r *http.Request) error {

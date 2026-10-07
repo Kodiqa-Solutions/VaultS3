@@ -38,6 +38,14 @@ type Collector struct {
 	bucketMu      sync.RWMutex
 	bucketMetrics map[string]*bucketMetrics
 
+	// sizes caches each bucket's size and object count. Computing them walks the
+	// bucket's directory, and /metrics is served without authentication, so
+	// every scrape, or anyone who could reach the port, made the server walk
+	// every bucket on disk. A minute-old figure is what a scrape interval
+	// shows anyway.
+	sizesMu sync.Mutex
+	sizes   map[string]bucketSize
+
 	// diskUsage reports VaultS3's measured on-disk footprint, so the physical
 	// size can be graphed next to the logical one instead of guessed at from
 	// filesystem-wide numbers (issue #43). nil until wired, or when the scan is
@@ -270,7 +278,7 @@ func (c *Collector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var totalSize, totalObjects int64
 		for _, b := range buckets {
-			size, count, err := c.engine.BucketSize(b.Name)
+			size, count, err := c.bucketSize(b.Name)
 			if err != nil {
 				continue
 			}
@@ -351,4 +359,31 @@ func (c *Collector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "vaults3_go_memory_alloc_bytes %d\n", mem.Alloc)
 	fmt.Fprintf(w, "vaults3_go_memory_sys_bytes %d\n", mem.Sys)
 	fmt.Fprintf(w, "vaults3_go_gc_total %d\n", mem.NumGC)
+}
+
+type bucketSize struct {
+	size, count int64
+	at          time.Time
+}
+
+const bucketSizeTTL = time.Minute
+
+// bucketSize returns a bucket's size and object count, walking its directory
+// at most once a minute. The lock is held across the walk on purpose, so
+// concurrent scrapes wait for one walk instead of each starting their own.
+func (c *Collector) bucketSize(bucket string) (int64, int64, error) {
+	c.sizesMu.Lock()
+	defer c.sizesMu.Unlock()
+	if e, ok := c.sizes[bucket]; ok && time.Since(e.at) < bucketSizeTTL {
+		return e.size, e.count, nil
+	}
+	size, count, err := c.engine.BucketSize(bucket)
+	if err != nil {
+		return 0, 0, err
+	}
+	if c.sizes == nil {
+		c.sizes = make(map[string]bucketSize)
+	}
+	c.sizes[bucket] = bucketSize{size: size, count: count, at: time.Now()}
+	return size, count, nil
 }

@@ -62,6 +62,9 @@ func TestUploadReportsStorageError(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/vault/upload", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	// The handler authorizes each file against the caller, as ServeHTTP does
+	// for the route, so the request carries the admin session it would have.
+	req.Header.Set("Authorization", "Bearer "+getToken(t, h))
 	rr := httptest.NewRecorder()
 	h.handleUpload(rr, req, "vault")
 
@@ -108,6 +111,9 @@ func TestUploadStreamsAndPreservesFolderPath(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/vault/upload", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	// The handler authorizes each file against the caller, as ServeHTTP does
+	// for the route, so the request carries the admin session it would have.
+	req.Header.Set("Authorization", "Bearer "+getToken(t, h))
 	rr := httptest.NewRecorder()
 	h.handleUpload(rr, req, "vault")
 

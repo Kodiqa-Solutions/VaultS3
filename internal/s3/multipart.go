@@ -100,9 +100,21 @@ func (h *ObjectHandler) CreateMultipartUpload(w http.ResponseWriter, r *http.Req
 // Every multipart handler goes through here so none of them can reintroduce the
 // bug where a node that lacks the record answers NoSuchUpload for an upload that
 // is alive on a different node (issue #47 bug B).
-func (h *ObjectHandler) requireUpload(w http.ResponseWriter, r *http.Request, uploadID string) (*metadata.MultipartUpload, bool) {
+//
+// The upload must also belong to the bucket and key in the URL. That was never
+// compared, so an upload id was a capability for whatever object it was started
+// for: a caller authorized only on its own key could complete, abort or add
+// parts to someone else's upload by naming it under that key, and the object
+// was then written under the upload's key, not the authorized one.
+func (h *ObjectHandler) requireUpload(w http.ResponseWriter, r *http.Request, uploadID, bucket, key string) (*metadata.MultipartUpload, bool) {
 	upload, err := h.multipartStore().GetMultipartUpload(uploadID)
 	if err == nil {
+		// A record written before uploads carried their bucket and key cannot
+		// be checked, and is honoured as it always was.
+		if (upload.Bucket != "" || upload.Key != "") && (upload.Bucket != bucket || upload.Key != key) {
+			writeS3Error(w, "NoSuchUpload", "Upload not found", http.StatusNotFound)
+			return nil, false
+		}
 		return upload, true
 	}
 	if h.multipartHolder != nil && h.multipartHolder(w, r, uploadID) {
@@ -112,9 +124,17 @@ func (h *ObjectHandler) requireUpload(w http.ResponseWriter, r *http.Request, up
 	return nil, false
 }
 
+// lockUpload serializes the requests that end an upload. Two concurrent
+// CompleteMultipartUpload calls for one upload used to assemble into the same
+// fixed temp file at once and interleave their bytes, and an abort could remove
+// the parts from under a completion halfway through assembling them.
+func lockUpload(uploadID string) func() {
+	return lockObjectKey("\x00multipart", uploadID)
+}
+
 // UploadPart handles PUT /{bucket}/{key}?partNumber=N&uploadId=X.
 func (h *ObjectHandler) UploadPart(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
-	if _, ok := h.requireUpload(w, r, uploadID); !ok {
+	if _, ok := h.requireUpload(w, r, uploadID, bucket, key); !ok {
 		return
 	}
 
@@ -133,18 +153,32 @@ func (h *ObjectHandler) UploadPart(w http.ResponseWriter, r *http.Request, bucke
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxPartSize)
 
-	written, etag, ok := h.writePart(w, r.Body, uploadID, partNum)
+	// A part is checked against its Content-MD5 and x-amz-checksum-* the same
+	// way a whole object is, inside the reader, so a part that arrives damaged
+	// never replaces a good copy of itself. Neither was checked at all.
+	digests := newPutDigests(r, r.Body)
+	digests.checkInline(r, -1)
+
+	written, etag, ok := h.writePart(w, digests, uploadID, partNum)
 	if !ok {
 		return
 	}
 
-	h.multipartStore().PutPart(uploadID, metadata.PartInfo{
+	// The part is only usable once it is recorded, so a failed record must not
+	// be answered with 200. It used to be ignored, and the completion then
+	// failed with InvalidPart for a part the client had been told was stored.
+	if err := h.multipartStore().PutPart(uploadID, metadata.PartInfo{
 		PartNumber: partNum,
 		ETag:       etag,
 		Size:       written,
-	})
+	}); err != nil {
+		metaWriteFailed(w, err, "PutPart", bucket, key)
+		return
+	}
 
 	w.Header().Set("ETag", etag)
+	setChecksumHeaders(w, &metadata.ObjectMeta{ChecksumSHA256: digests.sums.SHA256, ChecksumCRC32: digests.sums.CRC32,
+		ChecksumCRC32C: digests.sums.CRC32C, ChecksumSHA1: digests.sums.SHA1})
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -184,7 +218,9 @@ func (h *ObjectHandler) writePart(w http.ResponseWriter, body io.Reader, uploadI
 		// left exactly as it was.
 		slog.Warn("multipart: part upload failed mid-transfer, any previously uploaded copy of this part is untouched",
 			"upload", uploadID, "part", partNum, "error", err)
-		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		if !writeReqError(w, err) {
+			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		}
 		return 0, "", false
 	}
 	// Close before renaming, and check it: a deferred close would discard a
@@ -208,27 +244,65 @@ func (h *ObjectHandler) writePart(w http.ResponseWriter, body io.Reader, uploadI
 	return written, fmt.Sprintf("\"%s\"", hex.EncodeToString(hash.Sum(nil))), true
 }
 
+// completePart is one entry of a CompleteMultipartUpload part list.
+type completePart struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+// normalizeETag compares ETags the way S3 does: quotes are optional and hex is
+// case-insensitive.
+func normalizeETag(e string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(e), `"`))
+}
+
+// checkCompleteParts validates a completion's part list against the parts that
+// were uploaded. It returns the S3 error to answer, or nil.
+//
+// The list used to be trusted as given: a part named twice was concatenated
+// twice, an empty list produced a 0-byte object, a part's ETag was never
+// compared with the part that was stored, and an unsorted list was quietly
+// sorted. Every one of those stores an object the client did not describe.
+func checkCompleteParts(parts []completePart, stored []metadata.PartInfo) *reqError {
+	if len(parts) == 0 {
+		return &reqError{"MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema", http.StatusBadRequest}
+	}
+	byNumber := make(map[int]metadata.PartInfo, len(stored))
+	for _, p := range stored {
+		byNumber[p.PartNumber] = p
+	}
+	prev := 0
+	for _, p := range parts {
+		if p.PartNumber < 1 || p.PartNumber > 10000 {
+			return &reqError{"InvalidPart", fmt.Sprintf("Part number %d is out of range", p.PartNumber), http.StatusBadRequest}
+		}
+		if p.PartNumber <= prev {
+			return &reqError{"InvalidPartOrder", "The list of parts was not in ascending order. Parts must be ordered by part number.", http.StatusBadRequest}
+		}
+		prev = p.PartNumber
+		got, ok := byNumber[p.PartNumber]
+		if !ok || normalizeETag(p.ETag) == "" || normalizeETag(got.ETag) != normalizeETag(p.ETag) {
+			return &reqError{"InvalidPart", fmt.Sprintf("Part %d not found, or its ETag does not match the part that was uploaded", p.PartNumber), http.StatusBadRequest}
+		}
+	}
+	return nil
+}
+
 // CompleteMultipartUpload handles POST /{bucket}/{key}?uploadId=X.
 func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
-	upload, ok := h.requireUpload(w, r, uploadID)
-	if !ok {
+	if _, ok := h.requireUpload(w, r, uploadID, bucket, key); !ok {
+		return
+	}
+	unlock := lockUpload(uploadID)
+	defer unlock()
+	// A completion or abort that held the lock before this one may have ended
+	// the upload, so read it again now that nothing else can.
+	upload, err := h.multipartStore().GetMultipartUpload(uploadID)
+	if err != nil {
+		writeS3Error(w, "NoSuchUpload", "Upload not found", http.StatusNotFound)
 		return
 	}
 
-	// Check quota (estimate size from parts)
-	parts, _ := h.multipartStore().ListParts(uploadID)
-	var estimatedSize int64
-	for _, p := range parts {
-		estimatedSize += p.Size
-	}
-	if !h.checkQuota(w, bucket, estimatedSize) {
-		return
-	}
-
-	type completePart struct {
-		PartNumber int    `xml:"PartNumber"`
-		ETag       string `xml:"ETag"`
-	}
 	type completeRequest struct {
 		XMLName xml.Name       `xml:"CompleteMultipartUpload"`
 		Parts   []completePart `xml:"Part"`
@@ -247,25 +321,43 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	sort.Slice(req.Parts, func(i, j int) bool {
-		return req.Parts[i].PartNumber < req.Parts[j].PartNumber
-	})
-
-	// Assemble the parts. When encryption is enabled we assemble into a temp file
-	// and write the object through engine.PutObject so it is encrypted at rest
-	// (per-bucket or SSE); otherwise we assemble straight to the final path.
-	// Assemble the parts into a temp file, then write the object through
-	// engine.PutObject. This keeps completion atomic (the engine does temp+rename),
-	// routes through the packed/compressed/encrypted wrappers, and never touches a
-	// pre-existing object at the target key until the new object is fully assembled,
-	// so a failed complete (e.g. a missing part) cannot truncate or delete it.
-	assemblePath := filepath.Join(h.multipartDir(uploadID), "assembled.tmp")
-	outFile, err := os.Create(assemblePath)
+	stored, err := h.multipartStore().ListParts(uploadID)
 	if err != nil {
 		slog.Error("internal error", "error", err)
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 		return
 	}
+	if rerr := checkCompleteParts(req.Parts, stored); rerr != nil {
+		writeS3Error(w, rerr.code, rerr.msg, rerr.status)
+		return
+	}
+
+	// Check quota against the parts actually being assembled
+	sizes := make(map[int]int64, len(stored))
+	for _, p := range stored {
+		sizes[p.PartNumber] = p.Size
+	}
+	var estimatedSize int64
+	for _, p := range req.Parts {
+		estimatedSize += sizes[p.PartNumber]
+	}
+	if !h.checkQuota(w, bucket, estimatedSize) {
+		return
+	}
+
+	// Assemble the parts into a temp file of this request's own, then write the
+	// object through writeObject. That keeps completion atomic (the engine does
+	// temp+rename), routes through the packed/compressed/encrypted wrappers and
+	// the versioning and object-lock rules, and never touches a pre-existing
+	// object at the target key until the new object is fully assembled.
+	outFile, err := os.CreateTemp(h.multipartDir(uploadID), "assembled-*.tmp")
+	if err != nil {
+		slog.Error("internal error", "error", err)
+		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		return
+	}
+	assemblePath := outFile.Name()
+	defer os.Remove(assemblePath)
 
 	// Concatenate parts and compute multipart ETag
 	var totalSize int64
@@ -295,9 +387,15 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		pf.Close()
 		if err != nil {
 			outFile.Close()
-			os.Remove(assemblePath)
 			slog.Error("internal error", "error", err)
 			writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+			return
+		}
+		// The bytes on disk must be the part the client named. A part re-uploaded
+		// while this completion was being prepared has a different digest.
+		if hex.EncodeToString(partHash.Sum(nil)) != normalizeETag(part.ETag) {
+			outFile.Close()
+			writeS3Error(w, "InvalidPart", fmt.Sprintf("Part %d does not match its ETag", part.PartNumber), http.StatusBadRequest)
 			return
 		}
 
@@ -305,9 +403,12 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		partBoundaries = append(partBoundaries, totalSize)
 		combinedHash.Write(partHash.Sum(nil))
 	}
-	outFile.Close()
+	if cerr := outFile.Close(); cerr != nil && missingPart == 0 {
+		slog.Error("internal error", "error", cerr)
+		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
+		return
+	}
 	if missingPart != 0 {
-		os.Remove(assemblePath)
 		if openErr != nil {
 			slog.Error("multipart: could not read a part that is present, failing the completion",
 				"bucket", bucket, "key", key, "upload", uploadID,
@@ -325,52 +426,43 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Write the assembled object through the engine (atomic temp+rename; applies
-	// compression / per-bucket or SSE encryption / packing as configured), then
-	// drop the temp file.
 	af, err := os.Open(assemblePath)
 	if err != nil {
-		os.Remove(assemblePath)
 		slog.Error("internal error", "error", err)
 		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 		return
 	}
-	if _, _, perr := h.engine.PutObject(bucket, key, af, totalSize); perr != nil {
-		af.Close()
-		os.Remove(assemblePath)
-		slog.Error("internal error", "error", perr)
-		writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
-		return
-	}
-	af.Close()
-	os.Remove(assemblePath)
+	defer af.Close()
 
 	// S3 multipart ETag: md5(md5(part1) + md5(part2) + ...)-N
 	etag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(combinedHash.Sum(nil)), len(req.Parts))
 
-	now := time.Now().UTC()
-
-	if err := h.store.PutObjectMeta(metadata.ObjectMeta{
-		Bucket:             bucket,
-		Key:                key,
-		ContentType:        upload.ContentType,
-		ETag:               etag,
-		Size:               totalSize,
-		LastModified:       now.Unix(),
-		PartsCount:         len(req.Parts),
-		PartBoundaries:     partBoundaries,
-		Tags:               upload.Tags,
-		UserMetadata:       upload.UserMetadata,
-		ContentEncoding:    upload.ContentEncoding,
-		ContentDisposition: upload.ContentDisposition,
-		CacheControl:       upload.CacheControl,
-		ContentLanguage:    upload.ContentLanguage,
-		WebsiteRedirect:    upload.WebsiteRedirect,
-	}); err != nil {
+	meta, err := h.writeObject(newObject{
+		bucket: bucket,
+		key:    key,
+		body:   af,
+		size:   totalSize,
+		meta: metadata.ObjectMeta{
+			ContentType:        upload.ContentType,
+			PartsCount:         len(req.Parts),
+			PartBoundaries:     partBoundaries,
+			Tags:               upload.Tags,
+			UserMetadata:       upload.UserMetadata,
+			ContentEncoding:    upload.ContentEncoding,
+			ContentDisposition: upload.ContentDisposition,
+			CacheControl:       upload.CacheControl,
+			ContentLanguage:    upload.ContentLanguage,
+			WebsiteRedirect:    upload.WebsiteRedirect,
+		},
+		etag:             etag,
+		bypassGovernance: h.governanceBypass(r, bucket, key),
+		lockFrom:         r,
+	})
+	if err != nil {
 		// The parts are assembled but the object is not recorded. Failing here
 		// leaves the upload completable on retry, which is far better than
 		// acknowledging an object that will never list.
-		metaWriteFailed(w, err, "CompleteMultipartUpload", bucket, key)
+		answerWriteError(w, err, bucket, key)
 		return
 	}
 
@@ -392,35 +484,26 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		ETag     string   `xml:"ETag"`
 	}
 
+	if meta.VersionID != "" {
+		w.Header().Set("X-Amz-Version-Id", meta.VersionID)
+	}
 	writeXML(w, http.StatusOK, completeResult{
 		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
 		Location: fmt.Sprintf("/%s/%s", bucket, key),
 		Bucket:   bucket,
 		Key:      key,
-		ETag:     etag,
+		ETag:     meta.ETag,
 	})
-	if h.onNotification != nil {
-		h.onNotification("s3:ObjectCreated:CompleteMultipartUpload", bucket, key, totalSize, etag, "")
-	}
-	if h.onReplication != nil {
-		h.onReplication("s3:ObjectCreated:CompleteMultipartUpload", bucket, key, totalSize, etag, "")
-	}
-	if h.onLambda != nil {
-		h.onLambda("s3:ObjectCreated:CompleteMultipartUpload", bucket, key, totalSize, etag, "")
-	}
-	if h.onScan != nil {
-		h.onScan(bucket, key, totalSize)
-	}
-	if h.onSearchUpdate != nil {
-		h.onSearchUpdate("put", bucket, key)
-	}
+	h.notifyCreated("s3:ObjectCreated:CompleteMultipartUpload", meta)
 }
 
 // AbortMultipartUpload handles DELETE /{bucket}/{key}?uploadId=X.
 func (h *ObjectHandler) AbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
-	if _, ok := h.requireUpload(w, r, uploadID); !ok {
+	if _, ok := h.requireUpload(w, r, uploadID, bucket, key); !ok {
 		return
 	}
+	unlock := lockUpload(uploadID)
+	defer unlock()
 
 	os.RemoveAll(h.multipartDir(uploadID))
 	h.multipartStore().DeleteMultipartUpload(uploadID)
@@ -438,7 +521,7 @@ func (h *ObjectHandler) multipartDir(uploadID string) string {
 
 // UploadPartCopy handles PUT /{bucket}/{key}?partNumber=N&uploadId=X with X-Amz-Copy-Source.
 func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
-	if _, ok := h.requireUpload(w, r, uploadID); !ok {
+	if _, ok := h.requireUpload(w, r, uploadID, bucket, key); !ok {
 		return
 	}
 
@@ -449,37 +532,25 @@ func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 
-	// Parse copy source
-	copySource := r.Header.Get("X-Amz-Copy-Source")
-	copySource = strings.TrimPrefix(copySource, "/")
-	srcBucket, srcKey := parseCopySource(copySource)
-	if srcBucket == "" || srcKey == "" {
+	// Parsed and opened exactly as CopyObject does. This used to take the header
+	// without unescaping it, so an encoded key named a different object from the
+	// one the router authorized, and it read the plain path, which misses every
+	// object in a versioned bucket.
+	src, perr := parseCopySourceHeader(r.Header.Get("X-Amz-Copy-Source"))
+	if perr != nil {
 		writeS3Error(w, "InvalidArgument", "Invalid x-amz-copy-source", http.StatusBadRequest)
 		return
 	}
-	// Validate source key against path traversal
-	for _, segment := range strings.Split(srcKey, "/") {
-		if segment == ".." {
-			writeS3Error(w, "InvalidArgument", "Invalid x-amz-copy-source key", http.StatusBadRequest)
-			return
-		}
-	}
-
-	if !h.store.BucketExists(srcBucket) {
-		writeS3Error(w, "NoSuchBucket", "Source bucket does not exist", http.StatusNotFound)
-		return
-	}
-
-	// Read source object
-	reader, srcSize, err := h.engine.GetObject(srcBucket, srcKey)
-	if err != nil {
-		writeS3Error(w, "NoSuchKey", "Source object not found", http.StatusNotFound)
+	srcMeta, reader, srcSize, ok := h.openCopySource(w, r, src)
+	if !ok {
 		return
 	}
 	defer reader.Close()
+	if checkCopyPreconditions(w, r, srcMeta) {
+		return
+	}
 
 	var dataReader io.Reader = reader
-	var copySize int64 = srcSize
 
 	// Parse optional range header
 	if rangeHeader := r.Header.Get("X-Amz-Copy-Source-Range"); rangeHeader != "" {
@@ -499,15 +570,11 @@ func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, b
 		if end >= srcSize {
 			end = srcSize - 1
 		}
-		// Skip to start
-		if start > 0 {
-			if _, err := io.CopyN(io.Discard, reader, start); err != nil {
-				writeS3Error(w, "InternalError", "Failed to seek source", http.StatusInternalServerError)
-				return
-			}
+		if _, err := reader.Seek(start, io.SeekStart); err != nil {
+			writeS3Error(w, "InternalError", "Failed to seek source", http.StatusInternalServerError)
+			return
 		}
-		copySize = end - start + 1
-		dataReader = io.LimitReader(reader, copySize)
+		dataReader = io.LimitReader(reader, end-start+1)
 	}
 
 	// Write to the part file through the same temp-then-rename path as a normal
@@ -518,11 +585,14 @@ func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 
-	h.multipartStore().PutPart(uploadID, metadata.PartInfo{
+	if err := h.multipartStore().PutPart(uploadID, metadata.PartInfo{
 		PartNumber: partNum,
 		ETag:       etag,
 		Size:       written,
-	})
+	}); err != nil {
+		metaWriteFailed(w, err, "PutPart", bucket, key)
+		return
+	}
 
 	now := time.Now().UTC()
 
@@ -532,6 +602,9 @@ func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, b
 		LastModified string   `xml:"LastModified"`
 	}
 
+	if srcMeta.VersionID != "" {
+		w.Header().Set("X-Amz-Copy-Source-Version-Id", srcMeta.VersionID)
+	}
 	writeXML(w, http.StatusOK, copyPartResult{
 		ETag:         etag,
 		LastModified: now.Format(time.RFC3339),
@@ -607,7 +680,7 @@ func (h *ObjectHandler) ListMultipartUploads(w http.ResponseWriter, r *http.Requ
 
 // ListParts handles GET /{bucket}/{key}?uploadId=X.
 func (h *ObjectHandler) ListParts(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
-	if _, ok := h.requireUpload(w, r, uploadID); !ok {
+	if _, ok := h.requireUpload(w, r, uploadID, bucket, key); !ok {
 		return
 	}
 

@@ -20,9 +20,11 @@ metadata:
 type: Opaque
 stringData:
   access-key: "vaults3-admin"
-  # CHANGE THIS before applying. It is the dashboard and S3 password, and this
-  # file is public.
-  secret-key: "vaults3-secret-change-me"
+  # Left empty, the server generates a secret on first start and prints it once
+  # to its log: kubectl -n vaults3 logs deploy/vaults3 | grep -A3 "Secret key".
+  # This file is public, so a value written here is known to everyone who has
+  # read it. If you set one, set it before the first start.
+  secret-key: ""
 ---
 apiVersion: v1
 kind: ConfigMap

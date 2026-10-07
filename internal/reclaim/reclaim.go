@@ -52,7 +52,8 @@ const tmpPrefix = ".vaults3-tmp-"
 // of packed objects.
 const packedVolumesDir = "_volumes"
 
-// erasureDir holds erasure-coded shards at <bucket>/.ec/<key>/shard-N. An
+// erasureDir holds erasure-coded shards at <bucket>/.ec/<key>/gen-<id>/shard-N
+// (or <bucket>/.ec/<key>/shard-N for objects written before 5.0.0). An
 // erasure-coded object has no plain data file at all, only shards, so shards must
 // never be judged against the plain-object metadata lookup: every one of them
 // would look like an orphan.

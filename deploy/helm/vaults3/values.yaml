@@ -39,8 +39,19 @@ auth:
   # Read the generated one with:
   #   kubectl get secret <release> -o jsonpath='{.data.secret-key}' | base64 -d
   secretKey: ""
+  # The secret nodes use to authenticate each other in a cluster. Left empty, a
+  # new install generates one, and an upgraded release keeps the value it was
+  # using, which before this chart version was the admin secret. Set it to give
+  # the cluster a secret of its own.
+  clusterSecret: ""
   # Use an existing Secret instead of the chart-managed one. The Secret must
-  # contain keys `access-key` and `secret-key`.
+  # contain keys `access-key` and `secret-key`, and may contain `cluster-secret`.
+  #
+  # With `helm template`, Argo CD or any tool that renders without cluster
+  # access, the chart cannot read the existing Secret, so a generated secret
+  # changes on every render: pods that restart get a new admin and cluster
+  # secret while the rest keep the old one. Set secretKey and clusterSecret, or
+  # existingSecret, for those workflows.
   existingSecret: ""
 
 # The vaults3.yaml mounted at /etc/vaults3/vaults3.yaml. Data/metadata dirs are

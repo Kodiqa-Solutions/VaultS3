@@ -58,6 +58,20 @@ const (
 //  2. whatever the config or environment sets;
 //  3. a freshly generated secret, persisted so the next start reuses it.
 func resolveAdminCredentials(cfg *config.Config, store *metadata.Store, auth *s3.Authenticator) (adminCredentialSource, error) {
+	// An explicit override puts the configured credentials ahead of the saved
+	// ones and saves them, so they stay in force even after the flag is removed.
+	if cfg.Auth.OverrideStoredCredentials && cfg.Auth.AdminSecretKey != "" {
+		if cfg.Auth.AdminAccessKey == "" {
+			cfg.Auth.AdminAccessKey = defaultAdminAccessKey
+		}
+		if err := store.SetAdminCredentials(cfg.Auth.AdminAccessKey, cfg.Auth.AdminSecretKey); err != nil {
+			return adminCredsFromConfig, fmt.Errorf("save overriding admin credentials: %w", err)
+		}
+		auth.UpdateAdminCredentials(cfg.Auth.AdminAccessKey, cfg.Auth.AdminSecretKey)
+		slog.Warn("admin credentials replaced from the configuration (override_stored_credentials); " +
+			"remove the setting once the new credentials are in place, or later dashboard changes are lost on restart")
+		return adminCredsFromConfig, nil
+	}
 	if ak, sk, err := store.GetAdminCredentials(); err == nil && ak != "" && sk != "" {
 		cfg.Auth.AdminAccessKey = ak
 		cfg.Auth.AdminSecretKey = sk
@@ -113,8 +127,9 @@ func announceAdminCredentials(accessKey, secretKey, dashboard string) {
 
    Dashboard:   %s
 
- Change it from the dashboard, or set VAULTS3_ACCESS_KEY and
- VAULTS3_SECRET_KEY to credentials of your own.
+ Change it from the dashboard. To replace it from the environment,
+ set VAULTS3_ACCESS_KEY, VAULTS3_SECRET_KEY and
+ VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true for one start.
 ──────────────────────────────────────────────────────────────
 
 `, accessKey, secretKey, dashboard)
@@ -124,7 +139,7 @@ func announceAdminCredentials(accessKey, secretKey, dashboard string) {
 func warnPlaceholderSecret(secret string) {
 	if secret == publishedPlaceholderSecret {
 		slog.Warn("this server is using the example admin secret from the VaultS3 documentation, which is public; " +
-			"set VAULTS3_SECRET_KEY, or clear admin_secret_key to have one generated")
+			"change it from the dashboard, or set VAULTS3_SECRET_KEY with VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true for one start")
 	}
 }
 

@@ -124,7 +124,13 @@ func applySetup(a *setupAnswers, interactive bool) error {
 	}
 	// 0600: the file holds the admin secret, so it is readable by its owner only.
 	if err := os.WriteFile(a.configPath, []byte(renderConfig(a)), 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", a.configPath, err)
+		return fmt.Errorf("write config: %w", err)
+	}
+	// WriteFile applies the mode only when it creates the file. Overwriting an
+	// existing one with --force kept its old permissions, often world-readable,
+	// on a file that now holds the admin secret.
+	if err := os.Chmod(a.configPath, 0o600); err != nil {
+		return fmt.Errorf("restrict permissions on %s: %w", a.configPath, err)
 	}
 
 	printNextSteps(a, generated)

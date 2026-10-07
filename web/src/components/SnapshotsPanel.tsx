@@ -5,6 +5,7 @@ import {
   type Snapshot, type SnapshotDiff,
 } from '../api/snapshots'
 import { useToast } from '../hooks/useToast'
+import { useInFlight } from '../hooks/useInFlight'
 
 function formatSize(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -23,7 +24,9 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
   const { addToast } = useToast()
   const [snaps, setSnaps] = useState<Snapshot[]>([])
   const [message, setMessage] = useState('')
-  const [busy, setBusy] = useState(false)
+  // One guard for create, restore and delete: each changes the snapshot list
+  // the others act on, so only one runs at a time.
+  const [busy, runBusy] = useInFlight()
   const [diffFor, setDiffFor] = useState<string | null>(null)
   const [diff, setDiff] = useState<SnapshotDiff | null>(null)
 
@@ -37,8 +40,7 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
 
   useEffect(() => { refresh() }, [refresh])
 
-  const handleCreate = async () => {
-    setBusy(true)
+  const handleCreate = () => runBusy(async () => {
     try {
       await createSnapshot(bucket, message.trim())
       setMessage('')
@@ -46,10 +48,8 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
       await refresh()
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('snapshots.failedToCreateSnapshot'))
-    } finally {
-      setBusy(false)
     }
-  }
+  })
 
   const handleDiff = async (id: string) => {
     if (diffFor === id) { setDiffFor(null); setDiff(null); return }
@@ -62,9 +62,8 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
     }
   }
 
-  const handleRestore = async (id: string) => {
-    if (!window.confirm('Roll the bucket back to this snapshot? Objects added since will be removed from the listing (their versions are kept). You can snapshot first to make this reversible.')) return
-    setBusy(true)
+  const handleRestore = (id: string) => runBusy(async () => {
+    if (!window.confirm(t('snapshots.restoreConfirm'))) return
     try {
       const r = await restoreSnapshot(bucket, id)
       addToast('success', t('snapshots.restored', { reverted: r.reverted, removed: r.removed }) +
@@ -73,12 +72,10 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
       await refresh()
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('snapshots.restoreFailed'))
-    } finally {
-      setBusy(false)
     }
-  }
+  })
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = (id: string) => runBusy(async () => {
     if (!window.confirm(t('snapshots.deleteThisSnapshotObjectDataIs'))) return
     try {
       await deleteSnapshot(bucket, id)
@@ -87,7 +84,7 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
     } catch (err) {
       addToast('error', err instanceof Error ? err.message : t('snapshots.deleteFailed'))
     }
-  }
+  })
 
   return (
     <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5">
@@ -124,23 +121,23 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
                   <div className="flex items-center justify-between gap-3">
                     <div className="min-w-0">
                       <div className="text-sm text-gray-900 dark:text-white truncate">
-                        {s.message || <span className="text-gray-400 italic">(no message)</span>}
+                        {s.message || <span className="text-gray-400 italic">{t('snapshots.noMessage')}</span>}
                       </div>
                       <div className="text-xs text-gray-400 mt-0.5 font-mono">
-                        {s.id} · {s.objects} objects · {formatSize(s.size)} · {new Date(s.createdAt * 1000).toLocaleString()}
+                        {s.id} · {t('snapshots.objectCount', { count: s.objects })} · {formatSize(s.size)} · {new Date(s.createdAt * 1000).toLocaleString()}
                       </div>
                     </div>
                     <div className="flex gap-1 flex-shrink-0">
                       <button onClick={() => handleDiff(s.id)}
                         className="px-2.5 py-1 rounded-md text-xs border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700">
-                        {diffFor === s.id ? t('snapshots.hideDiff') : 'Diff'}
+                        {diffFor === s.id ? t('snapshots.hideDiff') : t('snapshots.diff')}
                       </button>
                       <button onClick={() => handleRestore(s.id)} disabled={busy}
                         className="px-2.5 py-1 rounded-md text-xs bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white">
                         {t('snapshots.restore')}
                       </button>
-                      <button onClick={() => handleDelete(s.id)}
-                        className="px-2.5 py-1 rounded-md text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20">
+                      <button onClick={() => handleDelete(s.id)} disabled={busy}
+                        className="px-2.5 py-1 rounded-md text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50">
                         {t('snapshots.delete')}
                       </button>
                     </div>
@@ -150,9 +147,9 @@ export default function SnapshotsPanel({ bucket, versioningEnabled }: Props) {
                     <div className="mt-3 p-3 rounded-lg bg-gray-50 dark:bg-gray-900/40 text-xs">
                       <div className="mb-2 text-gray-500 dark:text-gray-400">
                         {t('snapshots.changesSince')}
-                        <span className="text-emerald-600 dark:text-emerald-400 ml-2">+{diff.added} added</span>
-                        <span className="text-amber-600 dark:text-amber-400 ml-2">~{diff.modified} modified</span>
-                        <span className="text-red-600 dark:text-red-400 ml-2">-{diff.removed} removed</span>
+                        <span className="text-emerald-600 dark:text-emerald-400 ml-2">{t('snapshots.addedCount', { count: diff.added })}</span>
+                        <span className="text-amber-600 dark:text-amber-400 ml-2">{t('snapshots.modifiedCount', { count: diff.modified })}</span>
+                        <span className="text-red-600 dark:text-red-400 ml-2">{t('snapshots.removedCount', { count: diff.removed })}</span>
                       </div>
                       {(diff.changes || []).length === 0 ? (
                         <div className="text-gray-400">{t('snapshots.noChangesTheBucketMatchesThis')}</div>

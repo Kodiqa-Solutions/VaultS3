@@ -7,6 +7,7 @@
 package bucketcrypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -150,26 +151,42 @@ type Manager struct {
 	kek   *KEK
 	keys  KeyStore
 	mu    sync.RWMutex
-	cache map[string][]byte // bucket\x00version -> unwrapped DEK
+	cache map[string]cachedKey // bucket\x00version -> unwrapped DEK
+}
+
+// cachedKey is an unwrapped DEK together with the wrapped form it came from. A
+// cache hit is only trusted while the key store still holds that same wrapped
+// key, which is how a shred, or a re-enable that reuses a version number, done
+// on another node reaches this one.
+type cachedKey struct {
+	wrapped []byte
+	dek     []byte
 }
 
 func NewManager(kek *KEK, keys KeyStore) *Manager {
-	return &Manager{kek: kek, keys: keys, cache: map[string][]byte{}}
+	return &Manager{kek: kek, keys: keys, cache: map[string]cachedKey{}}
 }
 
 func cacheKey(bucket string, version int) string {
 	return bucket + "\x00" + strconv.Itoa(version)
 }
 
-func (m *Manager) cacheGet(bucket string, version int) []byte {
+func (m *Manager) cacheGet(bucket string, version int) (cachedKey, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.cache[cacheKey(bucket, version)]
+	c, ok := m.cache[cacheKey(bucket, version)]
+	return c, ok
 }
 
-func (m *Manager) cachePut(bucket string, version int, dek []byte) {
+func (m *Manager) cachePut(bucket string, version int, wrapped, dek []byte) {
 	m.mu.Lock()
-	m.cache[cacheKey(bucket, version)] = dek
+	m.cache[cacheKey(bucket, version)] = cachedKey{wrapped: wrapped, dek: dek}
+	m.mu.Unlock()
+}
+
+func (m *Manager) cacheDrop(bucket string, version int) {
+	m.mu.Lock()
+	delete(m.cache, cacheKey(bucket, version))
 	m.mu.Unlock()
 }
 
@@ -233,30 +250,39 @@ func (m *Manager) newVersion(bucket string, version int) error {
 	if err := m.keys.SetCurrent(bucket, version, wrapped); err != nil {
 		return err
 	}
-	m.cachePut(bucket, version, dek)
+	m.cachePut(bucket, version, wrapped, dek)
 	return nil
 }
 
 // ShredBucket deletes every key version for a bucket. Its ciphertext becomes
-// permanently unrecoverable (crypto-shredding).
+// permanently unrecoverable (crypto-shredding). The eviction here covers this
+// node at once. Other nodes stop using the key on their next lookup, because
+// dek checks the key store on every use rather than trusting its cache.
 func (m *Manager) ShredBucket(bucket string) error {
 	m.cacheEvict(bucket)
 	return m.keys.Delete(bucket)
 }
 
+// dek resolves a bucket's data key for one version. The key store is consulted
+// every time and the cache only saves the unwrap. Trusting a cache hit alone
+// meant that after a shred on one node every other node went on encrypting and
+// decrypting with the destroyed key until it restarted, and after a re-enable
+// that started again at version 1 it would have sealed new objects with the
+// shredded key.
 func (m *Manager) dek(bucket string, version int) ([]byte, error) {
-	if d := m.cacheGet(bucket, version); d != nil {
-		return d, nil
-	}
 	wrapped, ok := m.keys.Get(bucket, version)
 	if !ok {
+		m.cacheDrop(bucket, version)
 		return nil, ErrNoKey
+	}
+	if c, hit := m.cacheGet(bucket, version); hit && bytes.Equal(c.wrapped, wrapped) {
+		return c.dek, nil
 	}
 	d, err := m.kek.unwrap(wrapped)
 	if err != nil {
 		return nil, err
 	}
-	m.cachePut(bucket, version, d)
+	m.cachePut(bucket, version, wrapped, d)
 	return d, nil
 }
 
