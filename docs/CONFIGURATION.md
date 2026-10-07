@@ -29,7 +29,10 @@ server:
   address: "0.0.0.0"
   port: 9000
   domain: ""  # set to enable virtual-hosted URLs (e.g. "s3.example.com")
-  shutdown_timeout_secs: 30
+  shutdown_timeout_secs: 30  # how long running requests get to finish on shutdown
+  # `docker stop` waits only 10s before killing the process, so give it more:
+  # `docker stop -t 35`, or `stop_grace_period: 35s` in Compose. Kubernetes waits
+  # 30s by default (`terminationGracePeriodSeconds`).
   tls:
     enabled: false
     cert_file: ""

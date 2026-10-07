@@ -2,7 +2,10 @@ server:
   address: "0.0.0.0"
   port: 9000
   domain: ""  # set to enable virtual-hosted style URLs (e.g. "localhost", "s3.example.com")
-  shutdown_timeout_secs: 30
+  shutdown_timeout_secs: 30  # how long running requests get to finish on shutdown
+  # `docker stop` waits only 10s before killing the process, so give it more:
+  # `docker stop -t 35`, or `stop_grace_period: 35s` in Compose. Kubernetes waits
+  # 30s by default (`terminationGracePeriodSeconds`).
   # Serve the dashboard (Web UI) + its API on a SEPARATE port from the S3 API, so
   # each can have its own firewall rules / TLS / reverse proxy (MinIO-style). 0 =
   # everything on `port`. (env: VAULTS3_CONSOLE_PORT / VAULTS3_CONSOLE_ADDRESS)
