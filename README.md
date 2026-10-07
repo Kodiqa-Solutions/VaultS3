@@ -124,9 +124,9 @@ Windows, an SPDX SBOM per platform, and a Sigstore provenance bundle you can
 verify offline:
 
 ```bash
-sudo apt install ./vaults3_5.0.0_amd64.deb
+sudo apt install ./vaults3_5.0.1_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_5.0.0_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_5.0.1_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart or a single
