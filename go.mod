@@ -2,7 +2,7 @@ module github.com/Kodiqa-Solutions/VaultS3
 
 go 1.26.0
 
-toolchain go1.26.7
+toolchain go1.26.9
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -15,11 +15,11 @@ require (
 	github.com/lib/pq v1.11.2
 	github.com/nats-io/nats.go v1.49.0
 	github.com/parquet-go/parquet-go v0.28.0
-	github.com/rabbitmq/amqp091-go v1.13.0
+	github.com/rabbitmq/amqp091-go v1.15.0
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/segmentio/kafka-go v0.4.50
 	go.etcd.io/bbolt v1.4.3
-	golang.org/x/crypto v0.56.0
+	golang.org/x/crypto v0.57.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -47,8 +47,8 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/twpayne/go-geom v1.6.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/net v0.57.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 )

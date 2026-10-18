@@ -63,6 +63,18 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.3
+
+A security rebuild with updated dependencies. Nothing to migrate, no behaviour
+changes, and rolling back to 5.0.2 is safe.
+
+Upgrade soon if VaultS3 terminates TLS itself (`server.tls` or automatic TLS):
+those servers speak HTTP/2, and the Go release it was built with had a bug that
+lets a client crash the server. A server behind a reverse proxy over plain HTTP
+is not exposed. Servers with AMQP notifications enabled also get a RabbitMQ
+client that no longer trusts the broker's frame sizes before the connection is
+set up.
+
 ## Upgrading to 5.0.2
 
 A fix release. Nothing to migrate, and rolling back to 5.0.1 is safe.

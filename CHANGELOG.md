@@ -6,6 +6,17 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.3] - 2026-10-18
+### Security
+- **Built with Go 1.26.9 and `golang.org/x/net` 0.60.0** for GO-2026-6617, a
+  race in the HTTP/2 header encoder that can crash the server. Only servers
+  that terminate TLS themselves (`server.tls` or automatic TLS) speak HTTP/2.
+  A server behind a reverse proxy over plain HTTP is not exposed.
+- **`amqp091-go` 1.15.0** for GHSA-w6r9-248c-frg8. A malicious or compromised
+  RabbitMQ broker could make VaultS3 allocate up to 4 GiB before the connection
+  was set up. This only affects servers with AMQP notifications enabled, and
+  only from the broker they are configured to use.
+
 ## [5.0.2] - 2026-10-07
 ### Security
 - **An object uploaded in parts ignored the object lock it asked for.** The
@@ -3414,7 +3425,16 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.74...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.3...HEAD
+[5.0.3]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.2...v5.0.3
+[5.0.2]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.1...v5.0.2
+[5.0.1]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.0...v5.0.1
+[5.0.0]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.79...v5.0.0
+[4.4.79]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.78...v4.4.79
+[4.4.78]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.77...v4.4.78
+[4.4.77]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.76...v4.4.77
+[4.4.76]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.75...v4.4.76
+[4.4.75]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.74...v4.4.75
 [4.4.74]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.73...v4.4.74
 [4.4.73]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.72...v4.4.73
 [4.4.72]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v4.4.71...v4.4.72
