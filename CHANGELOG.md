@@ -6,6 +6,15 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.6] - 2026-10-26
+### Security
+- **Built with Go 1.26.10** for GO-2026-6809 (CVE-2026-111943). Go now refuses
+  a set of compromised intermediate certificates when it checks a TLS
+  certificate, for the cases where the system trust store has not been updated.
+  This affects the outgoing TLS connections VaultS3 makes, such as LDAP
+  StartTLS, webhooks, replication peers and OIDC. Incoming connections are not
+  affected. 5.0.5 was built with Go 1.26.9.
+
 ## [5.0.5] - 2026-10-26
 ### Changed
 - **Dashboard: open dropdown lists follow the dashboard theme** (#63). The list
@@ -3450,7 +3459,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.5...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.6...HEAD
+[5.0.6]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.5...v5.0.6
 [5.0.5]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.4...v5.0.5
 [5.0.4]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.3...v5.0.4
 [5.0.3]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.2...v5.0.3

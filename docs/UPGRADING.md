@@ -63,6 +63,14 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.6
+
+A security rebuild with Go 1.26.10. Nothing to migrate, no behaviour changes,
+and rolling back to 5.0.5 is safe. It matters only for the outgoing TLS
+connections VaultS3 makes (LDAP StartTLS, webhooks, replication peers, OIDC),
+which now refuse a set of compromised intermediate certificates even where the
+system trust store has not been updated.
+
 ## Upgrading to 5.0.5
 
 A dashboard styling release. Nothing to migrate, and rolling back to 5.0.4 is
