@@ -1,7 +1,10 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useI18n } from '../i18n'
 import { getSettings, changeCredentials, type Settings } from '../api/settings'
 import { DASHBOARD_BASE } from '../basePath'
+import { featureSetup, featureAnchor, type FeatureKey } from '../components/featureSetup'
+import CopyButton from '../components/CopyButton'
 
 export default function SettingsPage() {
   const { t } = useI18n()
@@ -40,24 +43,25 @@ export default function SettingsPage() {
   }
 
   const features = settings.features
-  const featureList = [
-    { label: t('settings.encryptionAtRest'), enabled: features.encryption },
-    { label: t('settings.perBucketEncryption'), enabled: features.perBucketEncryption },
-    { label: t('settings.compression'), enabled: features.compression },
-    { label: t('settings.accessLogging'), enabled: features.accessLog },
-    { label: t('settings.rateLimiting'), enabled: features.rateLimit },
-    { label: t('settings.replication'), enabled: features.replication },
-    { label: t('settings.virusScanner'), enabled: features.scanner },
-    { label: t('settings.dataTiering'), enabled: features.tiering },
-    { label: t('settings.backupScheduler'), enabled: features.backup },
-    { label: 'OIDC / SSO', enabled: features.oidc },
-    { label: t('settings.externalAuth'), enabled: features.externalAuth },
-    { label: t('settings.lambdaTriggers'), enabled: features.lambda },
-    { label: t('settings.semanticVectorSearch'), enabled: features.vector },
-    { label: t('settings.erasureCoding'), enabled: features.erasure },
-    { label: t('settings.clustering'), enabled: features.cluster },
-    { label: t('settings.smallFilePacking'), enabled: features.packing },
-    { label: t('settings.debugMode'), enabled: features.debug },
+  const featureList: { key: FeatureKey; label: string; enabled: boolean }[] = [
+    { key: 'encryption', label: t('settings.encryptionAtRest'), enabled: features.encryption },
+    { key: 'perBucketEncryption', label: t('settings.perBucketEncryption'), enabled: features.perBucketEncryption },
+    { key: 'compression', label: t('settings.compression'), enabled: features.compression },
+    { key: 'accessLog', label: t('settings.accessLogging'), enabled: features.accessLog },
+    { key: 'rateLimit', label: t('settings.rateLimiting'), enabled: features.rateLimit },
+    { key: 'replication', label: t('settings.replication'), enabled: features.replication },
+    { key: 'scanner', label: t('settings.virusScanner'), enabled: features.scanner },
+    { key: 'tiering', label: t('settings.dataTiering'), enabled: features.tiering },
+    { key: 'backup', label: t('settings.backupScheduler'), enabled: features.backup },
+    { key: 'oidc', label: 'OIDC / SSO', enabled: features.oidc },
+    { key: 'externalAuth', label: t('settings.externalAuth'), enabled: features.externalAuth },
+    { key: 'notifyBackends', label: t('settings.notificationBackends'), enabled: features.notifyBackends },
+    { key: 'lambda', label: t('settings.lambdaTriggers'), enabled: features.lambda },
+    { key: 'vector', label: t('settings.semanticVectorSearch'), enabled: features.vector },
+    { key: 'erasure', label: t('settings.erasureCoding'), enabled: features.erasure },
+    { key: 'cluster', label: t('settings.clustering'), enabled: features.cluster },
+    { key: 'packing', label: t('settings.smallFilePacking'), enabled: features.packing },
+    { key: 'debug', label: t('settings.debugMode'), enabled: features.debug },
   ]
 
   return (
@@ -90,13 +94,8 @@ export default function SettingsPage() {
 
         {/* Features */}
         <Section title={t('settings.features')}>
-          <div className="grid grid-cols-2 gap-2">
-            {featureList.map(f => (
-              <div key={f.label} className="flex items-center gap-2 text-sm">
-                <span className={`inline-block w-2 h-2 rounded-full ${f.enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'}`} />
-                <span className={f.enabled ? 'text-gray-900 dark:text-white' : 'text-gray-400 dark:text-gray-500'}>{f.label}</span>
-              </div>
-            ))}
+          <div id="features" className="grid grid-cols-2 gap-2">
+            {featureList.map(f => <FeatureRow key={f.key} feature={f.key} label={f.label} enabled={f.enabled} />)}
           </div>
         </Section>
 
@@ -212,6 +211,66 @@ function ChangeCredentialsForm() {
         </button>
       </form>
     </div>
+  )
+}
+
+// A feature that is off expands to the config that turns it on, so the answer
+// to "how do I enable this" sits next to the feature instead of on a page of
+// its own. Opening /settings#feature-<key> expands that feature.
+function FeatureRow({ feature, label, enabled }: { feature: FeatureKey; label: string; enabled: boolean }) {
+  const { t } = useI18n()
+  const anchor = featureAnchor(feature)
+  const { hash } = useLocation()
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!enabled && hash === `#${anchor}`) {
+      setOpen(true)
+      ref.current?.scrollIntoView({ block: 'center' })
+    }
+  }, [hash, anchor, enabled])
+
+  const dot = <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'}`} />
+
+  if (enabled) {
+    return (
+      <div id={anchor} className="flex items-center gap-2 text-sm">
+        {dot}
+        <span className="text-gray-900 dark:text-white">{label}</span>
+      </div>
+    )
+  }
+
+  const panelId = `${anchor}-setup`
+  return (
+    <>
+      <div id={anchor} ref={ref} className="text-sm">
+        <button
+          type="button"
+          onClick={() => setOpen(o => !o)}
+          aria-expanded={open}
+          aria-controls={panelId}
+          title={t('feature.howToEnable')}
+          className="flex items-center gap-2 text-left text-gray-400 dark:text-gray-500 hover:text-indigo-600 dark:hover:text-indigo-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 rounded"
+        >
+          {dot}
+          <span>{label}</span>
+          <svg className={`w-3 h-3 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+      </div>
+      {open && (
+        <div id={panelId} className="col-span-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 p-3">
+          <div className="flex items-start justify-between gap-2 mb-2">
+            <p className="text-xs text-gray-600 dark:text-gray-400">{t('feature.setupIntro')}</p>
+            <CopyButton text={featureSetup[feature]} />
+          </div>
+          <pre className="text-xs font-mono bg-gray-900 text-green-400 p-3 rounded-lg overflow-x-auto">{featureSetup[feature]}</pre>
+        </div>
+      )}
+    </>
   )
 }
 

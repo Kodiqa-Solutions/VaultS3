@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination, EmptyState } from '../components/table'
 import { getReplicationStatus, getReplicationQueue, type ReplicationStatus, type ReplicationEvent } from '../api/replication'
+import FeatureOffNotice from '../components/FeatureOffNotice'
 
 type RSortField = 'type' | 'bucket' | 'key' | 'peer' | 'retryCount'
-type RSortDir = 'asc' | 'desc'
 
 export default function ReplicationPage() {
   const { t } = useI18n()
@@ -11,8 +12,7 @@ export default function ReplicationPage() {
   const [queue, setQueue] = useState<ReplicationEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [error] = useState('')
-  const [rSortField, setRSortField] = useState<RSortField>('bucket')
-  const [rSortDir, setRSortDir] = useState<RSortDir>('asc')
+  const { field: rSortField, dir: rSortDir, toggle: handleRSort } = useSort<RSortField>('bucket', 'asc')
 
   const fetchData = useCallback(async () => {
     try {
@@ -36,14 +36,6 @@ export default function ReplicationPage() {
     return () => clearInterval(id)
   }, [fetchData])
 
-  const handleRSort = (field: RSortField) => {
-    if (rSortField === field) {
-      setRSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setRSortField(field)
-      setRSortDir('asc')
-    }
-  }
 
   const sortedQueue = useMemo(() => {
     const s = [...queue]
@@ -60,20 +52,8 @@ export default function ReplicationPage() {
     })
     return s
   }, [queue, rSortField, rSortDir])
+  const paging = usePaged(sortedQueue)
 
-  const RSortHeader = ({ field, label }: { field: RSortField; label: string }) => (
-    <th
-      onClick={() => handleRSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {rSortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{rSortDir === 'asc' ? '\u2191' : '\u2193'}</span>
-        )}
-      </span>
-    </th>
-  )
 
   if (loading) {
     return (
@@ -103,25 +83,12 @@ export default function ReplicationPage() {
             ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400'
             : 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400'
         }`}>
-          {status?.enabled ? 'Enabled' : 'Disabled'}
+          {status?.enabled ? t('common.enabled') : t('common.disabled')}
         </span>
       </div>
 
       {status && !status.enabled && (
-        <div className="mb-6 p-5 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800">
-          <h3 className="text-sm font-semibold text-indigo-900 dark:text-indigo-300 mb-2">{t('replication.replicationNotEnabled')}</h3>
-          <p className="text-sm text-indigo-700 dark:text-indigo-400 mb-3">
-            Async replication mirrors objects to peer VaultS3 instances automatically.
-            Enable it in your <code className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 font-mono text-xs">vaults3.yaml</code> config:
-          </p>
-          <pre className="text-xs font-mono bg-gray-900 text-green-400 p-3 rounded-lg overflow-x-auto">{`replication:
-  enabled: true
-  peers:
-    - name: "dc2"
-      url: "http://peer-vaults3:9000"
-      access_key: "peer-admin"
-      secret_key: "peer-secret"`}</pre>
-        </div>
+        <FeatureOffNotice feature="replication" titleKey="replication.replicationNotEnabled" bodyKey="replication.notEnabledBody" />
       )}
 
       {/* Peer cards */}
@@ -171,16 +138,16 @@ export default function ReplicationPage() {
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-200 dark:border-gray-700">
-              <RSortHeader field="type" label={t('replication.type')} />
-              <RSortHeader field="bucket" label={t('replication.bucket')} />
-              <RSortHeader field="key" label={t('replication.key')} />
-              <RSortHeader field="peer" label={t('replication.peer')} />
-              <RSortHeader field="retryCount" label={t('replication.retries')} />
+              <SortHeader sortField={rSortField} sortDir={rSortDir} onSort={handleRSort} field="type" label={t('replication.type')} />
+              <SortHeader sortField={rSortField} sortDir={rSortDir} onSort={handleRSort} field="bucket" label={t('replication.bucket')} />
+              <SortHeader sortField={rSortField} sortDir={rSortDir} onSort={handleRSort} field="key" label={t('replication.key')} />
+              <SortHeader sortField={rSortField} sortDir={rSortDir} onSort={handleRSort} field="peer" label={t('replication.peer')} />
+              <SortHeader sortField={rSortField} sortDir={rSortDir} onSort={handleRSort} field="retryCount" label={t('replication.retries')} />
               <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('replication.nextRetry')}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
-            {sortedQueue.map((e, i) => (
+            {paging.paged.map((e, i) => (
               <tr key={i} className="hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
                 <td className="px-4 py-3 text-gray-700 dark:text-gray-300">{e.type}</td>
                 <td className="px-4 py-3 font-medium text-gray-900 dark:text-white">{e.bucket}</td>
@@ -192,12 +159,11 @@ export default function ReplicationPage() {
                 </td>
               </tr>
             ))}
-            {queue.length === 0 && (
-              <tr><td colSpan={6} className="px-4 py-8 text-center text-gray-400">{t('replication.queueEmpty')}</td></tr>
-            )}
+            {queue.length === 0 && <EmptyState colSpan={6} title={t('replication.queueEmpty')} />}
           </tbody>
         </table>
       </div>
+      <Pagination paging={paging} />
     </div>
   )
 }

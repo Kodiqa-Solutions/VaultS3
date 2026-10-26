@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useI18n } from '../i18n'
+import { EmptyState } from '../components/table'
 import { useInFlight } from '../hooks/useInFlight'
 import {
   listUsers, createUser, deleteUser, attachUserPolicy, detachUserPolicy,
@@ -228,9 +229,7 @@ export default function IAMPage() {
                   </td>
                 </tr>
               ))}
-              {users.length === 0 && (
-                <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">{t('iam.noUsers')}</td></tr>
-              )}
+              {users.length === 0 && <EmptyState colSpan={5} title={t('iam.noUsers')} />}
             </tbody>
           </table>
         </div>
@@ -351,9 +350,7 @@ export default function IAMPage() {
                   </td>
                 </tr>
               ))}
-              {groups.length === 0 && (
-                <tr><td colSpan={4} className="px-4 py-8 text-center text-gray-400">{t('iam.noGroups')}</td></tr>
-              )}
+              {groups.length === 0 && <EmptyState colSpan={4} title={t('iam.noGroups')} />}
             </tbody>
           </table>
         </div>

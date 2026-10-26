@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination, EmptyState } from '../components/table'
 import { queryAudit, type AuditEntry } from '../api/audit'
 
 type SortField = 'time' | 'user' | 'action' | 'resource' | 'effect' | 'sourceIp' | 'statusCode'
-type SortDir = 'asc' | 'desc'
 
-const PAGE_SIZE = 50
+
+// Newest first is the useful order for a timestamp, every other column starts A to Z.
+const auditFirstDir = (field: SortField) => (field === 'time' ? 'desc' : 'asc')
 
 export default function AuditPage() {
   const { t } = useI18n()
@@ -18,11 +20,9 @@ export default function AuditPage() {
   const [limit, setLimit] = useState(100)
 
   // Sort state
-  const [sortField, setSortField] = useState<SortField>('time')
-  const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const { field: sortField, dir: sortDir, toggle: handleSort } = useSort<SortField>('time', 'desc', auditFirstDir)
 
   // Pagination
-  const [page, setPage] = useState(0)
 
   const fetchAudit = useCallback(async () => {
     try {
@@ -32,7 +32,7 @@ export default function AuditPage() {
         bucket: filterBucket || undefined,
       })
       setEntries(data || [])
-      setPage(0)
+      paging.setPage(0)
     } catch (err) {
       setError(err instanceof Error ? err.message : t('audit.loadFailed'))
     } finally {
@@ -49,14 +49,6 @@ export default function AuditPage() {
   }, [fetchAudit])
 
   // Sort logic
-  const handleSort = (field: SortField) => {
-    if (sortField === field) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortField(field)
-      setSortDir(field === 'time' ? 'desc' : 'asc')
-    }
-  }
 
   const sortedEntries = useMemo(() => {
     const sorted = [...entries]
@@ -77,22 +69,9 @@ export default function AuditPage() {
   }, [entries, sortField, sortDir])
 
   // Pagination
-  const totalPages = Math.ceil(sortedEntries.length / PAGE_SIZE)
-  const pagedEntries = sortedEntries.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const paging = usePaged(sortedEntries)
+  const pagedEntries = paging.paged
 
-  const SortHeader = ({ field, label }: { field: SortField; label: string }) => (
-    <th
-      onClick={() => handleSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {sortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{sortDir === 'asc' ? '\u2191' : '\u2193'}</span>
-        )}
-      </span>
-    </th>
-  )
 
   if (loading) {
     return (
@@ -125,9 +104,9 @@ export default function AuditPage() {
           className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm w-44" />
         <select value={limit} onChange={e => setLimit(Number(e.target.value))}
           className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm">
-          <option value={50}>50 entries</option>
-          <option value={100}>100 entries</option>
-          <option value={500}>500 entries</option>
+          <option value={50}>{t('audit.entriesOption', { count: 50 })}</option>
+          <option value={100}>{t('audit.entriesOption', { count: 100 })}</option>
+          <option value={500}>{t('audit.entriesOption', { count: 500 })}</option>
         </select>
       </div>
 
@@ -137,13 +116,13 @@ export default function AuditPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-200 dark:border-gray-700">
-                <SortHeader field="time" label={t('audit.time')} />
-                <SortHeader field="user" label={t('audit.user')} />
-                <SortHeader field="action" label={t('audit.action')} />
-                <SortHeader field="resource" label={t('audit.resource')} />
-                <SortHeader field="effect" label={t('audit.effect')} />
-                <SortHeader field="sourceIp" label={t('audit.sourceIp')} />
-                <SortHeader field="statusCode" label={t('audit.status')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="time" label={t('audit.time')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="user" label={t('audit.user')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="action" label={t('audit.action')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="resource" label={t('audit.resource')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="effect" label={t('audit.effect')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="sourceIp" label={t('audit.sourceIp')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="statusCode" label={t('audit.status')} />
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
@@ -170,38 +149,13 @@ export default function AuditPage() {
                   <td className="px-4 py-3 text-gray-500 dark:text-gray-400">{e.statusCode || '-'}</td>
                 </tr>
               ))}
-              {entries.length === 0 && (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">{t('audit.noAuditEntries')}</td></tr>
-              )}
+              {entries.length === 0 && <EmptyState colSpan={7} title={t('audit.noAuditEntries')} />}
             </tbody>
           </table>
         </div>
       </div>
 
-      {/* Pagination */}
-      {totalPages > 1 && (
-        <div className="flex items-center justify-between mt-3 text-sm text-gray-500 dark:text-gray-400">
-          <span>
-            {sortedEntries.length} entries &middot; Page {page + 1} of {totalPages}
-          </span>
-          <div className="flex gap-1">
-            <button
-              onClick={() => setPage(p => Math.max(0, p - 1))}
-              disabled={page === 0}
-              className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {t('audit.prev')}
-            </button>
-            <button
-              onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}
-              disabled={page >= totalPages - 1}
-              className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {t('audit.next')}
-            </button>
-          </div>
-        </div>
-      )}
+      <Pagination paging={paging} />
     </div>
   )
 }

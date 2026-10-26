@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination, EmptyState } from '../components/table'
 import { useInFlight } from '../hooks/useInFlight'
 import { getLambdaStatus, listLambdaTriggers, deleteBucketTriggers, type LambdaStatus, type BucketTriggers } from '../api/lambda'
 import { useToast } from '../hooks/useToast'
+import FeatureOffNotice from '../components/FeatureOffNotice'
 
 type LSortField = 'bucket' | 'functionURL' | 'events' | 'keyFilter'
-type LSortDir = 'asc' | 'desc'
 
 export default function LambdaPage() {
   const { t } = useI18n()
@@ -16,8 +17,7 @@ export default function LambdaPage() {
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [deleting, runDelete] = useInFlight()
   const { addToast } = useToast()
-  const [lSortField, setLSortField] = useState<LSortField>('bucket')
-  const [lSortDir, setLSortDir] = useState<LSortDir>('asc')
+  const { field: lSortField, dir: lSortDir, toggle: handleLSort } = useSort<LSortField>('bucket', 'asc')
 
   const fetchData = useCallback(async () => {
     try {
@@ -49,14 +49,6 @@ export default function LambdaPage() {
     }
   })
 
-  const handleLSort = (field: LSortField) => {
-    if (lSortField === field) {
-      setLSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setLSortField(field)
-      setLSortDir('asc')
-    }
-  }
 
   // Flatten triggers for sorting
   const flatTriggers = useMemo(() => {
@@ -73,20 +65,8 @@ export default function LambdaPage() {
     })
     return flat
   }, [triggers, lSortField, lSortDir])
+  const paging = usePaged(flatTriggers)
 
-  const LSortHeader = ({ field, label }: { field: LSortField; label: string }) => (
-    <th
-      onClick={() => handleLSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {lSortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{lSortDir === 'asc' ? '\u2191' : '\u2193'}</span>
-        )}
-      </span>
-    </th>
-  )
 
   if (loading) {
     return (
@@ -110,18 +90,7 @@ export default function LambdaPage() {
       )}
 
       {status && !status.enabled && (
-        <div className="mb-6 p-5 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800">
-          <h3 className="text-sm font-semibold text-indigo-900 dark:text-indigo-300 mb-2">{t('lambda.lambdaTriggersNotEnabled')}</h3>
-          <p className="text-sm text-indigo-700 dark:text-indigo-400 mb-3">
-            Lambda triggers call external webhook URLs when S3 events occur (object created, deleted, etc.).
-            Enable them in your <code className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 font-mono text-xs">vaults3.yaml</code> config:
-          </p>
-          <pre className="text-xs font-mono bg-gray-900 text-green-400 p-3 rounded-lg overflow-x-auto">{`lambda:
-  enabled: true
-  timeout_secs: 30
-  max_workers: 4
-  queue_size: 256`}</pre>
-        </div>
+        <FeatureOffNotice feature="lambda" titleKey="lambda.lambdaTriggersNotEnabled" bodyKey="lambda.notEnabledBody" />
       )}
 
       {/* Status cards */}
@@ -144,15 +113,15 @@ export default function LambdaPage() {
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-200 dark:border-gray-700">
-              <LSortHeader field="bucket" label={t('lambda.bucket')} />
-              <LSortHeader field="functionURL" label={t('lambda.functionUrl')} />
-              <LSortHeader field="events" label={t('lambda.events')} />
-              <LSortHeader field="keyFilter" label={t('lambda.keyFilter')} />
+              <SortHeader sortField={lSortField} sortDir={lSortDir} onSort={handleLSort} field="bucket" label={t('lambda.bucket')} />
+              <SortHeader sortField={lSortField} sortDir={lSortDir} onSort={handleLSort} field="functionURL" label={t('lambda.functionUrl')} />
+              <SortHeader sortField={lSortField} sortDir={lSortDir} onSort={handleLSort} field="events" label={t('lambda.events')} />
+              <SortHeader sortField={lSortField} sortDir={lSortDir} onSort={handleLSort} field="keyFilter" label={t('lambda.keyFilter')} />
               <th className="text-right px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('lambda.actions')}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
-            {flatTriggers.map((trigger, i) => (
+            {paging.paged.map((trigger, i) => (
               <tr key={`${trigger.bucket}-${i}`} className="hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
                 <td className="px-4 py-3 font-medium text-gray-900 dark:text-white">{trigger.bucket}</td>
                 <td className="px-4 py-3 text-gray-500 dark:text-gray-400 font-mono text-xs max-w-xs truncate">{trigger.functionURL}</td>
@@ -176,12 +145,11 @@ export default function LambdaPage() {
                 </td>
               </tr>
             ))}
-            {flatTriggers.length === 0 && (
-              <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">{t('lambda.noLambdaTriggersConfigured')}</td></tr>
-            )}
+            {flatTriggers.length === 0 && <EmptyState colSpan={5} title={t('lambda.noLambdaTriggersConfigured')} />}
           </tbody>
         </table>
       </div>
+      <Pagination paging={paging} />
 
       {/* Delete confirmation */}
       {deleteTarget && (

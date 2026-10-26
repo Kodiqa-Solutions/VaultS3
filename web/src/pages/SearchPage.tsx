@@ -1,14 +1,13 @@
 import { useState, useCallback, useMemo, useEffect } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination, EmptyState } from '../components/table'
 import { useNavigate } from 'react-router-dom'
 import { searchObjects, type SearchResult } from '../api/search'
 import { queryVectors, getVectorStatus, type VectorMatch } from '../api/vectors'
 
 type SortField = 'bucket' | 'key' | 'size' | 'content_type' | 'last_modified'
-type SortDir = 'asc' | 'desc'
 type Mode = 'keyword' | 'semantic'
 
-const PAGE_SIZE = 50
 
 function formatSize(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -38,11 +37,9 @@ export default function SearchPage() {
   const [searched, setSearched] = useState(false)
 
   // Sort state (keyword mode)
-  const [sortField, setSortField] = useState<SortField>('key')
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const { field: sortField, dir: sortDir, toggle: handleSort } = useSort<SortField>('key', 'asc')
 
   // Pagination (keyword mode)
-  const [page, setPage] = useState(0)
 
   useEffect(() => {
     getVectorStatus().then(s => setVectorEnabled(s.enabled)).catch(() => setVectorEnabled(false))
@@ -60,7 +57,7 @@ export default function SearchPage() {
       } else {
         const data = await searchObjects({ q: query.trim(), bucket: bucket || undefined, limit: 100 })
         setResults(data || [])
-        setPage(0)
+        paging.setPage(0)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : t('search.failed'))
@@ -69,14 +66,6 @@ export default function SearchPage() {
     }
   }, [query, bucket, mode])
 
-  const handleSort = (field: SortField) => {
-    if (sortField === field) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortField(field)
-      setSortDir('asc')
-    }
-  }
 
   const sortedResults = useMemo(() => {
     const sorted = [...results]
@@ -94,22 +83,9 @@ export default function SearchPage() {
     return sorted
   }, [results, sortField, sortDir])
 
-  const totalPages = Math.ceil(sortedResults.length / PAGE_SIZE)
-  const pagedResults = sortedResults.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const paging = usePaged(sortedResults)
+  const pagedResults = paging.paged
 
-  const SortHeader = ({ field, label }: { field: SortField; label: string }) => (
-    <th
-      onClick={() => handleSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {sortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{sortDir === 'asc' ? '↑' : '↓'}</span>
-        )}
-      </span>
-    </th>
-  )
 
   const switchMode = (m: Mode) => {
     setMode(m)
@@ -178,7 +154,7 @@ export default function SearchPage() {
       {searched && mode === 'semantic' && (
         <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
           <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-            <span className="text-sm text-gray-500 dark:text-gray-400">{semanticResults.length} match{semanticResults.length !== 1 ? 'es' : ''} by similarity</span>
+            <span className="text-sm text-gray-500 dark:text-gray-400">{semanticResults.length === 1 ? t('search.similarOne') : t('search.similarOther', { n: semanticResults.length })}</span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -206,9 +182,7 @@ export default function SearchPage() {
                     </td>
                   </tr>
                 ))}
-                {semanticResults.length === 0 && (
-                  <tr><td colSpan={3} className="px-4 py-8 text-center text-gray-400">{t('search.noMatchesFound')}</td></tr>
-                )}
+                {semanticResults.length === 0 && <EmptyState colSpan={3} title={t('search.noMatchesFound')} />}
               </tbody>
             </table>
           </div>
@@ -220,17 +194,17 @@ export default function SearchPage() {
         <>
           <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-              <span className="text-sm text-gray-500 dark:text-gray-400">{results.length} result{results.length !== 1 ? 's' : ''}</span>
+              <span className="text-sm text-gray-500 dark:text-gray-400">{results.length === 1 ? t('search.resultOne') : t('search.resultOther', { n: results.length })}</span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-gray-200 dark:border-gray-700">
-                    <SortHeader field="bucket" label={t('search.bucket')} />
-                    <SortHeader field="key" label={t('search.key')} />
-                    <SortHeader field="size" label={t('search.size')} />
-                    <SortHeader field="content_type" label={t('search.contentType')} />
-                    <SortHeader field="last_modified" label={t('search.lastModified')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="bucket" label={t('search.bucket')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="key" label={t('search.key')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="size" label={t('search.size')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="content_type" label={t('search.contentType')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="last_modified" label={t('search.lastModified')} />
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
@@ -247,38 +221,13 @@ export default function SearchPage() {
                       </td>
                     </tr>
                   ))}
-                  {results.length === 0 && (
-                    <tr><td colSpan={5} className="px-4 py-8 text-center text-gray-400">{t('search.noResultsFound')}</td></tr>
-                  )}
+                  {results.length === 0 && <EmptyState colSpan={5} title={t('search.noResultsFound')} />}
                 </tbody>
               </table>
             </div>
           </div>
 
-          {/* Pagination */}
-          {totalPages > 1 && (
-            <div className="flex items-center justify-between mt-3 text-sm text-gray-500 dark:text-gray-400">
-              <span>
-                {sortedResults.length} results &middot; Page {page + 1} of {totalPages}
-              </span>
-              <div className="flex gap-1">
-                <button
-                  onClick={() => setPage(p => Math.max(0, p - 1))}
-                  disabled={page === 0}
-                  className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                >
-                  {t('search.prev')}
-                </button>
-                <button
-                  onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}
-                  disabled={page >= totalPages - 1}
-                  className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                >
-                  {t('search.next')}
-                </button>
-              </div>
-            </div>
-          )}
+          <Pagination paging={paging} />
         </>
       )}
     </div>

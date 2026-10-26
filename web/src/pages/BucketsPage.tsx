@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination } from '../components/table'
 import { useInFlight } from '../hooks/useInFlight'
 import { Link } from 'react-router-dom'
 import { listBuckets, createBucket, deleteBucket, setBucketVersioning } from '../api/buckets'
@@ -8,7 +9,6 @@ import type { Bucket } from '../api/buckets'
 import { useToast } from '../hooks/useToast'
 
 type SortField = 'name' | 'objectCount' | 'size' | 'createdAt'
-type SortDir = 'asc' | 'desc'
 
 export default function BucketsPage() {
   const { t } = useI18n()
@@ -27,8 +27,7 @@ export default function BucketsPage() {
   const [autoExpireDays, setAutoExpireDays] = useState('')
 
   // Sort state
-  const [sortField, setSortField] = useState<SortField>('name')
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const { field: sortField, dir: sortDir, toggle: handleSort } = useSort<SortField>('name', 'asc')
 
   const fetchBuckets = useCallback(async () => {
     try {
@@ -82,14 +81,6 @@ export default function BucketsPage() {
     }
   })
 
-  const handleSort = (field: SortField) => {
-    if (sortField === field) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortField(field)
-      setSortDir('asc')
-    }
-  }
 
   const sortedBuckets = useMemo(() => {
     const sorted = [...buckets]
@@ -105,20 +96,8 @@ export default function BucketsPage() {
     })
     return sorted
   }, [buckets, sortField, sortDir])
+  const paging = usePaged(sortedBuckets)
 
-  const SortHeader = ({ field, label }: { field: SortField; label: string }) => (
-    <th
-      onClick={() => handleSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {sortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{sortDir === 'asc' ? '\u2191' : '\u2193'}</span>
-        )}
-      </span>
-    </th>
-  )
 
   if (loading) {
     return (
@@ -133,7 +112,7 @@ export default function BucketsPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-xl font-semibold text-gray-900 dark:text-white">{t('nav.buckets')}</h2>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">{buckets.length} bucket{buckets.length !== 1 ? 's' : ''}</p>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">{buckets.length === 1 ? t('buckets.countOne') : t('buckets.countOther', { n: buckets.length })}</p>
         </div>
         <button
           onClick={() => setShowCreate(true)}
@@ -251,15 +230,15 @@ export default function BucketsPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-200 dark:border-gray-700">
-                <SortHeader field="name" label={t('common.name')} />
-                <SortHeader field="objectCount" label={t('home.objects')} />
-                <SortHeader field="size" label={t('common.size')} />
-                <SortHeader field="createdAt" label={t('common.created')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="name" label={t('common.name')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="objectCount" label={t('home.objects')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="size" label={t('common.size')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="createdAt" label={t('common.created')} />
                 <th className="text-right px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('common.actions')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
-              {sortedBuckets.map((b) => (
+              {paging.paged.map((b) => (
                 <tr key={b.name} className="hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
                   <td className="px-4 py-3">
                     <Link
@@ -289,6 +268,7 @@ export default function BucketsPage() {
           </table>
         </div>
       )}
+      <Pagination paging={paging} />
     </div>
   )
 }

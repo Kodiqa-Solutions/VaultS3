@@ -16,6 +16,19 @@
    from the right border equals the select's own padding-right (px-2, px-3, ...)
    and lines up with the text inset on the left without per-class overrides. */
 @layer base {
+  /* Native controls (the open <select> list, scrollbars, date pickers) follow
+     color-scheme, not the page's classes, so without this the dropdown opened
+     as a white panel in dark mode. */
+  :root {
+    color-scheme: light;
+  }
+  :root.dark {
+    color-scheme: dark;
+  }
+  .dark option {
+    background-color: #1f2937;
+    color: #f9fafb;
+  }
   select {
     -webkit-appearance: none;
     -moz-appearance: none;

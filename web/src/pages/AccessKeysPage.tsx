@@ -1,12 +1,12 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination } from '../components/table'
 import { useInFlight } from '../hooks/useInFlight'
 import { listKeys, createKey, deleteKey, type AccessKey, type CreatedKey } from '../api/keys'
 import { listBuckets, type Bucket } from '../api/buckets'
 import { useToast } from '../hooks/useToast'
 
 type SortField = 'accessKey' | 'user' | 'createdAt' | 'type'
-type SortDir = 'asc' | 'desc'
 
 export default function AccessKeysPage() {
   const { t } = useI18n()
@@ -25,8 +25,7 @@ export default function AccessKeysPage() {
   const { addToast } = useToast()
 
   // Sort state
-  const [sortField, setSortField] = useState<SortField>('accessKey')
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const { field: sortField, dir: sortDir, toggle: handleSort } = useSort<SortField>('accessKey', 'asc')
 
   const fetchKeys = useCallback(async () => {
     try {
@@ -97,14 +96,6 @@ export default function AccessKeysPage() {
     setTimeout(() => setCopied(''), 2000)
   }
 
-  const handleSort = (field: SortField) => {
-    if (sortField === field) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortField(field)
-      setSortDir('asc')
-    }
-  }
 
   const sortedKeys = useMemo(() => {
     const sorted = [...keys]
@@ -120,20 +111,8 @@ export default function AccessKeysPage() {
     })
     return sorted
   }, [keys, sortField, sortDir])
+  const paging = usePaged(sortedKeys)
 
-  const SortHeader = ({ field, label }: { field: SortField; label: string }) => (
-    <th
-      onClick={() => handleSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {sortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{sortDir === 'asc' ? '\u2191' : '\u2193'}</span>
-        )}
-      </span>
-    </th>
-  )
 
   if (loading) {
     return (
@@ -306,16 +285,16 @@ export default function AccessKeysPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-200 dark:border-gray-700">
-                <SortHeader field="accessKey" label={t('accesskeys.accessKey')} />
-                <SortHeader field="user" label={t('keys.userId')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="accessKey" label={t('accesskeys.accessKey')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="user" label={t('keys.userId')} />
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('accesskeys.secret')}</th>
-                <SortHeader field="createdAt" label={t('accesskeys.created')} />
-                <SortHeader field="type" label={t('accesskeys.type')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="createdAt" label={t('accesskeys.created')} />
+                <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="type" label={t('accesskeys.type')} />
                 <th className="text-right px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('accesskeys.actions')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
-              {sortedKeys.map((k) => (
+              {paging.paged.map((k) => (
                 <tr key={k.accessKey} className="hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
                   <td className="px-4 py-3 font-mono text-gray-900 dark:text-white">{k.accessKey}</td>
                   <td className="px-4 py-3 text-gray-700 dark:text-gray-300">
@@ -357,6 +336,7 @@ export default function AccessKeysPage() {
           </table>
         </div>
       </div>
+      <Pagination paging={paging} />
     </div>
   )
 }

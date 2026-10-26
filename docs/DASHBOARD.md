@@ -19,6 +19,8 @@ The built-in dashboard is available at `http://localhost:9000/dashboard/`. Login
 - Replication, peer status cards, pending queue table
 - Lambda triggers, status overview, trigger table with event filtering
 - Backups, status cards, history table, manual trigger button
+- Replication, Lambda triggers and Backups appear in the sidebar only once they are enabled. Settings, Features shows the `vaults3.yaml` lines that turn each feature on, opened by clicking a feature that is off
+- Every list sorts by column and pages the same way, with a 25, 50 or 100 rows per page control
 - Activity log, real-time S3 operation feed with auto-refresh
 - Storage stats, logical size, VaultS3's measured on-disk footprint and total filesystem usage side by side (with a per-directory and per-node breakdown), per-bucket breakdown, runtime metrics, auto-refresh toggle (30s)
 - Migrate, import buckets from any S3-compatible source with live progress and a Cancel button for in-flight jobs

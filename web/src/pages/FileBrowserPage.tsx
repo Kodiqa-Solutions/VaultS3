@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination } from '../components/table'
 import { useParams, useSearchParams, Link } from 'react-router-dom'
 import { listObjects, searchObjectsInPrefix, deleteObject, bulkDeleteObjects, summarizeBulkDelete, getDownloadUrl, getDownloadZipUrl, fetchObjectText, type ObjectItem } from '../api/objects'
 import { isAddressableKey } from '../api/paths'
@@ -15,10 +16,8 @@ import { useToast } from '../hooks/useToast'
 import { useInFlight } from '../hooks/useInFlight'
 
 type SortField = 'name' | 'size' | 'type' | 'modified'
-type SortDir = 'asc' | 'desc'
 type ViewMode = 'table' | 'grid'
 
-const PAGE_SIZE = 50
 const FETCH_SIZE = 1000 // objects pulled from the server per request
 const VIEW_MODE_KEY = 'vaults3:fileBrowserViewMode'
 
@@ -48,11 +47,9 @@ export default function FileBrowserPage() {
   const { addToast } = useToast()
 
   // Sort state
-  const [sortField, setSortField] = useState<SortField>('name')
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const { field: sortField, dir: sortDir, toggle: handleSort } = useSort<SortField>('name', 'asc')
 
   // Pagination
-  const [page, setPage] = useState(0)
 
   // View mode (table / grid), persisted; defaults to table
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
@@ -162,7 +159,7 @@ export default function FileBrowserPage() {
       setObjects(data.objects || [])
       setTruncated(data.truncated)
       setNextCursor(data.nextStartAfter || '')
-      setPage(0)
+      paging.setPage(0)
       setSelectedKeys(new Set())
     } catch (err) {
       setError(err instanceof Error ? err.message : t('files.listFailed'))
@@ -260,14 +257,6 @@ export default function FileBrowserPage() {
   }
 
   // Sort logic
-  const handleSort = (field: SortField) => {
-    if (sortField === field) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortField(field)
-      setSortDir('asc')
-    }
-  }
 
   const sortedObjects = useMemo(() => {
     const folders = objects.filter(o => o.isPrefix)
@@ -288,8 +277,8 @@ export default function FileBrowserPage() {
   }, [objects, sortField, sortDir])
 
   // Pagination
-  const totalPages = Math.ceil(sortedObjects.length / PAGE_SIZE)
-  const pagedObjects = sortedObjects.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const paging = usePaged(sortedObjects)
+  const pagedObjects = paging.paged
 
   // Select all logic (files only, not folders)
   const selectableFiles = sortedObjects.filter(o => !o.isPrefix)
@@ -364,19 +353,6 @@ export default function FileBrowserPage() {
 
   if (!bucket) return null
 
-  const SortHeader = ({ field, label }: { field: SortField; label: string }) => (
-    <th
-      onClick={() => handleSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {sortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{sortDir === 'asc' ? '\u2191' : '\u2193'}</span>
-        )}
-      </span>
-    </th>
-  )
 
   return (
     <div className="flex gap-4">
@@ -639,10 +615,10 @@ export default function FileBrowserPage() {
                         className="rounded border-gray-300 dark:border-gray-600 text-indigo-600 focus:ring-indigo-500"
                       />
                     </th>
-                    <SortHeader field="name" label={t('common.name')} />
-                    <SortHeader field="size" label={t('common.size')} />
-                    <SortHeader field="type" label={t('common.type')} />
-                    <SortHeader field="modified" label={t('files.modified')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="name" label={t('common.name')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="size" label={t('common.size')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="type" label={t('common.type')} />
+                    <SortHeader sortField={sortField} sortDir={sortDir} onSort={handleSort} field="modified" label={t('files.modified')} />
                     <th className="text-right px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('common.actions')}</th>
                   </tr>
                 </thead>
@@ -734,40 +710,19 @@ export default function FileBrowserPage() {
               />
             )}
 
-            {/* Pagination */}
-            {(totalPages > 1 || truncated) && (
-              <div className="flex items-center justify-between mt-3 text-sm text-gray-500 dark:text-gray-400">
-                <span>
-                  {t('files.itemCount', { n: `${sortedObjects.length}${truncated ? '+' : ''}` })}
-                  {totalPages > 1 && <> &middot; {t('files.pageOf', { page: page + 1, total: totalPages })}</>}
-                </span>
-                <div className="flex gap-1">
-                  {truncated && (
-                    <button
-                      onClick={loadMore}
-                      disabled={loadingMore}
-                      className="px-3 py-1.5 rounded-lg border border-indigo-300 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {loadingMore ? t('common.loading') : t('files.loadMore', { n: FETCH_SIZE })}
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setPage(p => Math.max(0, p - 1))}
-                    disabled={page === 0}
-                    className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                  >
-                    {t('files.prev')}
-                  </button>
-                  <button
-                    onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}
-                    disabled={page >= totalPages - 1}
-                    className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                  >
-                    {t('files.next')}
-                  </button>
-                </div>
-              </div>
-            )}
+            <Pagination
+              paging={paging}
+              more={truncated}
+              extra={truncated && (
+                <button
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  className="px-3 py-1.5 rounded-lg border border-indigo-300 dark:border-indigo-700 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  {loadingMore ? t('common.loading') : t('files.loadMore', { n: FETCH_SIZE })}
+                </button>
+              )}
+            />
           </>
         )}
       </div>

@@ -30,6 +30,7 @@ export interface Settings {
     packing: boolean
     perBucketEncryption: boolean
     externalAuth: boolean
+    notifyBackends: boolean
     debug: boolean
   }
   lifecycle: {

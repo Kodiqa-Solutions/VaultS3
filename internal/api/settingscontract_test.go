@@ -35,6 +35,20 @@ func TestSettingsFeatureKeysMatchDashboard(t *testing.T) {
 		t.Fatal("found no features.* references, the regex or the page changed shape")
 	}
 
+	// The sidebar hides a page until its flag is true, so a key the API never
+	// sends would hide that page for good.
+	nav, err := os.ReadFile("../../web/src/components/Sidebar.tsx")
+	if err != nil {
+		t.Fatalf("read sidebar: %v", err)
+	}
+	navUsed := regexp.MustCompile(`feature: '([A-Za-z0-9_]+)'`).FindAllStringSubmatch(string(nav), -1)
+	if len(navUsed) == 0 {
+		t.Fatal("found no feature: references in the sidebar, the regex or the file changed shape")
+	}
+	for _, m := range navUsed {
+		used[m[1]] = true
+	}
+
 	var resp struct {
 		Features map[string]json.RawMessage `json:"features"`
 	}

@@ -36,6 +36,7 @@ type settingsResponse struct {
 		Packing             bool `json:"packing"`
 		PerBucketEncryption bool `json:"perBucketEncryption"`
 		ExternalAuth        bool `json:"externalAuth"`
+		NotifyBackends      bool `json:"notifyBackends"`
 		Debug               bool `json:"debug"`
 	} `json:"features"`
 	Lifecycle struct {
@@ -84,6 +85,11 @@ func (h *APIHandler) handleSettings(w http.ResponseWriter, _ *http.Request) {
 	resp.Features.Cluster = h.cfg.Cluster.Enabled
 	resp.Features.ExternalAuth = h.cfg.ExternalAuth.Enabled
 	resp.Features.Debug = h.cfg.Debug
+	// Per-bucket webhooks need no config, so this reports only the server wide
+	// event backends.
+	n := h.cfg.Notifications
+	resp.Features.NotifyBackends = n.Kafka.Enabled || n.NATS.Enabled || n.Redis.Enabled ||
+		n.AMQP.Enabled || n.Postgres.Enabled || n.Elasticsearch.Enabled
 
 	resp.Lifecycle.ScanIntervalSecs = h.cfg.Lifecycle.ScanIntervalSecs
 	resp.Lifecycle.AuditRetentionDays = h.cfg.Security.AuditRetentionDays

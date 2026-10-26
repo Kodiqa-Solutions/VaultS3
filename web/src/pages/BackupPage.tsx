@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useI18n } from '../i18n'
+import { useSort, SortHeader, usePaged, Pagination, EmptyState } from '../components/table'
 import { listBackups, getBackupStatus, triggerBackup, type BackupRecord, type BackupStatus } from '../api/backup'
 import { useToast } from '../hooks/useToast'
+import FeatureOffNotice from '../components/FeatureOffNotice'
 
 type BSortField = 'type' | 'target' | 'startTime' | 'objects' | 'size' | 'status'
-type BSortDir = 'asc' | 'desc'
 
 function formatSize(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -13,23 +14,6 @@ function formatSize(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
 }
 
-function SortHeader({ field, label, sortField, sortDir, onSort }: {
-  field: BSortField; label: string; sortField: BSortField; sortDir: BSortDir; onSort: (f: BSortField) => void
-}) {
-  return (
-    <th
-      onClick={() => onSort(field)}
-      className="text-left px-4 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 select-none"
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {sortField === field && (
-          <span className="text-indigo-600 dark:text-indigo-400">{sortDir === 'asc' ? '\u2191' : '\u2193'}</span>
-        )}
-      </span>
-    </th>
-  )
-}
 
 function StatusCard({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
@@ -47,8 +31,7 @@ export default function BackupPage() {
   const [loading, setLoading] = useState(true)
   const [triggering, setTriggering] = useState(false)
   const { addToast } = useToast()
-  const [sortField, setSortField] = useState<BSortField>('startTime')
-  const [sortDir, setSortDir] = useState<BSortDir>('desc')
+  const { field: sortField, dir: sortDir, toggle: handleSort } = useSort<BSortField>('startTime', 'desc')
 
   const fetchData = useCallback(async () => {
     try {
@@ -81,24 +64,8 @@ export default function BackupPage() {
     }
   }
 
-  const handleSort = (field: BSortField) => {
-    if (sortField === field) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortField(field)
-      setSortDir('asc')
-    }
-  }
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600" />
-      </div>
-    )
-  }
-
-  const sorted = [...backups].sort((a, b) => {
+  const sorted = useMemo(() => [...backups].sort((a, b) => {
     let cmp = 0
     switch (sortField) {
       case 'type': cmp = (a.type || '').localeCompare(b.type || ''); break
@@ -109,7 +76,17 @@ export default function BackupPage() {
       case 'status': cmp = (a.status || '').localeCompare(b.status || ''); break
     }
     return sortDir === 'asc' ? cmp : -cmp
-  })
+  }), [backups, sortField, sortDir])
+  const paging = usePaged(sorted)
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600" />
+      </div>
+    )
+  }
+
 
   const statusColor = (s: string) => {
     switch (s) {
@@ -134,21 +111,7 @@ export default function BackupPage() {
       </div>
 
       {status && !status.enabled && (
-        <div className="mb-6 p-5 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800">
-          <h3 className="text-sm font-semibold text-indigo-900 dark:text-indigo-300 mb-2">{t('backup.backupsNotEnabled')}</h3>
-          <p className="text-sm text-indigo-700 dark:text-indigo-400 mb-3">
-            Schedule automatic full or incremental backups to local directories.
-            Enable them in your <code className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 font-mono text-xs">vaults3.yaml</code> config:
-          </p>
-          <pre className="text-xs font-mono bg-gray-900 text-green-400 p-3 rounded-lg overflow-x-auto">{`backup:
-  enabled: true
-  targets:
-    - name: "local-backup"
-      type: "local"
-      path: "/backups/vaults3"
-  schedule_cron: "0 2 * * *"
-  retention_days: 30`}</pre>
-        </div>
+        <FeatureOffNotice feature="backup" titleKey="backup.backupsNotEnabled" bodyKey="backup.notEnabledBody" />
       )}
 
       {/* Status cards */}
@@ -186,7 +149,7 @@ export default function BackupPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
-              {sorted.map(b => (
+              {paging.paged.map(b => (
                 <tr key={b.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
                   <td className="px-4 py-3 font-mono text-xs text-gray-900 dark:text-white">{(b.id || '').slice(0, 8)}</td>
                   <td className="px-4 py-3 text-gray-700 dark:text-gray-300">{b.type}</td>
@@ -206,13 +169,12 @@ export default function BackupPage() {
                   </td>
                 </tr>
               ))}
-              {backups.length === 0 && (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-gray-400">{t('backup.noBackupsYet')}</td></tr>
-              )}
+              {backups.length === 0 && <EmptyState colSpan={8} title={t('backup.noBackupsYet')} />}
             </tbody>
           </table>
         </div>
       </div>
+      <Pagination paging={paging} />
     </div>
   )
 }

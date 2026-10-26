@@ -63,6 +63,15 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.4
+
+A dashboard release. Nothing to migrate, and rolling back to 5.0.3 is safe.
+
+Replication, Lambda triggers and Backups now appear in the sidebar only when
+they are enabled in `vaults3.yaml`. If one is missing after the upgrade, it is
+off on that server: Settings, Features shows the lines that turn it on. Bookmarks
+to those pages keep working.
+
 ## Upgrading to 5.0.3
 
 A security rebuild with updated dependencies. Nothing to migrate, no behaviour

@@ -4,16 +4,28 @@ import { getVersion, type VersionStatus } from '../api/version'
 import { useI18n } from '../i18n'
 import { useAuth } from '../hooks/useAuth'
 import { isAdminSession } from '../api/auth'
+import { getSettings } from '../api/settings'
+import type { FeatureKey } from './featureSetup'
 
 // adminOnly marks pages a non-admin session cannot use. Most call routes the
 // server answers with 403 for anyone but "admin", the rest show server wide
 // activity and settings, so listing them for a non-admin only leads to errors.
+//
+// feature marks a page that does nothing until that feature is enabled in
+// vaults3.yaml. It is listed only once the feature is on, and Settings explains
+// how to turn it on. Notifications has no flag: per-bucket webhooks need no
+// config, so the page is useful on every install.
 export interface NavItem {
   to: string
   labelKey: string
   icon: () => ReactElement
   adminOnly?: boolean
+  feature?: FeatureKey
 }
+
+// Which features are on, as Settings reports them. undefined while that is
+// still loading and null when it could not be read.
+export type FeatureFlags = Partial<Record<FeatureKey, boolean>> | null | undefined
 
 export const navItems: NavItem[] = [
   { to: '/', labelKey: 'nav.home', icon: homeIcon },
@@ -23,18 +35,24 @@ export const navItems: NavItem[] = [
   { to: '/iam', labelKey: 'nav.iam', icon: iamIcon, adminOnly: true },
   { to: '/audit', labelKey: 'nav.audit', icon: auditIcon, adminOnly: true },
   { to: '/notifications', labelKey: 'nav.notifications', icon: notifIcon, adminOnly: true },
-  { to: '/lambda', labelKey: 'nav.lambda', icon: lambdaIcon, adminOnly: true },
-  { to: '/replication', labelKey: 'nav.replication', icon: replicationIcon, adminOnly: true },
+  { to: '/lambda', labelKey: 'nav.lambda', icon: lambdaIcon, adminOnly: true, feature: 'lambda' },
+  { to: '/replication', labelKey: 'nav.replication', icon: replicationIcon, adminOnly: true, feature: 'replication' },
   { to: '/migrate', labelKey: 'nav.migrate', icon: migrateIcon, adminOnly: true },
-  { to: '/backup', labelKey: 'nav.backups', icon: backupIcon, adminOnly: true },
+  { to: '/backup', labelKey: 'nav.backups', icon: backupIcon, adminOnly: true, feature: 'backup' },
   { to: '/activity', labelKey: 'nav.activity', icon: activityIcon, adminOnly: true },
   { to: '/stats', labelKey: 'nav.stats', icon: statsIcon, adminOnly: true },
   { to: '/cost', labelKey: 'nav.cost', icon: costIcon, adminOnly: true },
   { to: '/settings', labelKey: 'nav.settings', icon: settingsIcon, adminOnly: true },
 ]
 
-export function visibleNavItems(isAdmin: boolean): NavItem[] {
-  return isAdmin ? navItems : navItems.filter(item => !item.adminOnly)
+// A feature page stays hidden while the flags load, so it does not flash in and
+// out, and is shown if they cannot be read, so a failed request hides nothing.
+export function visibleNavItems(isAdmin: boolean, features?: FeatureFlags): NavItem[] {
+  return navItems.filter(item => {
+    if (item.adminOnly && !isAdmin) return false
+    if (!item.feature || features === null) return true
+    return features?.[item.feature] === true
+  })
 }
 
 // isAdminOnlyPath lets other pages that link to these routes, such as the home
@@ -52,7 +70,13 @@ interface Props {
 export default function Sidebar({ onClose, isCollapsed, onToggleCollapse }: Props) {
   const { t } = useI18n()
   const { user } = useAuth()
-  const items = visibleNavItems(isAdminSession(user))
+  const isAdmin = isAdminSession(user)
+  const [features, setFeatures] = useState<FeatureFlags>(undefined)
+  useEffect(() => {
+    if (!isAdmin) return
+    getSettings().then(s => setFeatures(s.features)).catch(() => setFeatures(null))
+  }, [isAdmin])
+  const items = visibleNavItems(isAdmin, features)
   return (
     <aside className="w-full h-full bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col transition-all duration-300 overflow-hidden">
       <div className={`h-14 px-4 border-b border-gray-200 dark:border-gray-700 flex items-center ${isCollapsed ? 'justify-center' : 'justify-between'} shrink-0`}>

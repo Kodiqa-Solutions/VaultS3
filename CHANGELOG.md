@@ -6,6 +6,23 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.4] - 2026-10-26
+### Changed
+- **Dashboard: Replication, Lambda triggers and Backups are listed in the sidebar
+  only once they are enabled** (#63). On a default install those pages only said
+  "enable this in vaults3.yaml". Their URLs still work and point to Settings.
+  Notifications stays, since per-bucket webhooks need no setup.
+- **Settings, Features now says how to turn each feature on.** Clicking a feature
+  that is off shows the `vaults3.yaml` lines that enable it, with a copy button.
+  Server wide event backends (Kafka, NATS, Redis, RabbitMQ, PostgreSQL,
+  Elasticsearch) are listed there too.
+- **Every dashboard list sorts, pages and shows an empty state the same way,**
+  with a translated rows per page control. Lists without paging (buckets, access
+  keys, notifications, Lambda triggers, replication queue, backups) now page.
+- Strings that stayed English in a translated dashboard are translated: the
+  audit page size, bucket and search result counts, the replication status badge
+  and the setup notices. Dropdowns follow the dark theme.
+
 ## [5.0.3] - 2026-10-18
 ### Security
 - **Built with Go 1.26.9 and `golang.org/x/net` 0.60.0** for GO-2026-6617, a
@@ -3425,7 +3442,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.3...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.4...HEAD
+[5.0.4]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.3...v5.0.4
 [5.0.3]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.2...v5.0.3
 [5.0.2]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.1...v5.0.2
 [5.0.1]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.0...v5.0.1
