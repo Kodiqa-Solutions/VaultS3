@@ -124,9 +124,9 @@ Windows, a `checksums.txt` signed with the project's release key, an SPDX SBOM
 per platform, and a Sigstore provenance bundle you can verify offline:
 
 ```bash
-sudo apt install ./vaults3_5.0.4_amd64.deb
+sudo apt install ./vaults3_5.0.5_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_5.0.4_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_5.0.5_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart or a single
@@ -141,7 +141,7 @@ The short version. Each row links to the guide that covers it, and the
 | | |
 |---|---|
 | **S3 API** | 80+ operations, SigV4, multipart, range requests, conditional requests, checksums, presigned URLs. [Operation list](docs/S3-API.md) |
-| **Web dashboard** | File browser, drag-and-drop upload, stats, IAM, audit, search, backups, in English, German, French, Russian and Chinese. Settings shows how to turn each feature on. [Guide](docs/DASHBOARD.md) |
+| **Web dashboard** | File browser, drag-and-drop upload, stats, IAM, audit, search, backups, in English, German, French, Russian and Chinese, light and dark theme. Settings shows how to turn each feature on. [Guide](docs/DASHBOARD.md) |
 | **Access control** | IAM users, groups and policies, OIDC/JWT SSO, STS, external authorization webhook, per-bucket CORS, IP allowlists, audit trail. [Guide](docs/ACCESS-CONTROL.md) |
 | **Encryption** | AES-256-GCM at rest, SSE-S3, SSE-KMS, SSE-C, and per-bucket keys with rotation and crypto-shredding. [Guide](docs/CONFIGURATION.md#encryption-at-rest) |
 | **Durability** | Reed-Solomon erasure coding with a background healer, per-bucket replica counts with automatic repair after a node is lost, orphan reclaim. [Guide](docs/SCALING.md) |

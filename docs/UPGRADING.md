@@ -63,6 +63,11 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.5
+
+A dashboard styling release. Nothing to migrate, and rolling back to 5.0.4 is
+safe. Open dropdown lists now use the dashboard theme on Chrome and Edge 135+.
+
 ## Upgrading to 5.0.4
 
 A dashboard release. Nothing to migrate, and rolling back to 5.0.3 is safe.

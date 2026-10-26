@@ -6,6 +6,14 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.5] - 2026-10-26
+### Changed
+- **Dashboard: open dropdown lists follow the dashboard theme** (#63). The list
+  was still drawn by the browser, with its own border and the system blue
+  highlight. On Chrome and Edge 135+ it now uses the dashboard colors in light
+  and dark mode, with the selected option marked. Firefox and Safari keep their
+  native list, which follows the dark theme.
+
 ## [5.0.4] - 2026-10-26
 ### Changed
 - **Dashboard: Replication, Lambda triggers and Backups are listed in the sidebar
@@ -3442,7 +3450,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.4...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.5...HEAD
+[5.0.5]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.4...v5.0.5
 [5.0.4]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.3...v5.0.4
 [5.0.3]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.2...v5.0.3
 [5.0.2]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.1...v5.0.2

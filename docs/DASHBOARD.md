@@ -25,7 +25,7 @@ The built-in dashboard is available at `http://localhost:9000/dashboard/`. Login
 - Storage stats, logical size, VaultS3's measured on-disk footprint and total filesystem usage side by side (with a per-directory and per-node breakdown), per-bucket breakdown, runtime metrics, auto-refresh toggle (30s)
 - Migrate, import buckets from any S3-compatible source with live progress and a Cancel button for in-flight jobs
 - Version indicator, the running version is shown at the bottom of the sidebar, with an "update available" hint linking to releases
-- Dark/light theme, toggle with system preference detection
+- Dark/light theme, toggle with system preference detection. Open dropdown lists follow the theme on Chrome and Edge 135+
 - Language, English, German, French, Russian, Simplified Chinese, detected from the browser and switchable in the top bar
 - Responsive layout, mobile-friendly with collapsible sidebar
 - JWT-based authentication (24h tokens)

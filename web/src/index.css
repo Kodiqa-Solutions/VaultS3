@@ -46,3 +46,89 @@
     display: none;
   }
 }
+
+/* Themed dropdown list. The open list of a native select is drawn by the
+   operating system, so color-scheme alone left a white bordered panel with the
+   system blue highlight (issue #63). base-select (Chrome and Edge 135+) lets CSS
+   draw it. Other browsers skip this block and keep the native list, which
+   still follows color-scheme. */
+@supports (appearance: base-select) {
+  select,
+  select::picker(select) {
+    appearance: base-select;
+  }
+  /* base-select sizes the control to its text, so the background chevron above
+     would sit under the text. Draw the same chevron in the built-in icon slot,
+     which is laid out after the text. */
+  select {
+    background-image: none;
+    align-items: center;
+  }
+  .dark select {
+    background-image: none;
+  }
+  select::picker-icon {
+    content: "";
+    width: 1rem;
+    height: 1rem;
+    margin-inline-start: auto;
+    padding-inline-start: 0.5rem;
+    box-sizing: content-box;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%236b7280' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 8l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right center;
+    background-size: 1rem 1rem;
+    transition: none;
+  }
+  .dark select::picker-icon {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%239ca3af' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 8l4 4 4-4'/%3E%3C/svg%3E");
+  }
+  select::picker(select) {
+    margin-top: 0.25rem;
+    padding: 0.25rem;
+    border: 1px solid #e5e7eb;
+    border-radius: 0.5rem;
+    background-color: #ffffff;
+    color: #374151;
+    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  }
+  .dark select::picker(select) {
+    border-color: #374151;
+    background-color: #1f2937;
+    color: #e5e7eb;
+  }
+  select option {
+    padding: 0.375rem 0.75rem;
+    border-radius: 0.375rem;
+    background-color: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  select option:hover,
+  select option:focus-visible {
+    outline: none;
+    background-color: #eef2ff;
+    color: #4338ca;
+  }
+  select option:checked {
+    font-weight: 500;
+    color: #4f46e5;
+  }
+  .dark select option {
+    background-color: transparent;
+    color: inherit;
+  }
+  .dark select option:hover,
+  .dark select option:focus-visible {
+    background-color: rgb(99 102 241 / 0.2);
+    color: #c7d2fe;
+  }
+  .dark select option:checked {
+    color: #a5b4fc;
+  }
+  select option::checkmark {
+    order: 1;
+    margin-left: auto;
+    padding-left: 0.75rem;
+  }
+}
