@@ -5,6 +5,12 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+### Security
+- **Dashboard build tools: vite 8.3.5 and vitest 4.1.12** for seven Dependabot
+  alerts in vite, its `launch-editor` dependency and `@vitest/mocker`. They only
+  affect the development server and test runner on a developer machine. Nothing
+  from them ships in the binary, packages or Docker image, so no release is
+  needed for this alone.
 
 ## [5.0.7] - 2026-10-26
 ### Security
