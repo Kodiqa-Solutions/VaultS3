@@ -6,6 +6,15 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.7] - 2026-10-26
+### Security
+- **Release binaries and deb, rpm and apk packages are now built with Go
+  1.26.10** for GO-2026-6809. 5.0.6 asked for Go 1.26.10, but the release
+  workflow asked its Go installer for any 1.26 release and got a cached 1.26.9,
+  so its binaries and packages still carried the bug. Every workflow now
+  installs the exact version in `go.mod`. The 5.0.6 Docker image was already
+  built with Go 1.26.10.
+
 ## [5.0.6] - 2026-10-26
 ### Security
 - **Built with Go 1.26.10** for GO-2026-6809 (CVE-2026-111943). Go now refuses
@@ -3459,7 +3468,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.6...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.7...HEAD
+[5.0.7]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.6...v5.0.7
 [5.0.6]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.5...v5.0.6
 [5.0.5]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.4...v5.0.5
 [5.0.4]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.3...v5.0.4

@@ -63,6 +63,13 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.7
+
+The release 5.0.6 meant to be. Its binaries and deb, rpm and apk packages were
+still built with Go 1.26.9. These are built with 1.26.10. Nothing to migrate,
+no behaviour changes. If you run the 5.0.6 Docker image you already have the
+fix. Upgrading is still fine.
+
 ## Upgrading to 5.0.6
 
 A security rebuild with Go 1.26.10. Nothing to migrate, no behaviour changes,
