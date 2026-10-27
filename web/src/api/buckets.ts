@@ -99,6 +99,7 @@ export interface CORSRule {
   allowed_origins: string[]
   allowed_methods: string[]
   allowed_headers?: string[]
+  expose_headers?: string[]
   max_age_secs?: number
 }
 

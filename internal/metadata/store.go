@@ -152,6 +152,7 @@ type CORSRule struct {
 	AllowedOrigins []string `json:"allowed_origins"`
 	AllowedMethods []string `json:"allowed_methods"`
 	AllowedHeaders []string `json:"allowed_headers,omitempty"`
+	ExposeHeaders  []string `json:"expose_headers,omitempty"`
 	MaxAgeSecs     int      `json:"max_age_secs,omitempty"`
 }
 
