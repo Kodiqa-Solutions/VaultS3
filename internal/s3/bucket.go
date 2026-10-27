@@ -765,6 +765,7 @@ func (h *BucketHandler) PutBucketCORS(w http.ResponseWriter, r *http.Request, bu
 			AllowedOrigin []string `xml:"AllowedOrigin"`
 			AllowedMethod []string `xml:"AllowedMethod"`
 			AllowedHeader []string `xml:"AllowedHeader"`
+			ExposeHeader  []string `xml:"ExposeHeader"`
 			MaxAgeSeconds int      `xml:"MaxAgeSeconds"`
 		} `xml:"CORSRule"`
 	}
@@ -784,6 +785,7 @@ func (h *BucketHandler) PutBucketCORS(w http.ResponseWriter, r *http.Request, bu
 			AllowedOrigins: r.AllowedOrigin,
 			AllowedMethods: r.AllowedMethod,
 			AllowedHeaders: r.AllowedHeader,
+			ExposeHeaders:  r.ExposeHeader,
 			MaxAgeSecs:     r.MaxAgeSeconds,
 		})
 	}
@@ -817,6 +819,7 @@ func (h *BucketHandler) GetBucketCORS(w http.ResponseWriter, r *http.Request, bu
 		AllowedOrigin []string `xml:"AllowedOrigin"`
 		AllowedMethod []string `xml:"AllowedMethod"`
 		AllowedHeader []string `xml:"AllowedHeader,omitempty"`
+		ExposeHeader  []string `xml:"ExposeHeader,omitempty"`
 		MaxAgeSeconds int      `xml:"MaxAgeSeconds,omitempty"`
 	}
 	type xmlCORSConfig struct {
@@ -831,6 +834,7 @@ func (h *BucketHandler) GetBucketCORS(w http.ResponseWriter, r *http.Request, bu
 			AllowedOrigin: r.AllowedOrigins,
 			AllowedMethod: r.AllowedMethods,
 			AllowedHeader: r.AllowedHeaders,
+			ExposeHeader:  r.ExposeHeaders,
 			MaxAgeSeconds: r.MaxAgeSecs,
 		})
 	}

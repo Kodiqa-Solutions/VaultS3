@@ -132,14 +132,34 @@ Configure Cross-Origin Resource Sharing on a per-bucket basis:
 s3.put_bucket_cors(Bucket='my-bucket', CORSConfiguration={
     'CORSRules': [{
         'AllowedOrigins': ['https://example.com'],
-        'AllowedMethods': ['GET', 'PUT'],
+        'AllowedMethods': ['GET', 'HEAD', 'PUT', 'POST', 'DELETE'],
         'AllowedHeaders': ['*'],
+        'ExposeHeaders': ['ETag', 'x-amz-version-id'],
         'MaxAgeSeconds': 3600,
     }]
 })
 ```
 
-The server responds to `OPTIONS` preflight requests with the configured CORS headers. Unknown origins are rejected with 403.
+The server responds to `OPTIONS` preflight requests with the configured CORS
+headers. A preflight whose origin or method matches no rule is rejected with 403.
+Actual responses use the first rule matching both the origin and request method,
+and return its `ExposeHeaders` as `Access-Control-Expose-Headers`. Expose `ETag`
+when uploading in parts from a browser: JavaScript needs each part's ETag to
+complete the multipart upload. `POST` starts and completes the upload; `DELETE`
+allows aborting it. CORS does not grant access to a private bucket; requests still
+need valid S3 credentials or a presigned URL.
+
+The dashboard's JSON CORS editor and API use `expose_headers` for the same field:
+
+```json
+[{"allowed_origins":["https://example.com"],"allowed_methods":["GET","HEAD","PUT","POST","DELETE"],"allowed_headers":["*"],"expose_headers":["ETag","x-amz-version-id"],"max_age_secs":3600}]
+```
+
+Existing rules without `ExposeHeaders` / `expose_headers` continue to work and
+expose no additional response headers. Bucket responses include `Vary: Origin`,
+including requests without an Origin header; preflight responses also vary on
+`Access-Control-Request-Method` and `Access-Control-Request-Headers` so shared
+caches keep those variants separate.
 
 ## STS Temporary Credentials
 

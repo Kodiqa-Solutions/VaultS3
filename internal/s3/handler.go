@@ -1229,6 +1229,9 @@ func formatResource(bucket, key string) string {
 
 // handleCORSPreflight handles OPTIONS requests for CORS preflight.
 func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request, bucket string) {
+	// Refusals vary too: a cached refusal for one origin or method must not
+	// hide a later request that a rule allows.
+	addVary(w.Header(), "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers")
 	// nil means the bucket has no CORS configuration, which is a refusal here
 	// rather than an error, and must not be ranged over.
 	cfg, err := h.store.GetCORSConfig(bucket)
@@ -1265,6 +1268,9 @@ func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request, bu
 
 // addCORSHeaders adds CORS response headers if a matching rule exists.
 func (h *Handler) addCORSHeaders(w http.ResponseWriter, r *http.Request, bucket string) {
+	// Even a request without Origin can populate a shared cache. It must not
+	// replace the response whose CORS headers a browser needs.
+	addVary(w.Header(), "Origin")
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return
@@ -1279,9 +1285,33 @@ func (h *Handler) addCORSHeaders(w http.ResponseWriter, r *http.Request, bucket 
 	}
 
 	for _, rule := range cfg.Rules {
-		if matchOrigin(rule.AllowedOrigins, origin) {
+		if matchOrigin(rule.AllowedOrigins, origin) && matchMethod(rule.AllowedMethods, r.Method) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+			if len(rule.ExposeHeaders) > 0 {
+				w.Header().Set("Access-Control-Expose-Headers", strings.Join(rule.ExposeHeaders, ", "))
+			}
 			return
+		}
+	}
+}
+
+// addVary preserves values set by other middleware, including Vary: *, without
+// duplicating a field that is already listed with different casing.
+func addVary(header http.Header, fields ...string) {
+	seen := make(map[string]bool)
+	for _, value := range header.Values("Vary") {
+		for _, field := range strings.Split(value, ",") {
+			field = strings.ToLower(strings.TrimSpace(field))
+			if field == "*" {
+				return
+			}
+			seen[field] = true
+		}
+	}
+	for _, field := range fields {
+		if !seen[strings.ToLower(field)] {
+			header.Add("Vary", field)
+			seen[strings.ToLower(field)] = true
 		}
 	}
 }

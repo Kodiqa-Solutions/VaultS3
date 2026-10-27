@@ -346,7 +346,7 @@ export default function BucketDetailPage() {
           onChange={e => setCorsText(e.target.value)}
           rows={6}
           className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none mb-3"
-          placeholder={`[{"allowed_origins":["*"],"allowed_methods":["GET","PUT"],"allowed_headers":["*"],"max_age_secs":3600}]`}
+          placeholder={`[{"allowed_origins":["*"],"allowed_methods":["GET","PUT"],"allowed_headers":["*"],"expose_headers":["ETag"],"max_age_secs":3600}]`}
         />
         <div className="flex gap-2">
           <button
