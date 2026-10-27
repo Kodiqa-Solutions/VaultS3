@@ -124,9 +124,9 @@ Windows, a `checksums.txt` signed with the project's release key, an SPDX SBOM
 per platform, and a Sigstore provenance bundle you can verify offline:
 
 ```bash
-sudo apt install ./vaults3_5.0.7_amd64.deb
+sudo apt install ./vaults3_5.0.8_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_5.0.7_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_5.0.8_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart or a single
@@ -276,6 +276,15 @@ go test -race ./internal/erasure/ ./internal/cluster/ ./internal/replication/
 The data-durability subsystems (`erasure`, `cluster`, `replication`) carry
 fault-injection tests, corrupt a shard and heal it, lose a node and re-route,
 partition two sites and resolve the conflict. New logic there should keep that bar.
+
+**Thank you to everyone who has contributed code:**
+[@virgoone](https://github.com/virgoone) (CORS exposed headers for browser
+multipart uploads),
+[@zhyc9de](https://github.com/zhyc9de) (streaming reads for encrypted and
+compressed objects, faster startup, dashboard fixes),
+[@sweet0dream](https://github.com/sweet0dream) (Russian translation) and
+[@idpcks](https://github.com/idpcks) (file browser grid view, login page).
+Issue reporters are credited in the [CHANGELOG](CHANGELOG.md).
 
 ## License
 

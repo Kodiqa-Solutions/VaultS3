@@ -63,6 +63,18 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.8
+
+Nothing to migrate. Existing CORS rules keep working, and rolling back to 5.0.7
+is safe: an older server ignores the new exposed headers field.
+
+One behaviour change: a browser can read a response only when the rule lists
+both the origin and the request method, as on AWS S3. Before, the origin alone
+was enough. If a page reads `HEAD` or `DELETE` responses from a bucket whose
+rule lists only `GET` and `PUT`, add those methods to the rule. To upload in
+parts from a browser, add `ExposeHeaders: ["ETag"]` so the page can read each
+part's ETag.
+
 ## Upgrading to 5.0.7
 
 The release 5.0.6 meant to be. Its binaries and deb, rpm and apk packages were

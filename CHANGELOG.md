@@ -5,12 +5,26 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+
+## [5.0.8] - 2026-10-27
+### Fixed
+- **Bucket CORS rules keep `ExposeHeader`, and responses send
+  `Access-Control-Expose-Headers`** (#64, contributed by @virgoone, thank
+  you). The field was dropped when a rule was saved, so a web page uploading in
+  parts could not read each part's `ETag` and never finish the upload. It is stored from both the S3
+  API (`ExposeHeader`) and the dashboard (`expose_headers`), and returned by
+  `GetBucketCors`.
+- **A CORS response now needs the request method in the rule, not only the
+  origin**, as on AWS S3. Before, any method from an allowed origin was given
+  `Access-Control-Allow-Origin`. Bucket responses now send `Vary: Origin`, and
+  preflights also vary on the requested method and headers, so a shared cache
+  cannot hand one origin's answer to another.
+
 ### Security
 - **Dashboard build tools: vite 8.3.5 and vitest 4.1.12** for seven Dependabot
   alerts in vite, its `launch-editor` dependency and `@vitest/mocker`. They only
   affect the development server and test runner on a developer machine. Nothing
-  from them ships in the binary, packages or Docker image, so no release is
-  needed for this alone.
+  from them ships in the binary, packages or Docker image.
 
 ## [5.0.7] - 2026-10-26
 ### Security
@@ -3474,7 +3488,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.7...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.8...HEAD
+[5.0.8]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.7...v5.0.8
 [5.0.7]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.6...v5.0.7
 [5.0.6]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.5...v5.0.6
 [5.0.5]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.4...v5.0.5
