@@ -1377,8 +1377,8 @@ func (s *Server) Run() error {
 		mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/dashboard/favicon.svg", http.StatusMovedPermanently)
 		})
-		mux.Handle("/api/v1/", apiHandler)
-		mux.Handle("/dashboard/", dashboard.Handler(s.cfg.Server.BasePath, s.cfg.Server.TrustForwardedPrefix))
+		mux.Handle("/api/v1/", middleware.Compress(apiHandler))
+		mux.Handle("/dashboard/", middleware.Compress(dashboard.Handler(s.cfg.Server.BasePath, s.cfg.Server.TrustForwardedPrefix)))
 	}
 
 	// Register pprof endpoints when debug mode is enabled
@@ -1772,8 +1772,8 @@ func (s *Server) Run() error {
 		cmux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/dashboard/favicon.svg", http.StatusMovedPermanently)
 		})
-		cmux.Handle("/api/v1/", apiHandler)
-		cmux.Handle("/dashboard/", dashboard.Handler(s.cfg.Server.BasePath, s.cfg.Server.TrustForwardedPrefix))
+		cmux.Handle("/api/v1/", middleware.Compress(apiHandler))
+		cmux.Handle("/dashboard/", middleware.Compress(dashboard.Handler(s.cfg.Server.BasePath, s.cfg.Server.TrustForwardedPrefix)))
 		cmux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/dashboard/", http.StatusFound)
 		})
