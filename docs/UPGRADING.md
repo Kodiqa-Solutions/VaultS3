@@ -68,6 +68,10 @@ or restore the data directory from a backup taken before the upgrade.
 Nothing to migrate. Existing CORS rules keep working, and rolling back to 5.0.7
 is safe: an older server ignores the new exposed headers field.
 
+Dashboard and API responses are now compressed when the browser accepts gzip
+or deflate. A reverse proxy that compresses on its own leaves them as they are,
+so there is nothing to change in nginx.
+
 One behaviour change: a browser can read a response only when the rule lists
 both the origin and the request method, as on AWS S3. Before, the origin alone
 was enough. If a page reads `HEAD` or `DELETE` responses from a bucket whose

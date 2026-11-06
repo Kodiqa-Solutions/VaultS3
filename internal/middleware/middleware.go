@@ -74,6 +74,14 @@ func PanicRecovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				// ErrAbortHandler means "cut the connection", for example when
+				// ReverseProxy loses the peer part way through a body. net/http
+				// does that only if it sees the panic. Answering it here would
+				// end a half sent response normally, so the client could take a
+				// truncated body as complete.
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
 				stack := string(debug.Stack())
 				reqID := w.Header().Get("X-Request-Id")
 				slog.Error("panic recovered",

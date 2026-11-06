@@ -8,6 +8,15 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+)
+
+// A gzip or zlib writer allocates about 800 KB of compressor state. The
+// dashboard polls the API every few seconds per open tab, so writers are
+// reused instead of built per response.
+var (
+	gzipPool = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+	zlibPool = sync.Pool{New: func() any { return zlib.NewWriter(io.Discard) }}
 )
 
 // Compress transparently gzip- or deflate-encodes responses when the client
@@ -33,8 +42,14 @@ func Compress(next http.Handler) http.Handler {
 			ResponseWriter: w,
 			encoding:       encoding,
 		}
-		defer cw.Close()
 		next.ServeHTTP(cw, r)
+		// Close writes the gzip or zlib trailer. It is deliberately not
+		// deferred: after a panic part way through the body (ReverseProxy
+		// aborts this way when a peer dies), a trailer would turn the truncated
+		// body into a complete, valid stream. Without one the client's decoder
+		// reports the cut. Close only fails when the client has gone away, and
+		// then there is no one left to tell.
+		_ = cw.Close()
 	})
 }
 
@@ -110,13 +125,23 @@ func (w *compressWriter) WriteHeader(status int) {
 	if w.wroteHeader {
 		return
 	}
+	// An informational status (100 Continue, 103 Early Hints) is not the
+	// response. Pass it on and wait for the final status, or that status would
+	// be dropped and the client would see an implicit 200.
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
 	w.wroteHeader = true
 
 	// A handler may have replaced Vary (the API's CORS path does), so make
 	// sure Accept-Encoding survives before the headers go out.
 	addVary(w.Header(), "Accept-Encoding")
 
-	if compressibleResponse(w.Header(), status) {
+	// No negotiated encoding (no Accept-Encoding, HEAD, Range) means the
+	// response goes out exactly as the handler wrote it: no empty
+	// Content-Encoding header, and Content-Length kept.
+	if w.encoding != "" && compressibleResponse(w.Header(), status) {
 		w.startCompression()
 	}
 	w.ResponseWriter.WriteHeader(status)
@@ -158,26 +183,47 @@ func (w *compressWriter) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the underlying writer (write
+// deadlines, full duplex).
+func (w *compressWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // Close flushes and closes the compressor, writing the gzip/zlib trailer.
 func (w *compressWriter) Close() error {
 	if w.writer == nil {
 		return nil
 	}
 	err := w.writer.Close()
+	switch zw := w.writer.(type) {
+	case *gzip.Writer:
+		zw.Reset(io.Discard)
+		gzipPool.Put(zw)
+	case *zlib.Writer:
+		zw.Reset(io.Discard)
+		zlibPool.Put(zw)
+	}
 	w.writer = nil
 	return err
 }
 
 func (w *compressWriter) startCompression() {
 	w.Header().Del("Content-Length")
+	// Ranges would count bytes of the uncompressed body, so a client resuming
+	// a compressed transfer would splice the two together.
+	w.Header().Del("Accept-Ranges")
 	w.Header().Set("Content-Encoding", w.encoding)
 
 	switch w.encoding {
 	case "gzip":
-		w.writer = gzip.NewWriter(w.ResponseWriter)
+		zw := gzipPool.Get().(*gzip.Writer)
+		zw.Reset(w.ResponseWriter)
+		w.writer = zw
 	case "deflate":
 		// HTTP "deflate" means a zlib-wrapped DEFLATE stream (RFC 1950).
-		w.writer = zlib.NewWriter(w.ResponseWriter)
+		zw := zlibPool.Get().(*zlib.Writer)
+		zw.Reset(w.ResponseWriter)
+		w.writer = zw
 	}
 }
 
@@ -190,12 +236,19 @@ func compressibleResponse(h http.Header, status int) bool {
 	if h.Get("Content-Encoding") != "" || h.Get("Content-Range") != "" {
 		return false
 	}
+	// A file download (the file browser's object download) keeps its
+	// Content-Length, so the browser shows the size and progress, and a large
+	// text object is not compressed on the fly.
+	if disp, _, err := mime.ParseMediaType(h.Get("Content-Disposition")); err == nil && disp == "attachment" {
+		return false
+	}
 
 	ct := h.Get("Content-Type")
 	if ct == "" {
-		// net/http sniffs the type on the first write; most handlers that leave
-		// it empty are returning text or JSON, so allow it.
-		return true
+		// net/http only sniffs a missing type when no Content-Encoding is set,
+		// so compressing here would send the body with no type at all. The
+		// type is unknown, so it may be binary too: leave it alone.
+		return false
 	}
 	mediaType, _, err := mime.ParseMediaType(ct)
 	if err != nil {

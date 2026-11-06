@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -173,5 +175,38 @@ func TestMiddlewareChain(t *testing.T) {
 	}
 	if rec.recorded == 0 {
 		t.Error("latency not recorded in chain")
+	}
+}
+
+// ErrAbortHandler must reach net/http so it cuts the connection. Recovering it
+// and writing a 500 after part of the body was sent ended the response
+// normally, so a client read a truncated body as complete.
+func TestPanicRecoveryLetsAbortCutTheConnection(t *testing.T) {
+	srv := httptest.NewServer(PanicRecovery(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 4096))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	})))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if body, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatalf("aborted response read as complete: %d bytes, ends %q", len(body), body[len(body)-min(len(body), 30):])
+	}
+}
+
+// Any other panic is still answered with a 500.
+func TestPanicRecoveryStillAnswersOtherPanics(t *testing.T) {
+	rec := httptest.NewRecorder()
+	PanicRecovery(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 }

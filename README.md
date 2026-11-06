@@ -280,6 +280,8 @@ partition two sites and resolve the conflict. New logic there should keep that b
 **Thank you to everyone who has contributed code:**
 [@virgoone](https://github.com/virgoone) (CORS exposed headers for browser
 multipart uploads),
+[@tyronecai](https://github.com/tyronecai) (gzip and deflate for the dashboard
+and its API),
 [@zhyc9de](https://github.com/zhyc9de) (streaming reads for encrypted and
 compressed objects, faster startup, dashboard fixes),
 [@sweet0dream](https://github.com/sweet0dream) (Russian translation) and

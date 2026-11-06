@@ -6,8 +6,22 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
-## [5.0.8] - 2026-10-27
+## [5.0.8] - 2026-11-06
+### Added
+- **The dashboard and its API are compressed with gzip or deflate** when the
+  browser asks for it (#65, contributed by @tyronecai, thank you). The
+  dashboard's JavaScript is about 75% smaller on the wire, which helps on a slow
+  link when nothing in front of VaultS3 compresses. File downloads, zip
+  downloads, live streams, Range and HEAD requests and binary responses are sent
+  as before, so a download keeps its size and progress bar. S3 requests are not
+  affected.
+
 ### Fixed
+- **A read cut off by a failing cluster node now ends with a broken
+  connection.** When the node holding the data dropped part way through, the
+  server's panic handler answered anyway and ended the response normally, so a
+  client without a length to check could take the truncated body as complete.
+  The connection is now closed, as Go intends, and the client sees the error.
 - **Bucket CORS rules keep `ExposeHeader`, and responses send
   `Access-Control-Expose-Headers`** (#64, contributed by @virgoone, thank
   you). The field was dropped when a rule was saved, so a web page uploading in
@@ -21,6 +35,10 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   cannot hand one origin's answer to another.
 
 ### Security
+- **brotli 1.2.7 and klauspost/compress 1.20.2** for GO-2026-6888 (too much
+  memory used when decompressing a crafted brotli stream) and GO-2026-6865 (a
+  panic on some zstd frames). govulncheck finds both reachable from VaultS3's
+  compression code.
 - **Dashboard build tools: vite 8.3.5 and vitest 4.1.12** for seven Dependabot
   alerts in vite, its `launch-editor` dependency and `@vitest/mocker`. They only
   affect the development server and test runner on a developer machine. Nothing
