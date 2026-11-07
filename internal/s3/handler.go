@@ -504,7 +504,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// handler reads it. Must run after auth (which signs the STREAMING-* literal,
 	// not the body). Without this, HTTPS/HTTP-2 uploads from modern SDKs are stored
 	// with their chunk framing intact and corrupted.
-	maybeDecodeAwsChunked(r)
+	//
+	// The signature covers the body's declared SHA-256, or for a signed
+	// streaming upload the first link of a chain of chunk signatures, never
+	// the body itself. Both are checked against what arrives, so a body
+	// replaced in transit is refused (see payloadsig.go).
+	var signer *chunkSigner
+	if isSignedStreaming(r) {
+		// Only a header-signed request has a signature to chain from, so a
+		// presigned or anonymous one claiming signed chunks is refused here.
+		s, err := h.auth.chunkSignerFor(r)
+		if err != nil {
+			slog.Info("s3: signed streaming upload refused", "reason", err.Error(), "remote", rateLimitIP)
+			writeS3Error(w, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.", http.StatusForbidden)
+			return
+		}
+		signer = s
+	}
+	decodeAwsChunked(r, signer)
+	if err := verifyPayloadHash(r); err != nil {
+		if !writeReqError(w, err) {
+			writeS3Error(w, "IncompleteBody", "The request body could not be read.", http.StatusBadRequest)
+		}
+		return
+	}
 
 	// Replication loop prevention: use a per-request ObjectHandler copy with
 	// notification/replication/lambda callbacks disabled for replication peers.

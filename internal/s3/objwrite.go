@@ -161,6 +161,7 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 			return metadata.ObjectMeta{}, verr
 		}
 		meta.ChecksumSHA256, meta.ChecksumCRC32, meta.ChecksumCRC32C, meta.ChecksumSHA1 = sums.SHA256, sums.CRC32, sums.CRC32C, sums.SHA1
+		meta.ChecksumCRC64NVME = sums.CRC64NVME
 	}
 
 	now := time.Now().UTC()
@@ -272,10 +273,26 @@ func (h *ObjectHandler) checkReplaceLock(bucket, key, versioning string, bypassG
 // An engine that stopped reading before the end of the body never let them run,
 // so they run here instead, and the rejected bytes are removed the old way.
 func (h *ObjectHandler) settleDigests(bucket, key, versionID string, d *putDigests) (objectChecksums, error) {
-	if d.done {
-		if d.failure != nil {
-			return d.sums, d.failure
+	// An engine that never read to the end (an empty body it did not read at
+	// all) left the end checks undone. Reading on is cheap and bounded: any
+	// byte past the declared length is itself a refusal.
+	if !d.done && d.failure == nil && d.req != nil {
+		var b [512]byte
+		for i := 0; i < 64 && !d.done && d.failure == nil; i++ {
+			if _, err := d.Read(b[:]); err != nil {
+				break
+			}
 		}
+	}
+	// A check that failed only now, after the engine saved the object (the
+	// engine ignored a failed read, or never read an empty body), still has
+	// to take the object away. Checks normally fail inside the engine's read,
+	// before anything is saved; see putDigests.Read.
+	if d.failure != nil {
+		h.removeRejected(bucket, key, versionID)
+		return d.sums, d.failure
+	}
+	if d.done {
 		return d.sums, nil
 	}
 	if d.req == nil {
@@ -285,6 +302,13 @@ func (h *ObjectHandler) settleDigests(bucket, key, versionID string, d *putDiges
 	if ok {
 		return sums, nil
 	}
+	h.removeRejected(bucket, key, versionID)
+	return sums, &reqError{code, message, http.StatusBadRequest}
+}
+
+// removeRejected removes the data of an upload refused after the engine saved
+// it. It has no metadata, so it is never served even if this fails.
+func (h *ObjectHandler) removeRejected(bucket, key, versionID string) {
 	var err error
 	if versionID != "" {
 		err = h.engine.DeleteObjectVersion(bucket, key, versionID)
@@ -295,7 +319,6 @@ func (h *ObjectHandler) settleDigests(bucket, key, versionID string, d *putDiges
 		slog.Warn("could not remove the data of a rejected upload; it has no metadata so it is not served, run `vaults3-cli object verify --repair` to reclaim it",
 			"bucket", bucket, "key", key, "version", versionID, "error", err)
 	}
-	return sums, &reqError{code, message, http.StatusBadRequest}
 }
 
 // quotaByteLimit is how many bytes an upload to bucket may add before it takes

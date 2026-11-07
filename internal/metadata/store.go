@@ -336,6 +336,7 @@ type ObjectMeta struct {
 	ChecksumCRC32      string            `json:"checksum_crc32,omitempty"`
 	ChecksumCRC32C     string            `json:"checksum_crc32c,omitempty"`
 	ChecksumSHA1       string            `json:"checksum_sha1,omitempty"`
+	ChecksumCRC64NVME  string            `json:"checksum_crc64nvme,omitempty"`
 	ReplicationStatus  string            `json:"replication_status,omitempty"`
 	SSECustomerKeyMD5  string            `json:"ssec_key_md5,omitempty"` // base64(md5(customer key)) for SSE-C objects; key itself never stored
 	WebsiteRedirect    string            `json:"website_redirect,omitempty"`

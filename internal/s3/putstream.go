@@ -8,9 +8,15 @@ import (
 	"encoding/binary"
 	"hash"
 	"hash/crc32"
+	"hash/crc64"
 	"io"
 	"net/http"
+	"strings"
 )
+
+// crc64NVMETable is CRC-64/NVME, the checksum S3 itself defaults to (reflected
+// polynomial 0x9a6c9329ac4bc9b5, check value 0xae8b14860a799888).
+var crc64NVMETable = crc64.MakeTable(0x9a6c9329ac4bc9b5)
 
 // putDigests computes an upload's digests while its body streams to the storage
 // engine, so a PUT no longer has to be held in memory to be validated.
@@ -26,13 +32,17 @@ import (
 type putDigests struct {
 	src io.Reader
 	n   int64
-	sum io.Writer // fan-out to the active hashes; nil when none are needed
+	// expect is the length the request declared (Content-Length, or the
+	// decoded length of an aws-chunked body), or -1 when unknown.
+	expect int64
+	sum    io.Writer // fan-out to the active hashes; nil when none are needed
 
 	md5    hash.Hash // set only when Content-MD5 was sent
 	sha256 hash.Hash
 	crc32  hash.Hash32
 	crc32c hash.Hash32
 	sha1   hash.Hash
+	crc64  hash.Hash64 // CRC-64/NVME
 
 	// req, once set by checkInline, makes the reader verify the digests itself
 	// when the body ends and fail the read if they do not match. The engine
@@ -60,31 +70,39 @@ func (d *putDigests) checkInline(r *http.Request, limit int64) {
 
 // newPutDigests wraps body, enabling exactly the hashes this request needs.
 func newPutDigests(r *http.Request, body io.Reader) *putDigests {
-	d := &putDigests{src: body, limit: -1}
+	d := &putDigests{src: body, limit: -1, expect: r.ContentLength}
 	var ws []io.Writer
 
 	if r.Header.Get("Content-MD5") != "" {
 		d.md5 = md5.New()
 		ws = append(ws, d.md5)
 	}
-	// The trailer form carries the checksum after the body, so the value is not
-	// known up front; it is still computed and recorded, matching the buffered
-	// behaviour this replaces.
-	if r.Header.Get("X-Amz-Checksum-Sha256") != "" || r.Header.Get("X-Amz-Trailer") == "x-amz-checksum-sha256" {
+	// A checksum comes either as a header, known up front, or as a trailer
+	// after an aws-chunked body, declared up front in X-Amz-Trailer. Either
+	// way the hash runs over the body, and verify compares it with the value
+	// (maybeDecodeAwsChunked copies a trailer's value into the header).
+	wants := func(header string) bool {
+		return r.Header.Get(header) != "" || trailerDeclares(r, header)
+	}
+	if wants("X-Amz-Checksum-Sha256") {
 		d.sha256 = sha256.New()
 		ws = append(ws, d.sha256)
 	}
-	if r.Header.Get("X-Amz-Checksum-Crc32") != "" {
+	if wants("X-Amz-Checksum-Crc32") {
 		d.crc32 = crc32.NewIEEE()
 		ws = append(ws, d.crc32)
 	}
-	if r.Header.Get("X-Amz-Checksum-Crc32c") != "" {
+	if wants("X-Amz-Checksum-Crc32c") {
 		d.crc32c = crc32.New(crc32.MakeTable(crc32.Castagnoli))
 		ws = append(ws, d.crc32c)
 	}
-	if r.Header.Get("X-Amz-Checksum-Sha1") != "" {
+	if wants("X-Amz-Checksum-Sha1") {
 		d.sha1 = sha1.New()
 		ws = append(ws, d.sha1)
+	}
+	if wants("X-Amz-Checksum-Crc64nvme") {
+		d.crc64 = crc64.New(crc64NVMETable)
+		ws = append(ws, d.crc64)
 	}
 
 	if len(ws) > 0 {
@@ -93,9 +111,15 @@ func newPutDigests(r *http.Request, body io.Reader) *putDigests {
 	return d
 }
 
+var errBodyTooLong = &reqError{"IncompleteBody",
+	"The request body is longer than the length it declared.", http.StatusBadRequest}
+
 func (d *putDigests) Read(p []byte) (int, error) {
 	if d.failure != nil {
 		return 0, d.failure
+	}
+	if d.done {
+		return 0, io.EOF
 	}
 	n, err := d.src.Read(p)
 	if n > 0 {
@@ -106,6 +130,31 @@ func (d *putDigests) Read(p []byte) (int, error) {
 		if d.limit >= 0 && d.n > d.limit {
 			d.failure = &reqError{"QuotaExceeded", "Maximum bucket size exceeded", http.StatusForbidden}
 			return n, d.failure
+		}
+		if d.expect >= 0 && d.n > d.expect {
+			d.failure = errBodyTooLong
+			return n, d.failure
+		}
+	}
+	if err != nil && err != io.EOF {
+		// A check made while the body was decoded (a chunk or trailer
+		// signature, the body's SHA-256, a malformed trailer) is this upload's
+		// answer, whichever reader met it.
+		if re := bodyFailure(err); re != nil {
+			d.failure = re
+		}
+		return n, err
+	}
+	// The declared length has arrived. An engine that knows the size, like
+	// the erasure-coding one, stops reading here and never sees EOF, so a
+	// trailer after the data, and every check that runs at EOF, would only
+	// happen after the engine had saved the object. Confirm the body ends
+	// here and run the checks now, inside the engine's own read, so a refusal
+	// still makes it abandon the write.
+	if err == nil && d.req != nil && d.expect >= 0 && d.n == d.expect {
+		err = d.probeEnd()
+		if err != nil && err != io.EOF {
+			return n, err
 		}
 	}
 	if err == io.EOF && d.req != nil {
@@ -118,6 +167,29 @@ func (d *putDigests) Read(p []byte) (int, error) {
 		d.sums = sums
 	}
 	return n, err
+}
+
+// probeEnd reads past the declared length to reach the body's end. More data
+// there means the body is longer than it said, and is refused.
+func (d *putDigests) probeEnd() error {
+	var b [1]byte
+	for i := 0; i < 16; i++ {
+		m, err := d.src.Read(b[:])
+		if m > 0 {
+			d.failure = errBodyTooLong
+			return d.failure
+		}
+		if err == io.EOF {
+			return io.EOF
+		}
+		if err != nil {
+			if re := bodyFailure(err); re != nil {
+				d.failure = re
+			}
+			return err
+		}
+	}
+	return nil // no end yet after repeated empty reads: leave it to the engine
 }
 
 // size is how many bytes actually arrived, which is the authoritative length
@@ -144,40 +216,58 @@ func (d *putDigests) verify(r *http.Request) (sums objectChecksums, code, messag
 		}
 	}
 
-	if d.sha256 != nil {
-		computed := base64.StdEncoding.EncodeToString(d.sha256.Sum(nil))
-		if v := r.Header.Get("X-Amz-Checksum-Sha256"); v != "" && v != computed {
-			return sums, "BadDigest", errChecksumMismatch("SHA256").Error(), false
-		}
-		sums.SHA256 = computed
+	checks := []struct {
+		on     bool
+		header string
+		name   string
+		sum    func() string
+		out    *string
+	}{
+		{d.sha256 != nil, "X-Amz-Checksum-Sha256", "SHA256", func() string { return base64.StdEncoding.EncodeToString(d.sha256.Sum(nil)) }, &sums.SHA256},
+		{d.crc32 != nil, "X-Amz-Checksum-Crc32", "CRC32", func() string { return base32Sum(d.crc32.Sum32()) }, &sums.CRC32},
+		{d.crc32c != nil, "X-Amz-Checksum-Crc32c", "CRC32C", func() string { return base32Sum(d.crc32c.Sum32()) }, &sums.CRC32C},
+		{d.sha1 != nil, "X-Amz-Checksum-Sha1", "SHA1", func() string { return base64.StdEncoding.EncodeToString(d.sha1.Sum(nil)) }, &sums.SHA1},
+		{d.crc64 != nil, "X-Amz-Checksum-Crc64nvme", "CRC64NVME", func() string { return base64Sum64(d.crc64.Sum64()) }, &sums.CRC64NVME},
 	}
-	if d.crc32 != nil {
-		computed := base32Sum(d.crc32.Sum32())
-		if v := r.Header.Get("X-Amz-Checksum-Crc32"); v != computed {
-			return sums, "BadDigest", errChecksumMismatch("CRC32").Error(), false
+	for _, c := range checks {
+		if !c.on {
+			continue
 		}
-		sums.CRC32 = computed
-	}
-	if d.crc32c != nil {
-		computed := base32Sum(d.crc32c.Sum32())
-		if v := r.Header.Get("X-Amz-Checksum-Crc32c"); v != computed {
-			return sums, "BadDigest", errChecksumMismatch("CRC32C").Error(), false
+		computed := c.sum()
+		v := r.Header.Get(c.header)
+		if v == "" {
+			// Declared as a trailer that never arrived. Before, a trailer was
+			// never read at all, so whatever it said was accepted.
+			return sums, "MalformedTrailerError", "The request declared " + strings.ToLower(c.header) + " in X-Amz-Trailer but did not send it", false
 		}
-		sums.CRC32C = computed
-	}
-	if d.sha1 != nil {
-		computed := base64.StdEncoding.EncodeToString(d.sha1.Sum(nil))
-		if v := r.Header.Get("X-Amz-Checksum-Sha1"); v != computed {
-			return sums, "BadDigest", errChecksumMismatch("SHA1").Error(), false
+		if v != computed {
+			return sums, "BadDigest", errChecksumMismatch(c.name).Error(), false
 		}
-		sums.SHA1 = computed
+		*c.out = computed
 	}
 	return sums, "", "", true
 }
 
+// trailerDeclares reports whether X-Amz-Trailer lists header (a comma list,
+// any case).
+func trailerDeclares(r *http.Request, header string) bool {
+	for _, t := range strings.Split(strings.Join(r.Header.Values("X-Amz-Trailer"), ","), ",") {
+		if strings.EqualFold(strings.TrimSpace(t), header) {
+			return true
+		}
+	}
+	return false
+}
+
 // objectChecksums are the S3 checksum values recorded on an object.
 type objectChecksums struct {
-	SHA256, CRC32, CRC32C, SHA1 string
+	SHA256, CRC32, CRC32C, SHA1, CRC64NVME string
+}
+
+func base64Sum64(v uint64) string {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, v)
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 func base32Sum(v uint32) string {

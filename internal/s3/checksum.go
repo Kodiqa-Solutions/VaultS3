@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"hash/crc32"
-	"io"
 	"net/http"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -88,31 +87,7 @@ func setChecksumHeaders(w http.ResponseWriter, meta *metadata.ObjectMeta) {
 	if meta.ChecksumSHA1 != "" {
 		w.Header().Set("X-Amz-Checksum-Sha1", meta.ChecksumSHA1)
 	}
-}
-
-// computeChecksums computes all supported checksums from a reader.
-func computeChecksums(r io.Reader) (sha256sum, crc32sum, crc32csum, sha1sum string, body []byte, err error) {
-	body, err = io.ReadAll(r)
-	if err != nil {
-		return
+	if meta.ChecksumCRC64NVME != "" {
+		w.Header().Set("X-Amz-Checksum-Crc64nvme", meta.ChecksumCRC64NVME)
 	}
-
-	h256 := sha256.Sum256(body)
-	sha256sum = base64.StdEncoding.EncodeToString(h256[:])
-
-	c32 := crc32.ChecksumIEEE(body)
-	b32 := make([]byte, 4)
-	binary.BigEndian.PutUint32(b32, c32)
-	crc32sum = base64.StdEncoding.EncodeToString(b32)
-
-	table := crc32.MakeTable(crc32.Castagnoli)
-	c32c := crc32.Checksum(body, table)
-	b32c := make([]byte, 4)
-	binary.BigEndian.PutUint32(b32c, c32c)
-	crc32csum = base64.StdEncoding.EncodeToString(b32c)
-
-	h1 := sha1.Sum(body)
-	sha1sum = base64.StdEncoding.EncodeToString(h1[:])
-
-	return
 }

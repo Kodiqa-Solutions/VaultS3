@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
@@ -118,21 +119,42 @@ func TestPutDigestsRejectsEachBadChecksum(t *testing.T) {
 	}
 }
 
-// A trailer checksum has no value to compare against up front, but the computed
-// value is still recorded on the object.
-func TestPutDigestsRecordsTrailerChecksum(t *testing.T) {
+// A trailer checksum arrives after an aws-chunked body. maybeDecodeAwsChunked
+// reads it, the digest is checked against it, and the value is recorded. A
+// trailer that was declared but never sent is refused: before, the trailer was
+// never read, so whatever it said was accepted.
+func TestPutDigestsChecksTrailerChecksum(t *testing.T) {
 	body := []byte("trailer payload")
-	r := httptest.NewRequest(http.MethodPut, "/b/k", bytes.NewReader(body))
-	r.Header.Set("X-Amz-Trailer", "x-amz-checksum-sha256")
-	d := newPutDigests(r, r.Body)
-	drain(t, d)
-	sums, _, _, ok := d.verify(r)
-	if !ok {
-		t.Fatal("trailer form rejected")
+	sum := sha256.Sum256(body)
+	framed := func(trailer string) []byte {
+		return []byte(fmt.Sprintf("%x\r\n%s\r\n0\r\n%s\r\n", len(body), body, trailer))
 	}
-	want := sha256.Sum256(body)
-	if sums.SHA256 != b64(want[:]) {
-		t.Errorf("sha256 = %q, want %q", sums.SHA256, b64(want[:]))
+	for _, tc := range []struct {
+		name     string
+		trailer  string
+		wantOK   bool
+		wantCode string
+	}{
+		{"matching value", "x-amz-checksum-sha256:" + b64(sum[:]) + "\r\n", true, ""},
+		{"wrong value", "x-amz-checksum-sha256:" + b64(make([]byte, 32)) + "\r\n", false, "BadDigest"},
+		{"declared, not sent", "", false, "MalformedTrailerError"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPut, "/b/k", bytes.NewReader(framed(tc.trailer)))
+			r.Header.Set("Content-Encoding", "aws-chunked")
+			r.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+			r.Header.Set("X-Amz-Trailer", "x-amz-checksum-sha256")
+			maybeDecodeAwsChunked(r)
+			d := newPutDigests(r, r.Body)
+			drain(t, d)
+			sums, code, _, ok := d.verify(r)
+			if ok != tc.wantOK || code != tc.wantCode {
+				t.Fatalf("ok=%v code=%q, want ok=%v code=%q", ok, code, tc.wantOK, tc.wantCode)
+			}
+			if ok && sums.SHA256 != b64(sum[:]) {
+				t.Errorf("recorded sha256 %q, want %q", sums.SHA256, b64(sum[:]))
+			}
+		})
 	}
 }
 

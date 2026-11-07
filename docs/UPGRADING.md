@@ -63,6 +63,29 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.9
+
+Nothing to migrate, and rolling back to 5.0.8 is safe: 5.0.8 reads objects
+written by 5.0.9 and only leaves out the new CRC64NVME checksum header.
+
+Two behaviour changes, both refusing uploads that used to be stored without
+being checked. An upload that is refused now had wrong bytes or a wrong
+checksum or signature, which is what the checks are for.
+
+- An upload whose checksum does not match its bytes is refused with
+  `BadDigest` when the checksum is sent as an aws-chunked trailer or as
+  CRC64NVME. An upload that declares a trailer checksum in `X-Amz-Trailer` and
+  then does not send it is refused with `MalformedTrailerError`, as on AWS.
+- The body of a signed upload is checked against what the signature covers:
+  its declared `x-amz-content-sha256`, or the chunk and trailer signatures of
+  a signed streaming upload. A body changed on the way, or longer than the
+  length it declared, is refused. A presigned or anonymous request that claims
+  signed chunks (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) is refused, since it has
+  no signature to chain them from.
+
+boto3, the AWS CLI and minio-go clients (`mc`, `mcli`) are not affected: they
+were tested over HTTP and HTTPS, with and without erasure coding.
+
 ## Upgrading to 5.0.8
 
 Nothing to migrate. Existing CORS rules keep working, and rolling back to 5.0.7

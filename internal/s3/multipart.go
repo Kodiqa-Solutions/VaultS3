@@ -181,7 +181,7 @@ func (h *ObjectHandler) UploadPart(w http.ResponseWriter, r *http.Request, bucke
 
 	w.Header().Set("ETag", etag)
 	setChecksumHeaders(w, &metadata.ObjectMeta{ChecksumSHA256: digests.sums.SHA256, ChecksumCRC32: digests.sums.CRC32,
-		ChecksumCRC32C: digests.sums.CRC32C, ChecksumSHA1: digests.sums.SHA1})
+		ChecksumCRC32C: digests.sums.CRC32C, ChecksumSHA1: digests.sums.SHA1, ChecksumCRC64NVME: digests.sums.CRC64NVME})
 	w.WriteHeader(http.StatusOK)
 }
 

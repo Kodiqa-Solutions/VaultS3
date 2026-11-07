@@ -9,6 +9,7 @@ The measures built into VaultS3. For reporting a vulnerability, see SECURITY.md.
 VaultS3 is designed with security in mind:
 
 - **S3 Signature V4**: full signature verification including presigned URLs
+- **Upload body integrity**: the body of a signed upload is checked against the SHA-256 its signature covers, and every chunk and trailer signature of a signed streaming upload is verified, so a body changed on the network is refused even over plain HTTP. Flexible checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256) are verified whether sent as a header or as a trailer
 - **Slow client protection**: a client has 30 seconds to send its request headers (and finish the TLS handshake), and a keep-alive connection idle between requests is closed after 2 minutes, on every listener. Request bodies and responses have no time limit, so large uploads, downloads and live streams are never cut off
 - **Presigned URL validation**: signature, expiry, and restrictions enforced server-side
 - **Constant-time credential comparison**: `crypto/hmac.Equal` prevents timing attacks on login

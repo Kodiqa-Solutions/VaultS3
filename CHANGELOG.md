@@ -6,6 +6,20 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 ### Fixed
+- **Checksums sent after the upload body are now checked.** Current AWS SDKs
+  (boto3, the AWS CLI, the Go and JavaScript SDKs) send their CRC32 or
+  CRC64NVME checksum as a trailer after an aws-chunked body when talking
+  HTTPS, which is how most servers are reached. VaultS3 decoded the body but
+  threw the trailer away, so these checksums were never compared with the
+  bytes or stored: an upload damaged in transit was accepted, and a trailer
+  with any value at all was stored. The trailer is now read, the checksum is
+  compared, a mismatch is refused with `BadDigest` and stores nothing, and the
+  value is stored and returned on GET and HEAD. Also applies to UploadPart and
+  to servers with erasure coding.
+- **CRC64NVME checksums are supported**, the checksum S3 itself uses by
+  default. They were ignored, so a wrong value was stored without complaint.
+  They are now checked, stored and returned on PUT, GET, HEAD,
+  GetObjectAttributes and UploadPart, and kept by CopyObject.
 - **A restart no longer hangs for 30 seconds when a live stream is open.** The
   log, event and trace streams (`/api/v1/logs`, `/api/v1/events`,
   `/api/v1/trace`) ended only when their client left, and a graceful shutdown
@@ -19,6 +33,23 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   instead of one after another.
 
 ### Security
+- **The body of a signed upload is now checked against its signature.** A
+  SigV4 signature covers the SHA-256 of the body that the client declares in
+  `x-amz-content-sha256`, or, for a signed streaming upload, the first link of
+  a chain of per-chunk signatures. It does not cover the body itself, and
+  VaultS3 never compared the two. So on a plain HTTP connection anyone on the
+  network path could replace the body of a correctly signed upload, and the
+  replaced bytes were stored (checked with boto3, and with `mcli` sending
+  signed chunks, through a proxy that altered one byte). Now a body that does
+  not match its declared SHA-256 is refused with `XAmzContentSHA256Mismatch`,
+  every chunk signature and the signed trailer of a signed streaming upload
+  are checked in order (`SignatureDoesNotMatch`), and a body longer than its
+  declared length is refused with `IncompleteBody`. A refused upload stores
+  nothing and leaves an object already at the key as it was, also with
+  erasure coding. Configuration bodies (policies, lifecycle, CORS, tagging,
+  delete lists) are checked in full before they are applied. HTTPS already
+  protected the body in transit, so this mainly affects servers reached over
+  plain HTTP.
 - **Connections that send their headers too slowly are now closed.** The S3
   and dashboard listener, the separate console listener and the inter-node
   listener had no time limits at all, so a client sending its headers a byte

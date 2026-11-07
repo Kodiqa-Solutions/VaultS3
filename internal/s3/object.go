@@ -1467,6 +1467,7 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 	meta.ChecksumCRC32 = srcMeta.ChecksumCRC32
 	meta.ChecksumCRC32C = srcMeta.ChecksumCRC32C
 	meta.ChecksumSHA1 = srcMeta.ChecksumSHA1
+	meta.ChecksumCRC64NVME = srcMeta.ChecksumCRC64NVME
 	meta.Tags = copyTags
 
 	written, err := h.writeObject(newObject{
@@ -2271,10 +2272,11 @@ func (h *ObjectHandler) GetObjectAttributes(w http.ResponseWriter, r *http.Reque
 		TotalPartsCount int `xml:"TotalPartsCount"`
 	}
 	type xmlChecksum struct {
-		ChecksumSHA256 string `xml:"ChecksumSHA256,omitempty"`
-		ChecksumCRC32  string `xml:"ChecksumCRC32,omitempty"`
-		ChecksumCRC32C string `xml:"ChecksumCRC32C,omitempty"`
-		ChecksumSHA1   string `xml:"ChecksumSHA1,omitempty"`
+		ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+		ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+		ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+		ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+		ChecksumCRC64NVME string `xml:"ChecksumCRC64NVME,omitempty"`
 	}
 	type xmlObjectAttributes struct {
 		XMLName      xml.Name        `xml:"GetObjectAttributesResponse"`
@@ -2291,12 +2293,13 @@ func (h *ObjectHandler) GetObjectAttributes(w http.ResponseWriter, r *http.Reque
 		StorageClass: "STANDARD",
 	}
 
-	if meta.ChecksumSHA256 != "" || meta.ChecksumCRC32 != "" || meta.ChecksumCRC32C != "" || meta.ChecksumSHA1 != "" {
+	if meta.ChecksumSHA256 != "" || meta.ChecksumCRC32 != "" || meta.ChecksumCRC32C != "" || meta.ChecksumSHA1 != "" || meta.ChecksumCRC64NVME != "" {
 		resp.Checksum = &xmlChecksum{
-			ChecksumSHA256: meta.ChecksumSHA256,
-			ChecksumCRC32:  meta.ChecksumCRC32,
-			ChecksumCRC32C: meta.ChecksumCRC32C,
-			ChecksumSHA1:   meta.ChecksumSHA1,
+			ChecksumSHA256:    meta.ChecksumSHA256,
+			ChecksumCRC32:     meta.ChecksumCRC32,
+			ChecksumCRC32C:    meta.ChecksumCRC32C,
+			ChecksumSHA1:      meta.ChecksumSHA1,
+			ChecksumCRC64NVME: meta.ChecksumCRC64NVME,
 		}
 	}
 
