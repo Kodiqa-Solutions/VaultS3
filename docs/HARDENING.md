@@ -9,6 +9,7 @@ The measures built into VaultS3. For reporting a vulnerability, see SECURITY.md.
 VaultS3 is designed with security in mind:
 
 - **S3 Signature V4**: full signature verification including presigned URLs
+- **Slow client protection**: a client has 30 seconds to send its request headers (and finish the TLS handshake), and a keep-alive connection idle between requests is closed after 2 minutes, on every listener. Request bodies and responses have no time limit, so large uploads, downloads and live streams are never cut off
 - **Presigned URL validation**: signature, expiry, and restrictions enforced server-side
 - **Constant-time credential comparison**: `crypto/hmac.Equal` prevents timing attacks on login
 - **Path traversal protection**: `..` segments rejected at S3, API, versioning API, CopyObject/UploadPartCopy source, and filesystem layers

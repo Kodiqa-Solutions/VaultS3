@@ -1518,10 +1518,7 @@ func (s *Server) Run() error {
 	handler = trustedProxies(s.cfg.Server.TrustedProxies, handler)
 	handler = middleware.PanicRecovery(handler)
 
-	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: handler,
-	}
+	httpServer := newHTTPServer(addr, handler)
 
 	// Log startup info
 	scheme := "http"
@@ -1739,10 +1736,7 @@ func (s *Server) Run() error {
 			// ETag and size (security assessment finding 9, on the second door).
 			interNodeMux.HandleFunc("/_replication/sync", s.requireClusterSecret(s.biDirWorker.HandleSyncRequest))
 		}
-		interNodeServer = &http.Server{
-			Addr:    interNodeAddr,
-			Handler: interNodeMux,
-		}
+		interNodeServer = newHTTPServer(interNodeAddr, interNodeMux)
 		go func() {
 			slog.Info("inter-node listener started", "addr", interNodeAddr)
 			// The inter-node listener was always plain HTTP, even with TLS on.
@@ -1782,7 +1776,7 @@ func (s *Server) Run() error {
 		chandler = middleware.SecurityHeaders(chandler)
 		chandler = trustedProxies(s.cfg.Server.TrustedProxies, chandler)
 		chandler = middleware.PanicRecovery(chandler)
-		consoleServer = &http.Server{Addr: consoleAddr, Handler: chandler}
+		consoleServer = newHTTPServer(consoleAddr, chandler)
 		go func() {
 			slog.Info("console (dashboard) listener started", "addr", consoleAddr)
 			var err error

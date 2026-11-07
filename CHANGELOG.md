@@ -5,6 +5,16 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+### Security
+- **Connections that send their headers too slowly are now closed.** The S3
+  and dashboard listener, the separate console listener and the inter-node
+  listener had no time limits at all, so a client sending its headers a byte
+  at a time could hold a connection open for ever, and enough of them could
+  exhaust the server (a slowloris attack). A client now has 30 seconds to send
+  its headers, which also bounds the TLS handshake, and a keep-alive
+  connection that sits idle between requests is closed after 2 minutes. The
+  body of a request and the response have no time limit, as before, so large
+  or slow uploads, downloads and the dashboard's live streams are not cut off.
 
 ## [5.0.8] - 2026-11-06
 ### Added
