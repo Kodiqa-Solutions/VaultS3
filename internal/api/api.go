@@ -31,6 +31,8 @@ import (
 
 // APIHandler serves the dashboard REST API at /api/v1/.
 type APIHandler struct {
+	streamsDone        chan struct{} // closed by CloseStreams on shutdown, ends live streams
+	streamsOnce        sync.Once
 	allowPrivateLambda bool
 	store              metadata.StoreAPI
 	engine             storage.Engine
@@ -157,10 +159,11 @@ func (h *APIHandler) SetClusterInfo(selfID string, nodeAddrs func() map[string]s
 
 func NewAPIHandler(store metadata.StoreAPI, engine storage.Engine, mc *metrics.Collector, cfg *config.Config, activity *ActivityLog) *APIHandler {
 	return &APIHandler{
-		store:   store,
-		engine:  engine,
-		metrics: mc,
-		cfg:     cfg,
+		streamsDone: make(chan struct{}),
+		store:       store,
+		engine:      engine,
+		metrics:     mc,
+		cfg:         cfg,
 		// A random key until the server installs the persisted one. Signing with
 		// an ephemeral key means a bug that loses the real one costs everyone
 		// their session, which is recoverable; signing with a derived one meant

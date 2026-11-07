@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -1519,6 +1520,10 @@ func (s *Server) Run() error {
 	handler = middleware.PanicRecovery(handler)
 
 	httpServer := newHTTPServer(addr, handler)
+	// Live streams only end when their client leaves, so end them as soon as
+	// shutdown starts, or one open stream holds the restart for the whole
+	// shutdown timeout.
+	httpServer.RegisterOnShutdown(apiHandler.CloseStreams)
 
 	// Log startup info
 	scheme := "http"
@@ -1777,6 +1782,7 @@ func (s *Server) Run() error {
 		chandler = trustedProxies(s.cfg.Server.TrustedProxies, chandler)
 		chandler = middleware.PanicRecovery(chandler)
 		consoleServer = newHTTPServer(consoleAddr, chandler)
+		consoleServer.RegisterOnShutdown(apiHandler.CloseStreams)
 		go func() {
 			slog.Info("console (dashboard) listener started", "addr", consoleAddr)
 			var err error
@@ -1819,15 +1825,34 @@ func (s *Server) Run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	// The listeners drain side by side, so a slow one cannot spend the time
+	// the others need. A listener still busy at the deadline has its
+	// remaining connections closed, so the process always stops.
+	var wg sync.WaitGroup
+	drain := func(name string, srv *http.Server, errOut *error) {
+		defer wg.Done()
+		if err := srv.Shutdown(ctx); err != nil {
+			slog.Error("graceful shutdown timed out, closing the remaining connections", "listener", name, "timeout", timeout, "error", err)
+			_ = srv.Close()
+			if errOut != nil {
+				*errOut = err
+			}
+		}
+	}
+	var mainErr error
+	wg.Add(1)
+	go drain("s3", httpServer, &mainErr)
 	if interNodeServer != nil {
-		interNodeServer.Shutdown(ctx)
+		wg.Add(1)
+		go drain("inter-node", interNodeServer, nil)
 	}
 	if consoleServer != nil {
-		consoleServer.Shutdown(ctx)
+		wg.Add(1)
+		go drain("console", consoleServer, nil)
 	}
-	if err := httpServer.Shutdown(ctx); err != nil {
-		slog.Error("graceful shutdown timed out", "timeout", timeout, "error", err)
-		return err
+	wg.Wait()
+	if mainErr != nil {
+		return mainErr
 	}
 
 	slog.Info("server stopped gracefully")

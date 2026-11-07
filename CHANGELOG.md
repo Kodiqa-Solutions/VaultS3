@@ -5,6 +5,19 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+### Fixed
+- **A restart no longer hangs for 30 seconds when a live stream is open.** The
+  log, event and trace streams (`/api/v1/logs`, `/api/v1/events`,
+  `/api/v1/trace`) ended only when their client left, and a graceful shutdown
+  waits for every open request, so one open stream held `docker stop` for the
+  whole shutdown timeout and the server then exited with an error. Streams now
+  end as soon as shutdown starts, while uploads and downloads in flight are
+  still allowed to finish. The streams also send their headers as soon as
+  they open, instead of only when the first event arrives. If a listener is
+  still busy at the shutdown timeout, its remaining connections are now
+  closed, and the S3, console and inter-node listeners drain at the same time
+  instead of one after another.
+
 ### Security
 - **Connections that send their headers too slowly are now closed.** The S3
   and dashboard listener, the separate console listener and the inter-node

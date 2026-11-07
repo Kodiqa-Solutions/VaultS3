@@ -181,3 +181,22 @@ func TestEveryServerUsesNewHTTPServer(t *testing.T) {
 		}
 	}
 }
+
+// Live streams end only when told to. Both listeners that serve the console
+// API must end them as shutdown starts (see api.CloseStreams), or one open
+// stream holds a restart for the whole shutdown timeout. The behaviour itself
+// is tested in internal/api; this pins the wiring in Run.
+func TestBothAPIListenersEndStreamsOnShutdown(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"httpServer.RegisterOnShutdown(apiHandler.CloseStreams)",
+		"consoleServer.RegisterOnShutdown(apiHandler.CloseStreams)",
+	} {
+		if !strings.Contains(string(src), want) {
+			t.Errorf("server.go no longer calls %s", want)
+		}
+	}
+}
