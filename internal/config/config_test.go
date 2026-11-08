@@ -270,3 +270,37 @@ func TestRateLimitCanBeTurnedOffExplicitly(t *testing.T) {
 		t.Fatal("an explicit rate_limit.enabled: false was overridden by the default")
 	}
 }
+
+func TestAllowPrivateMigrationSourcesEnvOverride(t *testing.T) {
+	if (&Config{}).Migration.AllowPrivateSources {
+		t.Fatal("private migration sources must be off by default")
+	}
+	for v, want := range map[string]bool{"true": true, "1": true, "false": false, "no": false} {
+		t.Setenv("VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES", v)
+		cfg := &Config{}
+		applyEnvOverrides(cfg)
+		if cfg.Migration.AllowPrivateSources != want {
+			t.Errorf("VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES=%s: %v, want %v", v, cfg.Migration.AllowPrivateSources, want)
+		}
+	}
+	t.Setenv("VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES", "")
+	if Defaults().Migration.AllowPrivateSources {
+		t.Fatal("Defaults() allows private migration sources")
+	}
+}
+
+// The documented YAML key is the one read (fourth review: renaming it passed).
+func TestAllowPrivateMigrationSourcesYAMLKey(t *testing.T) {
+	t.Setenv("VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES", "")
+	path := filepath.Join(t.TempDir(), "vaults3.yaml")
+	if err := os.WriteFile(path, []byte("migration:\n  allow_private_sources: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Migration.AllowPrivateSources {
+		t.Fatal("migration.allow_private_sources: true in the config file was not applied")
+	}
+}

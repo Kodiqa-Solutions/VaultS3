@@ -293,6 +293,17 @@ external_auth:
   # (env: VAULTS3_EXTERNAL_AUTH_TOKEN, prefer that over writing it here)
   token: ""
 
+# "Migrate from S3" in the dashboard (Migrate page).
+migration:
+  # The source is a URL typed into the dashboard, so by default it may not be
+  # at a loopback or private address: otherwise an admin session could point
+  # the server at anything on the internal network. Turn this on to migrate
+  # from a source on your own network, such as a MinIO on the same Docker
+  # network, the LAN or localhost. Link-local addresses, where the cloud
+  # metadata service lives, are refused either way.
+  # (env: VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES=true)
+  allow_private_sources: false
+
 lambda:
   enabled: false
   # Function URLs that resolve to private, loopback or link-local addresses are

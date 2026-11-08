@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -42,6 +43,12 @@ func (h *APIHandler) handleMigrateTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	buckets, err := h.migrator.TestConnection(req.toConfig())
+	if errors.Is(err, migrate.ErrPrivateSource) {
+		// Says only that the address is private and how to allow it, never
+		// what answered there.
+		writeError(w, http.StatusBadRequest, migrate.ErrPrivateSource.Error())
+		return
+	}
 	if err != nil {
 		// Do not reflect the source's response or the connection error: it used
 		// to return up to 4 KiB of whatever an internal service replied with,
@@ -70,8 +77,19 @@ func (h *APIHandler) handleMigrateStart(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	id, err := h.migrator.Start(req.toConfig())
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "could not start migration: "+err.Error())
+	var reqErr *migrate.RequestError
+	switch {
+	case errors.Is(err, migrate.ErrPrivateSource):
+		writeError(w, http.StatusBadRequest, migrate.ErrPrivateSource.Error())
+		return
+	case errors.As(err, &reqErr):
+		writeError(w, http.StatusBadRequest, reqErr.Msg)
+		return
+	case err != nil:
+		// Not the error itself: it can quote the source's reply or tell a
+		// closed port from a filtered one (security assessment finding 6).
+		slog.Warn("migration start failed", "error", err)
+		writeError(w, http.StatusBadGateway, "could not start migration: "+migrate.PublicSourceError(err))
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"jobId": id})

@@ -39,6 +39,7 @@ type Config struct {
 	AutoUpdate    AutoUpdateConfig    `yaml:"auto_update"`
 	Metrics       MetricsConfig       `yaml:"metrics"`
 	ExternalAuth  ExternalAuthConfig  `yaml:"external_auth"`
+	Migration     MigrationConfig     `yaml:"migration"`
 	Debug         bool                `yaml:"debug"`
 }
 
@@ -420,6 +421,18 @@ type AuthConfig struct {
 	OverrideStoredCredentials bool `yaml:"override_stored_credentials"`
 }
 
+// MigrationConfig governs the "Migrate from S3" import.
+type MigrationConfig struct {
+	// AllowPrivateSources lets a migration read from a source at a loopback or
+	// private address (a MinIO on the same Docker network, the LAN,
+	// localhost). Off by default: the source is a URL typed into the dashboard,
+	// so without this an admin session could point the server at anything on
+	// the internal network. Link-local addresses, where the cloud metadata
+	// service lives, stay refused either way.
+	// (env: VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES)
+	AllowPrivateSources bool `yaml:"allow_private_sources"`
+}
+
 // ExternalAuthConfig delegates the access decision to an HTTP endpoint the
 // operator runs. Off by default. See internal/iam/external.go for the semantics
 // and for why this URL is not run through the notification SSRF validator.
@@ -713,6 +726,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("VAULTS3_ALLOW_PRIVATE_WEBHOOKS"); v != "" {
 		cfg.Notifications.AllowPrivateWebhooks = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES"); v != "" {
+		cfg.Migration.AllowPrivateSources = v == "true" || v == "1"
 	}
 	if v := os.Getenv("VAULTS3_ADMIN_CREDENTIALS_OVERRIDE"); v != "" {
 		cfg.Auth.OverrideStoredCredentials = v == "true" || v == "1"

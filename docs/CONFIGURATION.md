@@ -268,6 +268,27 @@ broken endpoint cannot lock you out. Set the URL with
 Full guide, including the two modes and what this costs on the request path:
 [Access control](ACCESS-CONTROL.md#external-authorization-webhook).
 
+## Migrating From Another S3 Server
+
+The dashboard's Migrate page imports buckets from MinIO, SeaweedFS, Garage,
+Ceph, AWS S3, R2, Wasabi, B2 or any S3-compatible source. The source is a URL
+typed into the dashboard, so by default it may not be at a loopback or private
+address: otherwise an admin session could make the server reach anything on the
+internal network. To migrate from a source on your own network (a MinIO on the
+same Docker network, the LAN, localhost), allow it:
+
+```yaml
+migration:
+  allow_private_sources: true   # default false; env: VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES=true
+```
+
+"Private" includes carrier-grade NAT space (100.64.0.0/10), so a source
+reached over Tailscale needs the setting too. The cloud metadata services
+(link-local addresses, and Alibaba Cloud's 100.100.100.200) stay refused
+either way. Without the setting, a private source is refused with a message
+that names it. Turn it off again once the migration is done if untrusted
+people can sign in to the dashboard as admin.
+
 ## Rate Limiting
 
 Token bucket rate limiting is **on by default**, because an unauthenticated request is rate limited before it is authenticated, so the limiter is the only thing bounding what a flood costs the server:

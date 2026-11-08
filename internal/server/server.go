@@ -1204,7 +1204,7 @@ func (s *Server) Run() error {
 	if LogBroadcaster != nil {
 		apiHandler.SetLogBroadcaster(LogBroadcaster)
 	}
-	apiHandler.SetMigrator(migrate.NewManager(s.metaStore, s.engine))
+	apiHandler.SetMigrator(newMigrator(s.cfg, s.metaStore, s.engine))
 	apiHandler.SetSnapshotManager(snapshot.NewManager(s.metaStore))
 	// Per-bucket encryption controls (enable/rotate/shred) for the dashboard share
 	// the SAME manager as the engine, so a shred evicts the live key cache too.
@@ -1978,4 +1978,17 @@ func (s *Server) Close() {
 	if s.store != nil {
 		s.store.Close()
 	}
+}
+
+// newMigrator builds the "Migrate from S3" manager with the operator's choice
+// on private sources. Without this a source on the operator's own network (a
+// MinIO on the same Docker network, the LAN, localhost) was refused on every
+// server, since nothing ever turned the allowance on.
+func newMigrator(cfg *config.Config, store metadata.StoreAPI, engine storage.Engine) *migrate.Manager {
+	m := migrate.NewManager(store, engine)
+	if cfg.Migration.AllowPrivateSources {
+		m.AllowPrivateSources(true)
+		slog.Info("migration: sources at loopback and private addresses are allowed (migration.allow_private_sources)")
+	}
+	return m
 }

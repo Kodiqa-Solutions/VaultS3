@@ -2,14 +2,18 @@ package migrate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
@@ -114,8 +118,9 @@ type StartConfig struct {
 	Concurrency int
 }
 
-// AllowPrivateSources lets this manager migrate from loopback, private and
-// link-local addresses. Off by default: a caller-supplied endpoint is otherwise
+// AllowPrivateSources lets this manager migrate from loopback and private
+// addresses (link-local ones, where the metadata service lives, stay
+// refused). Off by default: a caller-supplied endpoint is otherwise
 // a server-side request primitive pointed at the internal network and the cloud
 // metadata service (security assessment finding 6). Operators migrating from a
 // source on their own network turn it on deliberately.
@@ -139,7 +144,7 @@ func (m *Manager) TestConnection(cfg StartConfig) ([]string, error) {
 // Start validates the source then launches an async migration; returns the job ID.
 func (m *Manager) Start(cfg StartConfig) (string, error) {
 	if err := ValidateEndpoint(cfg.Endpoint); err != nil {
-		return "", err
+		return "", &RequestError{Msg: err.Error()}
 	}
 	src := m.newSource(cfg, 300)
 
@@ -152,7 +157,7 @@ func (m *Manager) Start(cfg StartConfig) (string, error) {
 		buckets = all
 	}
 	if len(buckets) == 0 {
-		return "", fmt.Errorf("no buckets to migrate")
+		return "", &RequestError{Msg: "no buckets to migrate"}
 	}
 
 	m.mu.Lock()
@@ -161,7 +166,7 @@ func (m *Manager) Start(cfg StartConfig) (string, error) {
 	for _, j := range m.jobs {
 		if j.Status == "running" && j.Endpoint == cfg.Endpoint && sameBucketSet(j.Buckets, buckets) {
 			m.mu.Unlock()
-			return "", fmt.Errorf("a migration from this source for these buckets is already running")
+			return "", &RequestError{Msg: "a migration from this source for these buckets is already running"}
 		}
 	}
 	m.seq++
@@ -272,7 +277,8 @@ func (m *Manager) run(ctx context.Context, src *Source, job *Job, concurrency in
 				return e
 			})
 			if err != nil {
-				m.setError(job, fmt.Sprintf("list %s: %v", bucket, err))
+				slog.Warn("migrate: listing the source failed", "bucket", bucket, "error", err)
+				m.setError(job, fmt.Sprintf("list %s: %s", bucket, PublicSourceError(err)))
 				return
 			}
 			m.bump(job, func(j *Job) { j.Total += len(objs) })
@@ -352,6 +358,12 @@ func (m *Manager) alreadyMigrated(bucket string, o ObjectInfo) bool {
 func (m *Manager) migrateBucketMeta(src *Source, bucket string, job *Job) {
 	if policy, err := src.GetBucketPolicy(bucket); err != nil {
 		slog.Warn("migrate: bucket policy fetch failed", "bucket", bucket, "error", err)
+	} else if len(policy) > 0 && !isBucketPolicy(policy) {
+		// Kept out of the store: whatever answered 200 at ?policy would
+		// otherwise be stored as the policy and read back through
+		// GetBucketPolicy, which with private sources allowed reads any
+		// internal HTTP service.
+		slog.Warn("migrate: source bucket policy is not a policy document, not copied", "bucket", bucket, "bytes", len(policy))
 	} else if len(policy) > 0 {
 		if err := m.store.PutBucketPolicy(bucket, policy); err != nil {
 			slog.Warn("migrate: apply bucket policy failed", "bucket", bucket, "error", err)
@@ -504,4 +516,48 @@ func unsafeKey(key string) string {
 		return "key names an internal storage directory"
 	}
 	return ""
+}
+
+// RequestError refuses the migration request itself (a bad endpoint, nothing
+// to migrate, a duplicate), not anything the source said, so it can be shown
+// as it is.
+type RequestError struct{ Msg string }
+
+func (e *RequestError) Error() string { return e.Msg }
+
+// PublicSourceError is what the dashboard is told about a failure talking to
+// the source. Only a private-address refusal or a refused key: the error
+// itself can quote the source's reply (an XML parse error quotes its tokens)
+// or tell "connection refused" from a timeout, and with private sources
+// allowed either one reads or maps the internal network (security assessment
+// finding 6). The detail goes to the server log.
+func PublicSourceError(err error) string {
+	if errors.Is(err, ErrPrivateSource) {
+		return ErrPrivateSource.Error()
+	}
+	// Only an S3 server refusing the credentials is told apart, which is what
+	// an operator needs to fix; any other answer, a 401 from some other
+	// service included, looks like no answer, so the start cannot tell which
+	// internal ports run an HTTP service.
+	var he *httpError
+	if errors.As(err, &he) && (he.StatusCode == http.StatusUnauthorized || he.StatusCode == http.StatusForbidden) &&
+		(he.S3Code == "InvalidAccessKeyId" || he.S3Code == "SignatureDoesNotMatch" || he.S3Code == "AccessDenied") {
+		return "the source refused the access key or secret (HTTP " + strconv.Itoa(he.StatusCode) + ")"
+	}
+	return "could not connect to the source or read its reply; the server log has the details"
+}
+
+// isBucketPolicy reports whether a reply is a policy document: at least one
+// statement, each with an Allow or Deny effect and an action.
+func isBucketPolicy(b []byte) bool {
+	var p iam.Policy
+	if err := json.Unmarshal(b, &p); err != nil || len(p.Statement) == 0 {
+		return false
+	}
+	for _, st := range p.Statement {
+		if (st.Effect != "Allow" && st.Effect != "Deny") || (len(st.Action) == 0 && len(st.NotAction) == 0) {
+			return false
+		}
+	}
+	return true
 }

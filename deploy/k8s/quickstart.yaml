@@ -64,6 +64,9 @@ data:
       cache_ttl_secs: 10
       authoritative: false
       fail_open: false
+    # Set true to migrate from a source inside the cluster (a MinIO service).
+    migration:
+      allow_private_sources: false
 ---
 apiVersion: v1
 kind: Service

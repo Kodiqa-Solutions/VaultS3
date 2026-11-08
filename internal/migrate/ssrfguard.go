@@ -2,11 +2,14 @@ package migrate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
 	"syscall"
+
+	"github.com/Kodiqa-Solutions/VaultS3/internal/netguard"
 )
 
 // SSRF guard for the migration source (security assessment finding 6).
@@ -41,48 +44,81 @@ func ValidateEndpoint(endpoint string) error {
 	return nil
 }
 
+// ErrPrivateSource is returned, wrapped, when a migration source resolves to a
+// loopback or private address while those are not allowed. It names the
+// setting that allows them, so the operator learns why and what to change; it
+// says nothing about what is at the address.
+var ErrPrivateSource = errors.New("the source is at a loopback or private address, which migration refuses by default; " +
+	"to migrate from a source on your own network set migration.allow_private_sources: true " +
+	"(env VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES=true)")
+
 // guardedControl refuses a connection to an address the server should never be
 // made to reach on a caller's behalf.
 func guardedControl(network, address string, _ syscall.RawConn) error {
-	host, _, err := net.SplitHostPort(address)
+	ip, err := dialIP(address)
 	if err != nil {
-		return fmt.Errorf("blocked destination %q", address)
+		return err
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return fmt.Errorf("blocked destination %q", address)
+	if neverAllowedIP(ip) {
+		return fmt.Errorf("blocked destination %s: link-local, cloud metadata, unspecified and multicast addresses are never migration sources", ip)
 	}
 	if blockedIP(ip) {
-		return fmt.Errorf("blocked destination %s: loopback, private, link-local and metadata addresses are not allowed as migration sources", ip)
+		return fmt.Errorf("blocked destination %s: %w", ip, ErrPrivateSource)
 	}
 	return nil
 }
 
-// blockedIP reports whether an address is off limits for a caller-supplied
-// destination.
-func blockedIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
-		return true
+// privateAllowedControl is the dial check once an operator has allowed
+// sources on their own network: loopback and private addresses connect, but
+// the cloud metadata service and the other addresses no S3 server is reached
+// at stay refused, so allowing a LAN does not also open instance credentials.
+func privateAllowedControl(network, address string, _ syscall.RawConn) error {
+	ip, err := dialIP(address)
+	if err != nil {
+		return err
 	}
-	// The cloud metadata services, which are link-local and therefore already
-	// covered, named here so the intent survives a refactor.
-	if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00:ec2::254")) {
-		return true
+	if neverAllowedIP(ip) {
+		return fmt.Errorf("blocked destination %s: link-local, cloud metadata, unspecified and multicast addresses are never migration sources", ip)
 	}
-	// IPv4-mapped IPv6 hides a loopback or private address behind ::ffff:.
-	if v4 := ip.To4(); v4 != nil && !ip.Equal(v4) {
-		return blockedIP(v4)
-	}
-	return false
+	return nil
 }
+
+// dialIP is the IP a dial is about to connect to.
+func dialIP(address string) (net.IP, error) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("blocked destination %q", address)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("blocked destination %q", address)
+	}
+	return ip, nil
+}
+
+// neverAllowedIP reports an address that is refused even when private sources
+// are allowed: the cloud metadata services (link-local, Alibaba's
+// 100.100.100.200, the private IPv6 fd00:ec2::254, and any of them carried in
+// a NAT64 or 6to4 address), other link-local addresses, unspecified and
+// multicast.
+func neverAllowedIP(ip net.IP) bool {
+	return netguard.Metadata(ip) || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() ||
+		ip.IsMulticast() || ip.IsInterfaceLocalMulticast()
+}
+
+// blockedIP reports whether an address is off limits for a caller-supplied
+// destination. It is the shared guard: a copy of its own here had drifted and
+// let a migration reach carrier-grade NAT space, Alibaba Cloud's metadata
+// service among it.
+func blockedIP(ip net.IP) bool { return netguard.Blocked(ip) }
 
 // dialContextGuarded is the dialer the migration client uses. allowPrivate
 // lifts the restriction for an operator migrating from a source on their own
 // network, which is a legitimate deployment and cannot be done otherwise.
 func dialContextGuarded(d *net.Dialer, allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	if !allowPrivate {
-		d.Control = guardedControl
+	d.Control = guardedControl
+	if allowPrivate {
+		d.Control = privateAllowedControl
 	}
 	return d.DialContext
 }

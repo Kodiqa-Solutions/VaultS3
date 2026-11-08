@@ -6,6 +6,47 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.10] - 2026-11-08
+### Fixed
+- **Migrating from a MinIO (or any S3 server) on your own network works
+  again.** Since 4.4.56 a migration source at a loopback or private address
+  (the same Docker network, the LAN, localhost) was always refused, because the
+  setting meant to allow it was never wired up, and the dashboard said only
+  "could not connect". The new `migration.allow_private_sources` setting (env
+  `VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES=true`, off by default) allows such a
+  source, and without it the refusal now names the setting. Link-local
+  addresses, where the cloud metadata service lives, stay refused either way.
+
+### Security
+- **A failed migration no longer shows what the source replied.** Starting a
+  migration, and the job list, carried up to 4 KiB of the source's error reply
+  back to the dashboard, quoted a reply that did not parse, and told a closed
+  port from an open one, which with private sources allowed would read or map
+  the internal network. The dashboard now says only whether an S3 server
+  refused the access key (an S3 error document saying so), or gives a generic
+  message, and the detail goes to the server log. A redirect from the source is no longer followed, so a
+  source cannot send the server to another address and have what answers
+  there stored as an object, and a bucket policy is copied only when the
+  source returns a policy document, so whatever answers at `?policy` is not
+  stored and read back, and replies must carry the S3 root element, so a
+  service that merely answers XML is a failed source like any other. How long
+  a failed job takes still differs: a closed port, a 5xx and a reply that does
+  not parse are retried, a 4xx is not. The refusal of a private source tells
+  an admin that a name resolves to a private address, which is the price of a
+  message that names the setting.
+- **Migration sources in carrier-grade NAT space are refused.** The migration
+  kept its own copy of the address check, which had drifted from the shared
+  one and let a source at 100.64.0.0/10, Alibaba Cloud's metadata service at
+  100.100.100.200 among it, through. It now uses the shared check, which also
+  refuses NAT64, 6to4 and IPv4-compatible IPv6 addresses that carry an
+  internal IPv4 address, and site-local IPv6 (fec0::/10), and Alibaba's
+  metadata address stays refused even with private sources allowed. Lambda
+  function URLs and notification webhooks use the same check and get the same
+  refusals; with `lambda.allow_private_endpoints` or
+  `notifications.allow_private_webhooks` on, they now also refuse Alibaba's
+  metadata address and metadata addresses carried in NAT64, 6to4 or
+  IPv4-compatible form.
+
 ## [5.0.9] - 2026-11-08
 ### Security
 - **Every `x-amz-*` header of a signed request must now be signed, as AWS
@@ -3609,7 +3650,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.9...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.10...HEAD
+[5.0.10]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.9...v5.0.10
 [5.0.9]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.8...v5.0.9
 [5.0.8]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.7...v5.0.8
 [5.0.7]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.6...v5.0.7

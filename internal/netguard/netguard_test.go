@@ -15,6 +15,11 @@ func TestBlocked(t *testing.T) {
 		"127.0.0.1": true, "10.1.2.3": true, "192.168.0.1": true, "172.16.5.4": true, "169.254.169.254": true,
 		"100.64.0.1": true, "::1": true, "fd00::1": true, "::ffff:127.0.0.1": true, "0.0.0.0": true,
 		"8.8.8.8": false, "203.0.113.5": false, "2001:4860:4860::8888": false,
+		// An IPv4 address carried in IPv6 is judged as that address.
+		"64:ff9b::7f00:1": true, "64:ff9b::a00:5": true, "64:ff9b::808:808": false,
+		"2002:a00:1::1": true, "2002:808:808::1": false,
+		"::127.0.0.1": true, "::10.0.0.1": true, "::8.8.8.8": false,
+		"fec0::1": true, "100.100.100.200": true,
 	} {
 		if got := Blocked(net.ParseIP(addr)); got != want {
 			t.Errorf("Blocked(%s) = %v, want %v", addr, got, want)
@@ -50,7 +55,9 @@ func TestAllowPrivateStillRefusesMetadata(t *testing.T) {
 			t.Errorf("dial %s with allowPrivate: %v, want a metadata refusal", addr, err)
 		}
 	}
-	for addr, want := range map[string]bool{"169.254.1.1": true, "10.0.0.1": false, "127.0.0.1": false, "8.8.8.8": false} {
+	for addr, want := range map[string]bool{"169.254.1.1": true, "10.0.0.1": false, "127.0.0.1": false, "8.8.8.8": false,
+		"100.100.100.200": true, "64:ff9b::a9fe:a9fe": true, "2002:a9fe:a9fe::1": true, "::169.254.169.254": true,
+		"100.64.0.1": false} {
 		if got := Metadata(net.ParseIP(addr)); got != want {
 			t.Errorf("Metadata(%s) = %v, want %v", addr, got, want)
 		}

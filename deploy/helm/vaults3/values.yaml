@@ -95,6 +95,10 @@ config: |
     cache_ttl_secs: 10
     authoritative: false
     fail_open: false
+  # "Migrate from S3": allow a source at a private address, such as a MinIO
+  # service in the same cluster. Off by default. Cloud metadata stays refused.
+  migration:
+    allow_private_sources: false
 
 # Buckets created on startup if they are missing, so the release needs no init
 # container or S3 client to get its first bucket. Existing buckets are left

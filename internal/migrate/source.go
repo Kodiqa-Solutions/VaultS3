@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -77,6 +78,12 @@ func newSource(endpoint, accessKey, secretKey, region string, timeoutSecs int, a
 				ExpectContinueTimeout: 5 * time.Second,
 				IdleConnTimeout:       90 * time.Second,
 			},
+			// A redirect is not followed: it would let a source hand the server
+			// any other address, internal ones included once private sources are
+			// allowed, and store what answers there as an object. An S3 server
+			// answers path-style requests without redirecting, so a 3xx is
+			// reported as an error like any other non-200.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
 }
@@ -104,7 +111,10 @@ type ObjectData struct {
 	ContentLanguage    string
 }
 
+// The XMLName fields require the S3 root element, so a 200 that is merely
+// well-formed XML (any other service) does not parse as an empty reply.
 type listAllMyBucketsResult struct {
+	XMLName xml.Name `xml:"ListAllMyBucketsResult"`
 	Buckets struct {
 		Bucket []struct {
 			Name string `xml:"Name"`
@@ -133,8 +143,9 @@ func (s *Source) ListBuckets() ([]string, error) {
 }
 
 type listBucketResult struct {
-	IsTruncated           bool   `xml:"IsTruncated"`
-	NextContinuationToken string `xml:"NextContinuationToken"`
+	XMLName               xml.Name `xml:"ListBucketResult"`
+	IsTruncated           bool     `xml:"IsTruncated"`
+	NextContinuationToken string   `xml:"NextContinuationToken"`
 	Contents              []struct {
 		Key          string `xml:"Key"`
 		Size         int64  `xml:"Size"`
@@ -196,8 +207,9 @@ func (s *Source) GetObject(bucket, key string) (*ObjectData, error) {
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		slog.Warn("migrate: source GET failed", "bucket", bucket, "key", key, "status", resp.StatusCode, "body", string(raw))
 		return nil, &httpError{StatusCode: resp.StatusCode,
-			msg: fmt.Sprintf("source GET %s/%s returned %d: %s", bucket, key, resp.StatusCode, string(raw))}
+			msg: fmt.Sprintf("source GET %s/%s returned %d", bucket, key, resp.StatusCode)}
 	}
 
 	var lm int64
@@ -260,7 +272,8 @@ func (s *Source) GetBucketPolicy(bucket string) ([]byte, error) {
 }
 
 type sourceTagging struct {
-	TagSet struct {
+	XMLName xml.Name `xml:"Tagging"`
+	TagSet  struct {
 		Tags []struct {
 			Key   string `xml:"Key"`
 			Value string `xml:"Value"`
@@ -298,7 +311,22 @@ func (s *Source) GetBucketTagging(bucket string) (map[string]string, error) {
 // failures (5xx, 429, and network errors) from permanent ones (4xx).
 type httpError struct {
 	StatusCode int
-	msg        string
+	// S3Code is the Code of an S3 <Error> reply, empty for any other body.
+	S3Code string
+	msg    string
+}
+
+// s3ErrorCode is the Code of an S3 <Error> document, or "" when the body is
+// not one.
+func s3ErrorCode(body []byte) string {
+	var e struct {
+		XMLName xml.Name `xml:"Error"`
+		Code    string   `xml:"Code"`
+	}
+	if xml.Unmarshal(body, &e) != nil {
+		return ""
+	}
+	return e.Code
 }
 
 func (e *httpError) Error() string { return e.msg }
@@ -320,10 +348,16 @@ func (s *Source) get(rawURL string) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		// The reply goes to the log only. This error reaches the dashboard (the
+		// start request and the job list), and carrying the reply there made a
+		// migration a way to read whatever a service on the network answers,
+		// which matters once private sources are allowed (security assessment
+		// finding 6).
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, &httpError{StatusCode: resp.StatusCode,
-			msg: fmt.Sprintf("source request to %s returned %d: %s", rawURL, resp.StatusCode, string(raw))}
+		slog.Warn("migrate: source request failed", "url", rawURL, "status", resp.StatusCode, "body", string(raw))
+		return nil, &httpError{StatusCode: resp.StatusCode, S3Code: s3ErrorCode(raw),
+			msg: fmt.Sprintf("source request to %s returned %d", rawURL, resp.StatusCode)}
 	}
 	return resp.Body, nil
 }

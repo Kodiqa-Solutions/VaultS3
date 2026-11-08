@@ -63,6 +63,37 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.10
+
+Nothing to migrate. The changes are all in the dashboard's Migrate page, and in
+which addresses notification webhooks and Lambda function URLs may reach.
+
+To import buckets from a MinIO or other S3 server on your own network (the same
+Docker network, the LAN, localhost), set `migration.allow_private_sources: true`
+or `VAULTS3_ALLOW_PRIVATE_MIGRATION_SOURCES=true`. Earlier versions refused such
+a source with "could not connect" and had no way to allow it.
+
+What changes without the setting:
+
+- A migration source in carrier-grade NAT space (100.64.0.0/10) is now refused
+  like any other private address. That includes a source reached over
+  Tailscale, which earlier versions allowed: set the setting above to keep
+  migrating from it. NAT64, 6to4 and IPv4-compatible IPv6 addresses that carry
+  an internal IPv4 address, and site-local IPv6 (fec0::/10), are refused too,
+  for migration sources, webhooks and Lambda function URLs.
+- Webhooks and Lambda function URLs allowed to reach private addresses
+  (`notifications.allow_private_webhooks`, `lambda.allow_private_endpoints`)
+  now also refuse Alibaba Cloud's metadata address (100.100.100.200) and
+  metadata addresses written in NAT64, 6to4 or IPv4-compatible form.
+- A migration source that answers with a redirect is no longer followed. No S3
+  server answers path-style requests with a redirect, but an `http://` endpoint
+  behind a proxy that redirects to `https://` now fails: use the `https://`
+  endpoint.
+- A failed migration says only whether the S3 source refused the access key,
+  or gives a generic message. The source's reply is in the server log.
+- A bucket policy copied from the source is kept only if it is a policy
+  document.
+
 ## Upgrading to 5.0.9
 
 Nothing to migrate, and rolling back to 5.0.8 is safe: 5.0.8 reads objects
