@@ -11,11 +11,15 @@ the `/health` / `/ready` probe endpoints.
 ## Install
 
 ```bash
-# From a local checkout of the repo:
-helm install vaults3 ./deploy/helm/vaults3 \
+helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3 \
   --namespace vaults3 --create-namespace \
   --set auth.secretKey="$(openssl rand -hex 20)"
 ```
+
+The chart is published to GitHub Container Registry with every release; add
+`--version <chart version>` to pin one (`helm show chart oci://ghcr.io/kodiqa-solutions/charts/vaults3`
+prints the latest). From a checkout of the repository, `./deploy/helm/vaults3`
+works in its place.
 
 Get the admin credentials and reach the dashboard:
 
@@ -67,7 +71,7 @@ VaultS3 features (encryption, compression, replication, erasure coding, tiering,
 etc.) are driven by `vaults3.yaml`. Override the `config` value with your own:
 
 ```bash
-helm install vaults3 ./deploy/helm/vaults3 -n vaults3 --create-namespace \
+helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3 -n vaults3 --create-namespace \
   --set-file config=./my-vaults3.yaml \
   --set auth.secretKey="$(openssl rand -hex 20)"
 ```
@@ -84,7 +88,7 @@ steps. Raft state lives on the metadata PVC, and a node re-joins automatically
 after a restart (its identity is the StatefulSet DNS name, not its pod IP).
 
 ```bash
-helm install vaults3 ./deploy/helm/vaults3 -n vaults3 --create-namespace \
+helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3 -n vaults3 --create-namespace \
   --set cluster.enabled=true --set replicaCount=3 \
   --set auth.secretKey="$(openssl rand -hex 20)"
 
@@ -174,7 +178,7 @@ BoltDB file on `/metadata`, and they reference each other.
 **Deployment mode** and point the chart at the restored claims:
 
 ```bash
-helm install vaults3 ./deploy/helm/vaults3 -n vaults3 \
+helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3 -n vaults3 \
   --set controller.kind=Deployment \
   --set persistence.data.existingClaim=restored-data \
   --set persistence.metadata.existingClaim=restored-metadata \

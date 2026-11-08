@@ -180,8 +180,8 @@ Deploy with the bundled **Helm chart** or a single **plain-manifest** quickstart
 (both under [`deploy/`](../deploy/)):
 
 ```bash
-# Helm (configurable, production-grade)
-helm install vaults3 ./deploy/helm/vaults3 \
+# Helm (configurable, production-grade), published with every release
+helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3 \
   --namespace vaults3 --create-namespace \
   --set auth.secretKey="$(openssl rand -hex 20)" \
   --set defaultBuckets="{app-data,backups}"

@@ -9,12 +9,14 @@
 ## Helm (recommended)
 
 ```bash
-helm install vaults3 ./helm/vaults3 \
+helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3 \
   --namespace vaults3 --create-namespace \
   --set auth.secretKey="$(openssl rand -hex 20)"
 ```
 
-Full configuration reference: [`helm/vaults3/README.md`](./helm/vaults3/README.md).
+The chart is published to GitHub Container Registry with every release. From a
+checkout of the repository, `./helm/vaults3` works in its place. Full
+configuration reference: [`helm/vaults3/README.md`](./helm/vaults3/README.md).
 
 ## Plain manifests (no Helm)
 

@@ -129,7 +129,8 @@ sudo systemctl enable --now vaults3
 gh attestation verify vaults3_5.0.10_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
-Building from source is `make build`. Kubernetes is a Helm chart or a single
+Building from source is `make build`. Kubernetes is a Helm chart
+(`helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3`) or a single
 manifest. All of it, plus the disk layout to use in production, is in the
 **[installation guide](docs/INSTALL.md)**.
 
