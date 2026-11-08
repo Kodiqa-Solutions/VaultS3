@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 	"io"
 	"net/http"
 	"net/url"
@@ -284,7 +285,10 @@ func (h *APIHandler) ClusterObjectDeleteHandler(secret string) http.HandlerFunc 
 		}
 		bucket := r.URL.Query().Get("bucket")
 		key := r.URL.Query().Get("key")
-		if bucket != "" && key != "" && h.engine != nil {
+		// A key the server refuses names another object's file ("./doc" is
+		// doc), so its data is never deleted here: a delete of such a legacy
+		// record removes the record only, on every node.
+		if bucket != "" && key != "" && h.engine != nil && storage.KeyProblem(key) == "" {
 			// best-effort throughout; a missing file is the expected case on the
 			// nodes that never held this object
 			if version := r.URL.Query().Get("version"); version != "" {
@@ -326,7 +330,7 @@ func (h *APIHandler) ClusterObjectDeleteBatchHandler(secret string) http.Handler
 			return
 		}
 		for _, key := range req.Keys {
-			if key == "" {
+			if key == "" || storage.KeyProblem(key) != "" {
 				continue
 			}
 			_ = h.engine.DeleteObject(req.Bucket, key)

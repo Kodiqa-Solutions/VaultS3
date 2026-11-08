@@ -173,17 +173,26 @@ tiering:
   scan_interval_secs: 3600
 ```
 
-Objects not accessed for `migrate_after_days` are moved to the cold data directory. On read, cold objects are transparently served and promoted back to hot storage. Manual migration is available via API:
+> **Moving objects to the cold tier is disabled from 5.0.11.** Neither the S3 API
+> nor the dashboard reads from the cold directory, and objects are moved there
+> below the encryption and compression layers, so every object moved there could
+> not be read (NoSuchKey) until it was moved back. Until reads go through the
+> tier, the background scan does not run and the `cold` direction is refused.
+> Objects an earlier version moved there are brought back with RestoreObject or
+> the `hot` direction below.
 
 ```bash
 # Check tiering status (hot/cold counts and sizes)
 curl http://localhost:9000/api/v1/tiering/status -H "Authorization: Bearer <token>"
 
-# Manually migrate an object to cold tier
+# Move an object back from the cold tier
 curl -X POST http://localhost:9000/api/v1/tiering/migrate \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"bucket":"my-bucket","key":"archive/old-file.zip","direction":"cold"}'
+  -d '{"bucket":"my-bucket","key":"archive/old-file.zip","direction":"hot"}'
+
+# or, with any S3 client
+aws s3api restore-object --bucket my-bucket --key archive/old-file.zip --restore-request Days=1
 ```
 
 ## Backup Scheduler

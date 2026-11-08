@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -54,14 +56,8 @@ func validateObjectKey(key string) error {
 	if len(key) > 1024 {
 		return fmt.Errorf("object key must not exceed 1024 characters")
 	}
-	if strings.ContainsRune(key, 0) {
-		return fmt.Errorf("object key must not contain null bytes")
-	}
-	// Prevent path traversal
-	for _, segment := range strings.Split(key, "/") {
-		if segment == ".." {
-			return fmt.Errorf("object key must not contain '..' path segments")
-		}
+	if msg := storage.KeyProblem(key); msg != "" {
+		return fmt.Errorf("%s", strings.ToLower(msg[:1])+msg[1:])
 	}
 	return nil
 }

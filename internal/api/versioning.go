@@ -207,6 +207,14 @@ func (h *APIHandler) handleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	defer reader.Close()
 
+	// A rollback writes a new version, so it is held to the quota as an
+	// upload is. It never was.
+	limit, qerr := h.uploadQuota(req.Bucket, req.Key, "Enabled")
+	if qerr != nil || (limit >= 0 && size > limit) {
+		writeError(w, http.StatusForbidden, errUploadQuota.Error())
+		return
+	}
+
 	newVersionID := genVersionID()
 	written, etag, err := h.engine.PutObjectVersion(req.Bucket, req.Key, newVersionID, reader, size)
 	if err != nil {

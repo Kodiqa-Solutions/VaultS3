@@ -137,12 +137,19 @@ func (h *ObjectHandler) snowballEntryKey(r *http.Request, bucket string, hdr *ta
 	// "../victim/a.txt" overwrote another bucket's object. A refused entry is
 	// counted and skipped, and the rest of the archive goes on. Cleaning
 	// still turns "./a.txt", as `tar -C dir .` writes it, into "a.txt".
-	if msg := objectKeyProblem(hdr.Name); msg != "" {
-		return "", msg
+	for _, seg := range strings.Split(hdr.Name, "/") {
+		if seg == ".." {
+			return "", "Key must not contain '..' path segments"
+		}
 	}
 	key = path.Clean(hdr.Name)
 	if key == "." {
 		return "", ""
+	}
+	// The cleaned name is the key, so it is the one checked in full: checked
+	// raw, "./.vs/x" passed and was stored as .vs/x, in the version store.
+	if msg := objectKeyProblem(key); msg != "" {
+		return "", msg
 	}
 	// The request was authorized for the archive's own key. Every entry is a
 	// write to a key of its own, so each is authorized on that key.

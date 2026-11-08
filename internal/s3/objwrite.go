@@ -326,13 +326,29 @@ func (h *ObjectHandler) removeRejected(bucket, key, versionID string) {
 }
 
 // quotaByteLimit is how many bytes an upload to bucket may add before it takes
-// the bucket over its size quota, or -1 when nothing limits it. FIFO buckets
-// make room instead of refusing, so they have no limit here.
+// the bucket over its size quota, or -1 when nothing limits it.
 func (h *ObjectHandler) quotaByteLimit(bucket string) int64 {
 	info, err := h.store.GetBucket(bucket)
-	if err != nil || info.MaxSizeBytes == 0 || info.FIFOQuota {
+	if err != nil || info.MaxSizeBytes == 0 {
 		return -1
 	}
 	currentSize, _, _ := h.engine.BucketSize(bucket)
-	return info.MaxSizeBytes - currentSize
+	// A bucket already past its quota (the quota was lowered) has no room,
+	// not no limit: -1 means only "no quota". A negative remainder used to
+	// be read as no limit by every streaming check, so such a bucket took
+	// uploads of unknown length, form uploads and parts of any size.
+	return max(0, info.MaxSizeBytes-currentSize)
+}
+
+// quotaByteLimitFor is quotaByteLimit for a write to key, which gives back
+// the bytes on disk of the object it replaces (replacesObject).
+func (h *ObjectHandler) quotaByteLimitFor(bucket, key string) int64 {
+	limit := h.quotaByteLimit(bucket)
+	if limit < 0 {
+		return limit
+	}
+	if replaces, onDisk := h.replacesObject(bucket, key); replaces {
+		limit += onDisk
+	}
+	return limit
 }

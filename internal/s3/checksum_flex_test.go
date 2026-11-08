@@ -365,3 +365,20 @@ func TestAwsChunkedUploadWithoutDecodedLengthIsStored(t *testing.T) {
 		})
 	}
 }
+
+// Regression (5.0.11): the aws-chunked marker was removed by dropping the
+// whole Content-Encoding header, so an object sent as "gzip,aws-chunked" was
+// stored without its gzip encoding.
+func TestAwsChunkedKeepsTheObjectsOwnContentEncoding(t *testing.T) {
+	ts, _ := fullServer(t)
+	call(t, ts, http.MethodPut, "/enc", "").must(t, "bucket")
+	body := []byte("pretend this is gzip")
+	if r := trailerPut(t, ts, "/enc/k.gz", body, "", "", "Content-Encoding", "gzip,aws-chunked"); r.code != http.StatusOK {
+		t.Fatalf("PUT: %d %s", r.code, r.body)
+	}
+	req, _ := http.NewRequest(http.MethodHead, ts.URL+"/enc/k.gz", nil)
+	signV4Request(req, testAccessKey, testSecretKey, nil)
+	if r := send(t, req); r.header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("stored Content-Encoding %q, want gzip", r.header.Get("Content-Encoding"))
+	}
+}

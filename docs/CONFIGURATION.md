@@ -144,6 +144,14 @@ VaultS3 has three encryption modes. **Pick one.** They are server-wide settings
 and they do not combine: whichever is configured decides how every object on the
 server is sealed. A bucket cannot ask for a mode the server is not running.
 
+The same goes for a request: with encryption off (the default), an upload that
+asks for SSE-S3 (`x-amz-server-side-encryption: AES256`, as Terraform's S3
+backend with `encrypt = true` or `aws s3 cp --sse` send) is stored unencrypted.
+It is not refused, so such clients keep working, and the answer does not claim
+encryption: `x-amz-server-side-encryption` is returned only for a bucket that
+encrypts at rest (not on UploadPart, since parts are stored as sent until the
+upload completes). Turn encryption on below if objects must be.
+
 
 **SSE-S3 (Static Key)**, Simple setup with a hex-encoded 32-byte key:
 

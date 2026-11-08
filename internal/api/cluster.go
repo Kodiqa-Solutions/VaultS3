@@ -61,6 +61,15 @@ func (h *APIHandler) forwardUpload(ownerAddr, bucket, prefix, filename, contentT
 		return 0, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		// The owner refused the file (quota, object lock, policy): the
+		// caller's answer, not a server failure.
+		var res []uploadResult
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&res); err == nil && len(res) > 0 && res[0].Error != "" {
+			return 0, &ownerRefusal{msg: res[0].Error}
+		}
+		return 0, &ownerRefusal{msg: "the owner node refused the upload"}
+	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return 0, fmt.Errorf("owner upload returned %d: %s", resp.StatusCode, string(raw))
@@ -71,3 +80,9 @@ func (h *APIHandler) forwardUpload(ownerAddr, bucket, prefix, filename, contentT
 	}
 	return 0, nil
 }
+
+// ownerRefusal is a forwarded upload the owner node refused with 403, so the
+// file is answered 403 here too.
+type ownerRefusal struct{ msg string }
+
+func (e *ownerRefusal) Error() string { return e.msg }

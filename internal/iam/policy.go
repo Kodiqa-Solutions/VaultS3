@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // Policy represents an IAM policy document.
@@ -214,18 +215,31 @@ func wildcardMatch(pattern, value string) bool {
 			return true
 		}
 	}
+	// By character, not byte: a '?' stands for one character, so "b/?"
+	// matches the key "é" (two bytes in UTF-8), as on AWS. The strings are
+	// walked in place, not converted to runes, which allocated four times the
+	// key's size on every match. A byte that is not valid UTF-8 is a
+	// character of its own, compared as that byte (as runes, every invalid
+	// byte became U+FFFD, and any two of them compared equal).
 	p, v := 0, 0
 	starP, starV := -1, -1
 	for v < len(value) {
-		if p < len(pattern) && (pattern[p] == '?' || pattern[p] == value[v]) {
-			p++
-			v++
-		} else if p < len(pattern) && pattern[p] == '*' {
+		// A '*' in the pattern is always a wildcard, tested before a literal
+		// match. Testing it after let a '*' in the value (S3 keys may hold
+		// one) match the pattern's '*' as a literal character with no
+		// backtracking point, so "b/private/*" did not match the key
+		// "private/*x" and a Deny on it did not apply.
+		vs := charLen(value, v)
+		if p < len(pattern) && pattern[p] == '*' {
 			starP = p
 			starV = v
 			p++
+		} else if ps := charLen(pattern, p); p < len(pattern) &&
+			(pattern[p] == '?' || pattern[p:p+ps] == value[v:v+vs]) {
+			p += ps
+			v += vs
 		} else if starP >= 0 {
-			starV++
+			starV += charLen(value, starV)
 			v = starV
 			p = starP + 1
 		} else {
@@ -236,4 +250,17 @@ func wildcardMatch(pattern, value string) bool {
 		p++
 	}
 	return p == len(pattern)
+}
+
+// charLen is the length in bytes of the character at s[i]: a UTF-8 sequence,
+// or 1 for a byte that does not start a valid one. 0 at the end of s.
+func charLen(s string, i int) int {
+	if i >= len(s) {
+		return 0
+	}
+	if s[i] < utf8.RuneSelf {
+		return 1
+	}
+	_, n := utf8.DecodeRuneInString(s[i:])
+	return n
 }

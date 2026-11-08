@@ -232,12 +232,23 @@ func (m *TriggerManager) executeTrigger(job triggerJob) {
 
 		outputKey := expandTemplate(job.trigger.OutputKeyTemplate, job.bucket, job.key)
 
-		// Validate output key doesn't contain path traversal
-		for _, segment := range strings.Split(outputKey, "/") {
-			if segment == ".." {
-				slog.Error("lambda output key contains path traversal", "trigger_id", job.trigger.ID, "key", outputKey)
-				return
-			}
+		// The same key check as every other write: ".." and "./" segments
+		// and the server's own folders. "./doc" overwrote doc, past its lock.
+		if msg := storage.KeyProblem(outputKey); msg != "" {
+			slog.Error("lambda output key refused", "trigger_id", job.trigger.ID, "key", outputKey, "reason", msg)
+			return
+		}
+		// The output is written as a plain object, so it is not written into
+		// a bucket with versioning (that would corrupt its history) or over
+		// a locked object.
+		if v, _ := m.store.GetBucketVersioning(job.trigger.OutputBucket); v != "" {
+			slog.Error("lambda output not stored: the output bucket has versioning, which lambda output does not support", "trigger_id", job.trigger.ID, "bucket", job.trigger.OutputBucket)
+			return
+		}
+		if cur, err := m.store.GetObjectMeta(job.trigger.OutputBucket, outputKey); err == nil && cur != nil &&
+			(cur.LegalHold || (cur.RetentionMode != "" && cur.RetentionUntil > 0 && time.Now().UTC().Unix() < cur.RetentionUntil)) {
+			slog.Error("lambda output not stored: the output key is locked", "trigger_id", job.trigger.ID, "bucket", job.trigger.OutputBucket, "key", outputKey)
+			return
 		}
 
 		contentType := resp.Header.Get("Content-Type")

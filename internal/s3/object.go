@@ -47,6 +47,10 @@ func traceRead404(r *http.Request, method, bucket, key, cause string) {
 }
 
 type ObjectHandler struct {
+	// coldRestorer moves an object back from the cold tier (RestoreObject),
+	// or nil when tiering is not configured.
+	coldRestorer func(bucket, key string) error
+
 	// auth authorizes individual entries of a multi-object request, which the
 	// router cannot do because it decides before the body is parsed.
 	auth *Authenticator
@@ -133,8 +137,18 @@ func writePutError(w http.ResponseWriter, err error) {
 	writeS3Error(w, "InternalError", "An internal error occurred", http.StatusInternalServerError)
 }
 
-// sseHeaderApplies reports whether this object really is encrypted at rest, and
-// so whether the response may claim `x-amz-server-side-encryption: AES256`.
+// setSSEHeader claims SSE-S3 on a response when the bucket really encrypts at
+// rest (sseHeaderApplies). PutObject, GET and HEAD did; CopyObject,
+// CreateMultipartUpload and Complete did not, although they write the same
+// encrypted object.
+func (h *ObjectHandler) setSSEHeader(w http.ResponseWriter, bucket string) {
+	if h.sseHeaderApplies(bucket) {
+		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
+	}
+}
+
+// sseHeaderApplies reports whether objects in the bucket really are encrypted
+// at rest, and so whether the response may claim `x-amz-server-side-encryption: AES256`.
 //
 // It used to be the global encryption flag alone. In per-bucket mode that is not
 // the same question: a bucket that never opted in stores plaintext, and the
@@ -355,8 +369,18 @@ func (h *ObjectHandler) multipartStore() metadata.StoreAPI {
 }
 
 // checkQuota verifies bucket quota limits before writing.
-// If FIFOQuota is enabled, oldest objects are deleted to make room.
 func (h *ObjectHandler) checkQuota(w http.ResponseWriter, bucket string, incomingSize int64) bool {
+	return h.checkQuotaFor(w, bucket, "", incomingSize)
+}
+
+// checkQuotaFor is checkQuota for a write to key. In a bucket without
+// versioning a write to a key that exists replaces it, so it is not one more
+// object: an overwrite, or a copy of an object onto itself to change its
+// metadata (rclone touch), was refused in a bucket at its quota although it
+// adds no object. The bytes given back are the replaced file's size on disk,
+// since the quota counts bytes on disk: giving back its recorded size, which
+// with compression is far more, let an overwrite store twice the quota.
+func (h *ObjectHandler) checkQuotaFor(w http.ResponseWriter, bucket, key string, incomingSize int64) bool {
 	info, err := h.store.GetBucket(bucket)
 	if err != nil {
 		return true // no bucket info, allow
@@ -366,17 +390,9 @@ func (h *ObjectHandler) checkQuota(w http.ResponseWriter, bucket string, incomin
 	}
 
 	currentSize, currentCount, _ := h.engine.BucketSize(bucket)
-
-	if info.FIFOQuota {
-		// FIFO: delete oldest objects to make room
-		if info.MaxObjects > 0 && currentCount >= info.MaxObjects {
-			h.fifoEvict(bucket, 1, 0)
-		}
-		if info.MaxSizeBytes > 0 && incomingSize > 0 && currentSize+incomingSize > info.MaxSizeBytes {
-			needed := currentSize + incomingSize - info.MaxSizeBytes
-			h.fifoEvict(bucket, 0, needed)
-		}
-		return true
+	if replaces, onDisk := h.replacesObject(bucket, key); replaces {
+		currentCount--
+		currentSize -= onDisk
 	}
 
 	if info.MaxObjects > 0 && currentCount >= info.MaxObjects {
@@ -391,73 +407,46 @@ func (h *ObjectHandler) checkQuota(w http.ResponseWriter, bucket string, incomin
 	return true
 }
 
-// fifoEvict deletes oldest objects until count or size requirements are met.
-func (h *ObjectHandler) fifoEvict(bucket string, countToFree int64, bytesToFree int64) {
-	objects, _, err := h.engine.ListObjects(bucket, "", "", 10000)
-	if err != nil || len(objects) == 0 {
-		return
+// replacesObject reports whether a write to key replaces an object rather
+// than adding one, and how many bytes on disk it gives back: the key exists in
+// a bucket that has never had versioning, or its current version is the null
+// version of a suspended bucket, which a write rewrites in place. The bytes
+// are the replaced file's size on disk, which with compression is not its
+// recorded size; 0 when it is not a plain file (packed, erasure coded).
+func (h *ObjectHandler) replacesObject(bucket, key string) (bool, int64) {
+	if key == "" {
+		return false, 0
 	}
+	v, _ := h.store.GetBucketVersioning(bucket)
+	if v == "Enabled" {
+		return false, 0
+	}
+	meta, err := h.store.GetObjectMeta(bucket, key)
+	if err != nil || meta == nil || meta.DeleteMarker {
+		return false, 0
+	}
+	if v == "Suspended" {
+		if meta.VersionID != "" && meta.VersionID != "null" {
+			return false, 0
+		}
+		// A null version written while suspended lives in the version store,
+		// .vs/<key>/null; one from before versioning is the plain file.
+		if meta.VersionID == "null" {
+			return true, regularFileSize(h.engine.ObjectPath(bucket, ".vs/"+key+"/null"))
+		}
+		return true, regularFileSize(h.engine.ObjectPath(bucket, key))
+	}
+	return true, regularFileSize(h.engine.ObjectPath(bucket, key))
+}
 
-	// Objects from ListObjects are typically in alphabetical order.
-	// Sort by modified time to find oldest.
-	type objMeta struct {
-		key  string
-		size int64
-		mod  time.Time
+// regularFileSize is the size on disk of a regular file at path, or 0. A
+// symbolic link is not followed: the disk walk that measures the bucket
+// counts the link itself, not its target.
+func regularFileSize(path string) int64 {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() {
+		return fi.Size()
 	}
-	var metas []objMeta
-	for _, obj := range objects {
-		meta, err := h.store.GetObjectMeta(bucket, obj.Key)
-		if err != nil {
-			continue
-		}
-		metas = append(metas, objMeta{key: obj.Key, size: meta.Size, mod: time.Unix(meta.LastModified, 0)})
-	}
-	// Sort oldest first
-	for i := 0; i < len(metas); i++ {
-		for j := i + 1; j < len(metas); j++ {
-			if metas[j].mod.Before(metas[i].mod) {
-				metas[i], metas[j] = metas[j], metas[i]
-			}
-		}
-	}
-
-	var freedCount int64
-	var freedBytes int64
-	for _, m := range metas {
-		if countToFree > 0 && freedCount >= countToFree && bytesToFree <= 0 {
-			break
-		}
-		if bytesToFree > 0 && freedBytes >= bytesToFree && countToFree <= 0 {
-			break
-		}
-		if countToFree > 0 && freedCount >= countToFree && bytesToFree > 0 && freedBytes >= bytesToFree {
-			break
-		}
-
-		// Eviction is a delete like any other, so object lock applies to it.
-		// It used to remove objects under legal hold and COMPLIANCE retention,
-		// and to count a failed delete as freed space.
-		if err := h.checkObjectLock(bucket, m.key, ""); err != nil {
-			continue
-		}
-		if err := h.engine.DeleteObject(bucket, m.key); err != nil {
-			slog.Warn("fifo quota: could not evict an object", "bucket", bucket, "key", m.key, "error", err)
-			continue
-		}
-		if err := h.store.DeleteObjectMeta(bucket, m.key); err != nil {
-			slog.Error("fifo quota: evicted an object's data but could not remove its metadata",
-				"bucket", bucket, "key", m.key, "error", err)
-			continue
-		}
-		h.reapElsewhere(bucket, m.key, "")
-		freedCount++
-		freedBytes += m.size
-
-		if h.onSearchUpdate != nil {
-			h.onSearchUpdate("delete", bucket, m.key)
-		}
-	}
+	return 0
 }
 
 // generateVersionID creates a unique version ID using timestamp + random bytes.
@@ -502,7 +491,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxPutSize)
 
-	if !h.checkQuota(w, bucket, r.ContentLength) {
+	if !h.checkQuotaFor(w, bucket, key, r.ContentLength) {
 		return
 	}
 
@@ -541,7 +530,7 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	// rejected upload fails the engine's own write and the object already at the
 	// key is left exactly as it was.
 	digests := newPutDigests(r, r.Body)
-	digests.checkInline(r, h.quotaByteLimit(bucket))
+	digests.checkInline(r, h.quotaByteLimitFor(bucket, key))
 	if digests.failure != nil {
 		writeReqError(w, digests.failure)
 		return
@@ -1474,6 +1463,13 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 	meta.ChecksumCRC64NVME = srcMeta.ChecksumCRC64NVME
 	meta.Tags = copyTags
 
+	// Held to the destination bucket's quota as a PutObject of the same size
+	// is. CopyObject never checked it, so copies filled a bucket past its
+	// size and object count quotas.
+	if !h.checkQuotaFor(w, bucket, key, size) {
+		return
+	}
+
 	written, err := h.writeObject(newObject{
 		bucket:           bucket,
 		key:              key,
@@ -1504,6 +1500,8 @@ func (h *ObjectHandler) CopyObject(w http.ResponseWriter, r *http.Request, bucke
 	if destKey != nil {
 		w.Header().Set(hdrSSECAlgo, "AES256")
 		w.Header().Set(hdrSSECKeyMD5, destKey.keyMD5)
+	} else {
+		h.setSSEHeader(w, bucket)
 	}
 	writeXML(w, http.StatusOK, copyResult{
 		ETag:         written.ETag,
@@ -1872,8 +1870,26 @@ func sortVersionsForListing(versions []metadata.ObjectMeta) {
 		if versions[i].IsLatest != versions[j].IsLatest {
 			return versions[i].IsLatest
 		}
-		return versions[i].LastModified > versions[j].LastModified
+		if versions[i].LastModified != versions[j].LastModified {
+			return versions[i].LastModified > versions[j].LastModified
+		}
+		// LastModified is whole seconds. Versions written in the same second
+		// were left in the store's order, oldest first, so a listing named
+		// them in the wrong order and a client reading "the previous version"
+		// got another one. Version IDs begin with the nanosecond time, so the
+		// larger is the newer; the null version has no time and goes last.
+		return versionNewer(versions[i].VersionID, versions[j].VersionID)
 	})
+}
+
+// versionNewer reports whether version ID a was written after b, for IDs
+// generated in the same second. The null version (or no ID) counts as oldest.
+func versionNewer(a, b string) bool {
+	an, bn := a == "" || a == "null", b == "" || b == "null"
+	if an || bn {
+		return !an && bn
+	}
+	return a > b
 }
 
 // ListObjectVersions handles GET /{bucket}?versions.

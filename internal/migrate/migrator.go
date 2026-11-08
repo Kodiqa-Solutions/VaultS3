@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -497,25 +496,7 @@ func (m *Manager) ListJobs() []*Job {
 // bucket, and a key under one of the engine's own directories (.vs/ versions,
 // .ec/ erasure shards, .multipart/ uploads) would overwrite its internal files.
 func unsafeKey(key string) string {
-	switch {
-	case key == "":
-		return "empty key"
-	case strings.ContainsRune(key, 0):
-		return "NUL byte in key"
-	case strings.HasPrefix(key, "/"):
-		return "key begins with '/'"
-	}
-	for _, seg := range strings.Split(key, "/") {
-		if seg == ".." {
-			return "'..' path segment"
-		}
-	}
-	first := strings.SplitN(key, "/", 2)[0]
-	switch {
-	case first == ".vs", first == ".ec", first == ".multipart", strings.HasPrefix(first, ".vaults3-tmp-"):
-		return "key names an internal storage directory"
-	}
-	return ""
+	return storage.KeyProblem(key)
 }
 
 // RequestError refuses the migration request itself (a bad endpoint, nothing

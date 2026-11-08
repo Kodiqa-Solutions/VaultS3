@@ -92,7 +92,7 @@ Every S3 API call VaultS3 implements.
 | List Objects V1 | `GET /{bucket}?marker=` | Done |
 | Replication Config | `PUT/GET/DELETE /{bucket}?replication` | Done |
 | Restore Object | `POST /{bucket}/{key}?restore` | Done |
-| POST Upload (Form) | `POST /{bucket}` (multipart/form-data) | Done |
+| POST Upload (Form) | `POST /{bucket}` (multipart/form-data), signed with an Authorization header or a POST policy (presigned POST) | Done |
 | Get Object (Part) | `GET /{bucket}/{key}?partNumber=N` | Done |
 | Event Stream | `GET /api/v1/events` (SSE) | Done |
 | Log Stream | `GET /api/v1/logs` (SSE) | Done |

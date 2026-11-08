@@ -233,6 +233,17 @@ func setHTTPMetadataHeaders(w http.ResponseWriter, meta *metadata.ObjectMeta) {
 	}
 }
 
+// hasResponseOverride reports whether the query asks for a response-* header
+// override.
+func hasResponseOverride(q url.Values) bool {
+	for name := range q {
+		if strings.HasPrefix(strings.ToLower(name), "response-") {
+			return true
+		}
+	}
+	return false
+}
+
 // applyResponseOverrides overrides response headers from query params.
 func applyResponseOverrides(w http.ResponseWriter, r *http.Request) {
 	overrides := map[string]string{

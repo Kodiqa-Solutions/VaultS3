@@ -2,10 +2,11 @@ package s3
 
 import (
 	"encoding/xml"
+	"errors"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/tiering"
 	"io"
 	"log/slog"
 	"net/http"
-	"time"
 )
 
 type restoreRequest struct {
@@ -27,9 +28,10 @@ func (h *ObjectHandler) RestoreObject(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	// Only cold-tiered objects need restoration
-	if meta.Tier != "cold" {
-		writeS3Error(w, "InvalidObjectState", "Object is not in a cold storage class", http.StatusConflict)
+	// Only the object's current data, or its null version, which lives at the
+	// same path, is tiered.
+	if v := r.URL.Query().Get("versionId"); v != "" && v != "null" && v != meta.VersionID {
+		writeS3Error(w, "InvalidObjectState", "Only the current or null version of an object can be in the cold tier", http.StatusConflict)
 		return
 	}
 
@@ -49,12 +51,28 @@ func (h *ObjectHandler) RestoreObject(w http.ResponseWriter, r *http.Request, bu
 		req.Days = 1
 	}
 
-	// Mark object as being restored (change tier to hot)
-	meta.Tier = "hot"
-	meta.LastModified = time.Now().UTC().Unix()
-	if err := h.store.PutObjectMeta(*meta); err != nil {
-		slog.Error("restore error", "error", err)
-		writeS3Error(w, "InternalError", "Failed to update metadata", http.StatusInternalServerError)
+	// The data is moved back to the hot tier, where reads find it. This only
+	// marked the record hot and left the bytes in the cold directory, so the
+	// "restored" object still could not be read.
+	// Asked even when the record says hot: 5.0.10's RestoreObject marked a
+	// record hot and left the data in the cold tier, and this brings it back.
+	if h.coldRestorer == nil {
+		if meta.Tier == "cold" {
+			writeS3Error(w, "InvalidObjectState", "The object is in the cold tier and tiering is not configured on this server, so it cannot be restored", http.StatusConflict)
+			return
+		}
+		writeS3Error(w, "InvalidObjectState", "Object is not in a cold storage class", http.StatusConflict)
+		return
+	}
+	if err := h.coldRestorer(bucket, key); errors.Is(err, tiering.ErrNothingToRestore) {
+		writeS3Error(w, "InvalidObjectState", "Object is not in a cold storage class", http.StatusConflict)
+		return
+	} else if errors.Is(err, tiering.ErrHotPathBlocked) {
+		writeS3Error(w, "InvalidObjectState", "The object cannot be restored: another object's folder now uses its path. Its cold copy is kept.", http.StatusConflict)
+		return
+	} else if err != nil {
+		slog.Error("restore error", "bucket", bucket, "key", key, "error", err)
+		writeS3Error(w, "InternalError", "Failed to restore the object from the cold tier", http.StatusInternalServerError)
 		return
 	}
 

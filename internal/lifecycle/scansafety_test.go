@@ -213,3 +213,23 @@ func TestNoncurrentExpiryKeepsRecordWhenDataDeleteFails(t *testing.T) {
 		t.Fatal("version record deleted although its data could not be")
 	}
 }
+
+// Regression (5.0.11): versions were sorted by LastModified alone, in whole
+// seconds, and the first taken as the current one. With every version written
+// in the same second the current version could be expired as noncurrent.
+func TestNoncurrentExpiryKeepsTheCurrentVersionWrittenInTheSameSecond(t *testing.T) {
+	w, g, _ := newGuardedWorker(t, "Enabled")
+	for _, v := range []string{"a1", "a2", "a3"} {
+		g.Store.PutObjectVersion(metadata.ObjectMeta{Bucket: "b", Key: "k", VersionID: v, ETag: v, LastModified: old})
+	}
+	latest := metadata.ObjectMeta{Bucket: "b", Key: "k", VersionID: "z9", ETag: "z9", LastModified: old, IsLatest: true}
+	g.Store.PutObjectVersion(latest)
+	g.Store.PutObjectMeta(latest)
+	w.scan()
+	if _, err := g.Store.GetObjectVersion("b", "k", "z9"); err != nil {
+		t.Fatal("the current version, written in the same second as the others, was expired as noncurrent")
+	}
+	if cur, err := g.Store.GetObjectMeta("b", "k"); err != nil || cur.VersionID != "z9" {
+		t.Fatalf("current version after the scan: %v %v, want z9", cur, err)
+	}
+}

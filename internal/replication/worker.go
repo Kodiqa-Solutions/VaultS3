@@ -237,13 +237,17 @@ func (w *Worker) replicatePut(peer config.ReplicationPeer, event metadata.Replic
 	if err != nil {
 		return err
 	}
+	sum, err := payloadSHA256(reader)
+	if err != nil {
+		return fmt.Errorf("read local object: %w", err)
+	}
 	req, err := http.NewRequest("PUT", u, reader)
 	if err != nil {
 		return err
 	}
 	req.ContentLength = size
 	req.Header.Set("X-VaultS3-Replication", "true")
-	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	req.Header.Set("X-Amz-Content-Sha256", sum)
 	signV4(req, peer.AccessKey, peer.SecretKey, "us-east-1")
 
 	resp, err := w.client.Do(req)
@@ -269,7 +273,7 @@ func (w *Worker) replicateDelete(peer config.ReplicationPeer, event metadata.Rep
 		return err
 	}
 	req.Header.Set("X-VaultS3-Replication", "true")
-	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	req.Header.Set("X-Amz-Content-Sha256", emptyPayloadSHA256)
 	signV4(req, peer.AccessKey, peer.SecretKey, "us-east-1")
 
 	resp, err := w.client.Do(req)
@@ -296,7 +300,7 @@ func (w *Worker) ensureBucket(peer config.ReplicationPeer, bucket string) error 
 		return err
 	}
 	req.Header.Set("X-VaultS3-Replication", "true")
-	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	req.Header.Set("X-Amz-Content-Sha256", emptyPayloadSHA256)
 	signV4(req, peer.AccessKey, peer.SecretKey, "us-east-1")
 
 	resp, err := w.client.Do(req)

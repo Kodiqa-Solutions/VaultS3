@@ -191,3 +191,19 @@ func TestClusterStatusAndMembership(t *testing.T) {
 		t.Fatal("the retired rebalance still triggered data movement")
 	}
 }
+
+// Regression (5.0.11 round 14): the inter-node delete removed the file of
+// whatever key it was given, so deleting a legacy record "./doc" on one node
+// destroyed doc's data on every node. Such a key's data is never deleted.
+func TestClusterObjectDeleteKeepsTheFileOfAnAliasingKey(t *testing.T) {
+	h, store := newTestAPI(t)
+	store.CreateBucket("b")
+	h.engine.PutObject("b", "doc", strings.NewReader("data"), 4)
+	handler := h.ClusterObjectDeleteHandler("s3cr3t")
+	req := httptest.NewRequest(http.MethodPost, "/cluster/object-delete?bucket=b&key=.%2Fdoc", nil)
+	req.Header.Set(clusterSecretHeader, "s3cr3t")
+	handler(httptest.NewRecorder(), req)
+	if !h.engine.ObjectExists("b", "doc") {
+		t.Fatal("an inter-node delete of ./doc destroyed doc's data")
+	}
+}

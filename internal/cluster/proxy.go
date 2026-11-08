@@ -314,6 +314,15 @@ type trackingWriter struct {
 }
 
 func (t *trackingWriter) WriteHeader(code int) {
+	// A 1xx (100 Continue from the holder) is passed on but is not an answer:
+	// a hop that fails after it has still answered nothing, and must be
+	// reported as failed. Counting it made forwardOnce say the client had its
+	// answer, nothing more was written, and net/http sent 200 for an upload
+	// the holder never stored.
+	if code >= 100 && code <= 199 {
+		t.ResponseWriter.WriteHeader(code)
+		return
+	}
 	t.wrote = true
 	t.ResponseWriter.WriteHeader(code)
 }

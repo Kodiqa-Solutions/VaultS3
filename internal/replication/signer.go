@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -129,4 +130,28 @@ func uriEncode(s string) string {
 		}
 	}
 	return buf.String()
+}
+
+// emptyPayloadSHA256 is the SHA-256 of an empty body, the payload hash of a
+// request that sends none.
+const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// payloadSHA256 is the hex SHA-256 of body, which is then rewound to its start
+// so it can be sent. Signing it, rather than UNSIGNED-PAYLOAD, lets the peer
+// refuse a body changed on the way, which it checks against the signature.
+func payloadSHA256(body io.ReadSeeker) (string, error) {
+	h := sha256.New()
+	if _, err := io.Copy(h, body); err != nil {
+		return "", err
+	}
+	if _, err := body.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// SignPeerRequest signs req with SigV4 exactly as replication signs its own
+// requests to a peer. Set X-Amz-Content-Sha256 first for a signed body.
+func SignPeerRequest(req *http.Request, accessKey, secretKey string) {
+	signV4(req, accessKey, secretKey, "us-east-1")
 }

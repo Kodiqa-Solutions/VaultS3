@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -194,5 +195,119 @@ func TestRollbackUndoesAFailedMetadataWrite(t *testing.T) {
 	m, _ := store.GetObjectMeta("v", "k.txt")
 	if !m.IsLatest {
 		t.Fatal("the latest pointer lost IsLatest")
+	}
+}
+
+// Regression (5.0.11): a rollback writes a new version, but was never held to
+// the bucket's quota.
+func TestRollbackIsHeldToTheQuota(t *testing.T) {
+	h, store := newTestAPI(t)
+	store.CreateBucket("vq")
+	h.engine.CreateBucketDir("vq")
+	store.SetBucketVersioning("vq", "Enabled")
+	uploadOne(t, h, "vq", "k.txt", "first-version-bytes")
+	first, _ := store.GetObjectMeta("vq", "k.txt")
+	uploadOne(t, h, "vq", "k.txt", "second")
+	if err := store.UpdateBucketQuota("vq", 30, 0); err != nil {
+		t.Fatal(err)
+	}
+	rr := doRequest(h, "POST", "/versions/rollback", map[string]string{"bucket": "vq", "key": "k.txt", "versionId": first.VersionID}, getToken(t, h))
+	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "QuotaExceeded") {
+		t.Fatalf("a rollback past the quota: %d %s, want 403 QuotaExceeded", rr.Code, rr.Body.String())
+	}
+	if latest, _ := store.GetObjectMeta("vq", "k.txt"); latest.Size != int64(len("second")) {
+		t.Fatalf("the refused rollback changed the latest version: %+v", latest)
+	}
+}
+
+// Regression (5.0.11 round 10): in a suspended bucket a dashboard upload took
+// the plain path, so over a null version it left that version's bytes behind
+// and listed a second null version, and the quota gave back bytes that were
+// never freed. It writes the null version in place now, as S3 does.
+func TestSuspendedUploadReplacesTheNullVersion(t *testing.T) {
+	h, store := newTestAPI(t)
+	store.CreateBucket("sus")
+	h.engine.CreateBucketDir("sus")
+	store.SetBucketVersioning("sus", "Suspended")
+	for _, content := range []string{"first", "second"} {
+		if rr, res := uploadOne(t, h, "sus", "k.txt", content); rr.Code != http.StatusOK {
+			t.Fatalf("upload %q: %d %+v", content, rr.Code, res)
+		}
+	}
+	versions, _, _ := store.ListObjectVersions("sus", "k.txt", "", "", 10)
+	if len(versions) != 1 || versions[0].VersionID != "null" || !versions[0].IsLatest {
+		t.Fatalf("versions after two uploads to a suspended bucket: %+v, want one latest null version", versions)
+	}
+	if got := readLatest(t, h, "sus", "k.txt"); got != "second" {
+		t.Fatalf("content %q, want second", got)
+	}
+	if n := countFiles(t, h); n != 1 {
+		t.Fatalf("%d files on disk, want 1 (the null version)", n)
+	}
+}
+
+// A dashboard upload never checked object lock, so it could overwrite a
+// locked object in a bucket without versioning (5.0.11 round 10).
+func TestUploadDoesNotOverwriteALockedObject(t *testing.T) {
+	h, store := newTestAPI(t)
+	store.CreateBucket("lk")
+	h.engine.CreateBucketDir("lk")
+	uploadOne(t, h, "lk", "k.txt", "kept")
+	meta, _ := store.GetObjectMeta("lk", "k.txt")
+	meta.LegalHold = true
+	if err := store.PutObjectMeta(*meta); err != nil {
+		t.Fatal(err)
+	}
+	rr, res := uploadOne(t, h, "lk", "k.txt", "replaced")
+	if rr.Code != http.StatusForbidden || len(res) != 1 || !strings.Contains(res[0].Error, "legal hold") {
+		t.Fatalf("an upload over an object under legal hold: %d %+v, want 403", rr.Code, res)
+	}
+	if got := readLatest(t, h, "lk", "k.txt"); got != "kept" {
+		t.Fatalf("the locked object now holds %q", got)
+	}
+}
+
+// Regression (5.0.11 round 11): bulk delete took its keys from the body with
+// no check, so "./doc" deleted doc's file under another name, past the lock
+// and the policy written for doc.
+func TestBulkDeleteRefusesAliasingKeys(t *testing.T) {
+	h, store := newTestAPI(t)
+	store.CreateBucket("bd")
+	h.engine.CreateBucketDir("bd")
+	uploadOne(t, h, "bd", "doc", "keep")
+	rr := doRequest(h, "POST", "/buckets/bd/bulk-delete", map[string][]string{"keys": {"./doc", "a//doc"}}, getToken(t, h))
+	if !strings.Contains(rr.Body.String(), "segment") {
+		t.Fatalf("bulk delete of aliasing keys: %d %s, want them refused", rr.Code, rr.Body.String())
+	}
+	if got := readLatest(t, h, "bd", "doc"); got != "keep" {
+		t.Fatalf("doc after a bulk delete of ./doc: %q", got)
+	}
+}
+
+// Regression (5.0.11 round 11): in a suspended bucket whose latest version is
+// not the null version, a dashboard upload checked the lock of the latest
+// version, not of the null version it replaces, and overwrote a held one.
+func TestSuspendedUploadChecksTheNullVersionsLock(t *testing.T) {
+	h, store := newTestAPI(t)
+	store.CreateBucket("sl")
+	h.engine.CreateBucketDir("sl")
+	store.SetBucketVersioning("sl", "Suspended")
+	uploadOne(t, h, "sl", "k.txt", "held")
+	null, _ := store.GetObjectVersion("sl", "k.txt", "null")
+	null.LegalHold = true
+	null.IsLatest = false
+	if err := store.PutObjectVersion(*null); err != nil {
+		t.Fatal(err)
+	}
+	newer := metadata.ObjectMeta{Bucket: "sl", Key: "k.txt", VersionID: "0000000000000009aaaaaaaa", ETag: "e", Size: 1, IsLatest: true}
+	if err := store.PutObjectVersion(newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObjectMeta(newer); err != nil {
+		t.Fatal(err)
+	}
+	rr, res := uploadOne(t, h, "sl", "k.txt", "replaced")
+	if rr.Code != http.StatusForbidden || len(res) != 1 || !strings.Contains(res[0].Error, "legal hold") {
+		t.Fatalf("an upload over a held null version below a newer one: %d %+v, want 403", rr.Code, res)
 	}
 }

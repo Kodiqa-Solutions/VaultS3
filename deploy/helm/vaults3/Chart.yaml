@@ -4,8 +4,8 @@ description: Lightweight S3-compatible object storage with a built-in dashboard,
 type: application
 # version  = the chart version (bump on chart changes)
 # appVersion = the VaultS3 image tag this chart defaults to
-version: 0.2.10
-appVersion: "5.0.10"
+version: 0.2.11
+appVersion: "5.0.11"
 home: https://github.com/Kodiqa-Solutions/VaultS3
 sources:
   - https://github.com/Kodiqa-Solutions/VaultS3
@@ -32,4 +32,4 @@ annotations:
       url: https://vaults3.com/migrate-from-minio
   artifacthub.io/images: |
     - name: vaults3
-      image: eniz1806/vaults3:5.0.10
+      image: eniz1806/vaults3:5.0.11

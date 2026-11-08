@@ -186,6 +186,9 @@ scanner:
   max_scan_size_bytes: 104857600  # 100MB
   workers: 2
 
+# Moving objects to the cold tier is disabled from 5.0.11: nothing reads from it
+# yet. With tiering enabled, objects an earlier version moved there can be
+# restored (RestoreObject, or the tiering API's hot direction).
 tiering:
   enabled: false
   cold_data_dir: "./cold_data"

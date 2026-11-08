@@ -402,3 +402,73 @@ func TestPullReplicationReportsAFailedMetadataWrite(t *testing.T) {
 		t.Error("a failed delete still removed the object's data")
 	}
 }
+
+// Regression (5.0.11 round 10): a pulled change was applied as a plain write
+// whatever the local bucket's versioning, so a versioned bucket got two
+// versions both claiming to be latest and an object outside its version
+// store; and a locked object was overwritten. Both are skipped now.
+func TestPullSkipsVersionedBucketsAndLockedObjects(t *testing.T) {
+	local := newSite(t)
+	local.put(t, "ver", "seed", "x")
+	if err := local.store.SetBucketVersioning("ver", "Enabled"); err != nil {
+		t.Fatal(err)
+	}
+	local.put(t, "plain", "locked", "kept")
+	m, _ := local.store.GetObjectMeta("plain", "locked")
+	m.LegalHold = true
+	if err := local.store.PutObjectMeta(*m); err != nil {
+		t.Fatal(err)
+	}
+	changes := []ChangeEntry{
+		{Bucket: "ver", Key: "k", EventType: "put", SiteID: "remote", VectorClock: VectorClock{"remote": 1}, Seq: 1},
+		{Bucket: "plain", Key: "locked", EventType: "put", SiteID: "remote", VectorClock: VectorClock{"remote": 2}, Seq: 2},
+		{Bucket: "plain", Key: "new", EventType: "put", SiteID: "remote", VectorClock: VectorClock{"remote": 3}, Seq: 3},
+	}
+	srv := syncPeerServer(t, changes, nil)
+	w := NewBiDirectionalWorker(local.store, local.engine, config.ReplicationConfig{
+		SiteID: "local",
+		Peers:  []config.ReplicationPeer{{Name: "p", URL: srv.URL}},
+	})
+	if err := w.syncPeer(context.Background(), "p", w.peers["p"]); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := local.read(t, "ver", "k"); ok {
+		t.Error("a change was applied to a versioned bucket")
+	}
+	if got, _ := local.read(t, "plain", "locked"); got != "kept" {
+		t.Errorf("a locked object was replaced by a replicated change: %q", got)
+	}
+	if got, ok := local.read(t, "plain", "new"); !ok || got != "body of /plain/new" {
+		t.Errorf("an ordinary change was not applied: %q %v", got, ok)
+	}
+	if w.peerCursors["p"] != 3 {
+		t.Errorf("cursor %d, want 3: skipped changes are not retried for ever", w.peerCursors["p"])
+	}
+}
+
+// Regression (5.0.11 round 11): a change to a key this server cannot store
+// ("./dotkey") failed to apply on every sync and held the cursor, so nothing
+// after it was ever replicated. It is skipped now.
+func TestPullSkipsAKeyThatCannotBeStored(t *testing.T) {
+	local := newSite(t)
+	local.put(t, "bkt", "seed", "x")
+	changes := []ChangeEntry{
+		{Bucket: "bkt", Key: "./dotkey", EventType: "put", SiteID: "remote", VectorClock: VectorClock{"remote": 1}, Seq: 1},
+		{Bucket: "bkt", Key: "after", EventType: "put", SiteID: "remote", VectorClock: VectorClock{"remote": 2}, Seq: 2},
+	}
+	// The peer refuses a GET of such a key, as a real one does.
+	srv := syncPeerServer(t, changes, map[string]bool{"./dotkey": true})
+	w := NewBiDirectionalWorker(local.store, local.engine, config.ReplicationConfig{
+		SiteID: "local",
+		Peers:  []config.ReplicationPeer{{Name: "p", URL: srv.URL}},
+	})
+	if err := w.syncPeer(context.Background(), "p", w.peers["p"]); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := local.read(t, "bkt", "after"); !ok {
+		t.Error("the change after an unstorable key was never applied")
+	}
+	if w.peerCursors["p"] != 2 {
+		t.Errorf("cursor %d, want 2", w.peerCursors["p"])
+	}
+}

@@ -1098,6 +1098,7 @@ func New(cfg *config.Config) (*Server, error) {
 			return nil, fmt.Errorf("init cold storage: %w", err)
 		}
 		tieringMgr = tiering.NewManager(metaStore, fs, coldFS, cfg.Tiering.MigrateAfterDays, cfg.Tiering.ScanIntervalSecs)
+		s3h.SetColdRestorer(tieringMgr.MigrateToHot)
 		slog.Info("tiering enabled", "cold_dir", cfg.Tiering.ColdDataDir, "migrate_after_days", cfg.Tiering.MigrateAfterDays)
 	}
 
@@ -1494,11 +1495,13 @@ func (s *Server) Run() error {
 
 	// Register bidirectional replication sync endpoint
 	if s.biDirWorker != nil {
-		// Authenticated with the cluster secret. It used to be anonymous on the
-		// public port and returns the full change log: every bucket name, object
-		// key, ETag and size written since replication was enabled, which the S3
-		// API otherwise protects behind SigV4 (security assessment finding 9).
-		mux.HandleFunc("/_replication/sync", s.requireClusterSecret(s.biDirWorker.HandleSyncRequest))
+		// Authenticated with SigV4 by any valid key, whose answer is limited to
+		// the changes it may list and read, or with the cluster secret
+		// (requireReplicationPeer). It used to be anonymous on
+		// the public port and returns the full change log: every bucket name,
+		// object key, ETag and size written since replication was enabled
+		// (security assessment finding 9).
+		mux.HandleFunc("/_replication/sync", s.requireReplicationPeer(s.biDirWorker.HandleSyncRequest))
 		slog.Info("bidirectional replication sync endpoint registered", "path", "/_replication/sync")
 	}
 
@@ -1525,6 +1528,7 @@ func (s *Server) Run() error {
 	if !splitConsole {
 		handler = signInDeadline(handler) // the dashboard API is on this listener
 	}
+	handler = policyPostDeadline(!splitConsole, handler)
 
 	httpServer := newHTTPServer(addr, handler)
 	// Live streams only end when their client leaves, so end them as soon as
@@ -1631,11 +1635,12 @@ func (s *Server) Run() error {
 		s.scanWorker.Start(scanCtx, s.cfg.Scanner.Workers)
 	}
 
-	// Start tiering manager if enabled
+	// The tiering manager's scan moves objects to the cold tier, which nothing
+	// reads from, so every object it moved became unreadable. It does not run:
+	// objects already there are moved back with RestoreObject or the
+	// dashboard's hot direction (tiering.ErrColdWritesDisabled).
 	if s.tieringMgr != nil {
-		tierCtx, tierCancel := context.WithCancel(context.Background())
-		defer tierCancel()
-		go s.tieringMgr.Run(tierCtx)
+		slog.Warn("tiering: moving objects to the cold tier is disabled in this version, because objects there cannot be read; objects already there can be restored with RestoreObject")
 	}
 
 	// Start lambda trigger manager if enabled
@@ -1742,11 +1747,11 @@ func (s *Server) Run() error {
 			interNodeMux.HandleFunc("/cluster/shard-apply", s.shardRouter.ApplyHandler())
 		}
 		if s.biDirWorker != nil {
-			// The cluster secret is required here exactly as on the public port.
+			// Authenticated exactly as on the public port.
 			// This listener registered the bare handler, so anyone who could reach
 			// internode_port could read the whole change log: every bucket, key,
 			// ETag and size (security assessment finding 9, on the second door).
-			interNodeMux.HandleFunc("/_replication/sync", s.requireClusterSecret(s.biDirWorker.HandleSyncRequest))
+			interNodeMux.HandleFunc("/_replication/sync", s.requireReplicationPeer(s.biDirWorker.HandleSyncRequest))
 		}
 		interNodeServer = newHTTPServer(interNodeAddr, interNodeMux)
 		go func() {

@@ -85,7 +85,11 @@ type BucketInfo struct {
 	DefaultRetentionDays int               `json:"default_retention_days,omitempty"`
 	ObjectLockEnabled    bool              `json:"object_lock_enabled,omitempty"` // set at creation; requires versioning
 	Tags                 map[string]string `json:"tags,omitempty"`
-	FIFOQuota            bool              `json:"fifo_quota,omitempty"` // delete oldest objects to make room instead of rejecting
+	// FIFOQuota is no longer read (5.0.11). Nothing ever set it, and the
+	// eviction it enabled deleted the bucket's oldest objects on the strength
+	// of an upload's declared size, before its body arrived. Kept so stored
+	// records still decode.
+	FIFOQuota bool `json:"fifo_quota,omitempty"`
 	// Durability overrides (issue #39). Both are pointers so that "not set" is
 	// distinct from "set to off": an unset bucket follows the server defaults, and
 	// only an explicit choice overrides them.
@@ -588,7 +592,15 @@ func (s *Store) HasPublicReadPolicy(bucket string) bool {
 // nothing else. Evaluating the bucket alone once made every object in a bucket
 // with any public-read policy anonymously readable.
 func (s *Store) IsObjectPublicRead(bucket, key string, ctx map[string]string) bool {
-	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, key: key}, "s3:GetObject", ctx)
+	return s.IsObjectPublicAction(bucket, key, "s3:GetObject", ctx)
+}
+
+// IsObjectPublicAction reports whether the bucket policy lets an anonymous
+// caller perform action on the object, for a read other than the object
+// itself (s3:GetObjectVersion, s3:GetObjectTagging, ...). Each is its own
+// action, as on AWS: a grant of s3:GetObject alone does not cover them.
+func (s *Store) IsObjectPublicAction(bucket, key, action string, ctx map[string]string) bool {
+	return s.policyAllowsAnonymous(policyTarget{bucket: bucket, key: key}, action, ctx)
 }
 
 // IsBucketPublicList reports whether the bucket policy lets an anonymous caller

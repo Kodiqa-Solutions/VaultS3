@@ -20,7 +20,7 @@ S3 API: `http://localhost:9000`
 
 ## Features
 
-- **Full S3 API** -- 80+ operations, works with AWS CLI, mc, boto3, any S3 client
+- **Full S3 API** -- 80+ operations, presigned URLs and presigned POST (browser uploads), works with AWS CLI, mc, boto3, any S3 client
 - **Built-in web dashboard** -- file browser, IAM management, audit trail, search, stats
 - **SSE-S3 and SSE-KMS encryption** -- AES-256-GCM with a static key or a local KMS key provider
 - **Object versioning** -- per-bucket versioning with version IDs, delete markers, diff/rollback
@@ -40,7 +40,7 @@ S3 API: `http://localhost:9000`
 - **FUSE mount** -- mount buckets as local filesystem directories
 - **Full-text search** -- search objects by key, content type, and tags
 - **Virus scanning** -- webhook integration (ClamAV, VirusTotal) with quarantine
-- **Data tiering** -- automatic hot/cold migration with remote S3-compatible tier
+- **Data tiering** -- cold tier restore (moving objects to cold is paused in 5.0.11)
 - **Backup scheduler** -- cron-based full/incremental backups
 - **Lambda triggers** -- webhook functions on S3 events
 - **Orphan reclaim** -- `vaults3-cli storage reclaim` frees data files that no metadata refers to, across every node

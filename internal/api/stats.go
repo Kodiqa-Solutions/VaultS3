@@ -15,9 +15,9 @@ func (h *APIHandler) bucketStatCounter(bucket string) (size, count int64) {
 		return st.Size, st.Count
 	}
 	// One-time backfill from the metadata index (a single atomic walk + seed),
-	// which is correct for versioned/compressed/encrypted buckets — an engine
-	// filesystem walk would count on-disk (compressed/encrypted) bytes and skip
-	// versioned data under .vs/.
+	// which counts live objects at their recorded size. The engine's disk walk
+	// counts every stored version at its size on disk (compressed, encrypted),
+	// which is what the quota uses, not what this page shows.
 	st, err := h.store.BackfillBucketStats(bucket)
 	if err != nil {
 		size, count, _ = h.engine.BucketSize(bucket)

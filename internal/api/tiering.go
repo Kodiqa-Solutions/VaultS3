@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/tiering"
@@ -33,11 +34,19 @@ func (h *APIHandler) handleTieringMigrate(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bucket and key are required")
 		return
 	}
+	if err := validateObjectKey(req.Key); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if req.Direction == "" {
 		req.Direction = "cold"
 	}
 
 	if err := h.tieringMgr.ManualMigrate(req.Bucket, req.Key, req.Direction); err != nil {
+		if errors.Is(err, tiering.ErrColdWritesDisabled) || errors.Is(err, tiering.ErrNothingToRestore) || errors.Is(err, tiering.ErrHotPathBlocked) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

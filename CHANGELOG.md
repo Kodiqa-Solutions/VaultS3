@@ -6,6 +6,252 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.11] - 2026-11-08
+### Security
+- **A Deny in an IAM or bucket policy now covers keys that contain a `*`.**
+  The policy matcher compared a `*` in the pattern with a `*` in the key as
+  the same literal character and then could not backtrack, so a Deny on
+  `bucket/private/*` did not apply to the key `private/*x`, and an Allow on
+  `bucket/*` granted it: under a bucket policy that made a bucket public
+  except `private/`, anyone could read `private/*x`. Every version since 1.0.0
+  is affected. Allows were affected the same way, refusing some keys they
+  should have allowed. A `?` in a pattern now stands for one character, as on
+  AWS, not one byte, so `b/?` also matches a key such as `é`.
+- **A key with a `.` or empty path segment no longer reaches another key's
+  object.** The storage engine keeps an object at its key as a path, and the
+  path folds `./doc` and `a//doc` into `doc` and `a/doc`. A key carried in a
+  request body, or in a URL as an encoded dot (`%2E`), was not checked: a
+  DeleteObjects of `./doc` destroyed `doc` although it was under legal hold;
+  a dashboard bulk delete, zip download or upload of `./secret/plan.txt`, or
+  a single download of `%2E/secret/plan.txt`, reached a file the caller's
+  policy denied; a form upload overwrote one; and a Lambda trigger whose
+  output key template was `./doc` overwrote a held `doc`. One key check is now
+  shared by the S3 API, the dashboard, presigned POST, Snowball (on the
+  cleaned entry name), migration, replication, tiering and Lambda output, and
+  refuses `.` and empty segments (a trailing `/` folder marker is still
+  allowed). A dashboard download of a key with no record answers 404 instead
+  of reading whatever file is at its path, and a record an earlier version
+  stored under such a key is neither served nor, when deleted from the
+  dashboard, expired by lifecycle or deleted on another cluster node, allowed
+  to take the other object's file with it. Every earlier version is affected,
+  for any caller allowed to write somewhere in the bucket.
+- **Lambda output is not written over a locked object or into a bucket with
+  versioning.** It is stored as a plain object, which replaced a locked one
+  and, in a versioned bucket, would corrupt its history; such an output is now
+  refused and logged.
+- **An anonymous `s3:GetObject` grant covers only reading the object.** A
+  bucket policy granting `s3:GetObject` to everyone waived authentication for
+  every GET of a key, so a public bucket also answered an anonymous
+  `?tagging`, `?acl`, `?attributes`, `?legal-hold`, `?retention` and
+  `?uploadId` (ListParts), and `?versionId`: every object's tags, and any older
+  version to someone who knew its ID, even after the key was deleted. On AWS
+  each of these is a separate action, and each is now checked as itself: a
+  policy that grants `s3:GetObjectVersion` or `s3:GetObjectTagging` to
+  everyone still makes that public, a grant of `s3:GetObject` alone does not.
+  Every earlier version is affected.
+- **An anonymous read cannot override the response headers.** A public
+  object fetched with `?response-content-type=text/html` was served as a web
+  page from the server's own origin, the one the dashboard runs on. As on
+  AWS, `response-*` overrides on an unsigned request are refused with
+  `InvalidRequest`; signed and presigned requests keep them, and are
+  authenticated, so a made-up signature does not. The public grant covers
+  such a signed request, unless the key's own policy denies it. Every earlier
+  version is affected.
+- **A dashboard upload no longer overwrites a locked object.** In a bucket
+  without versioning, or with versioning suspended, an upload replaced the
+  current object (in a suspended bucket, the null version, even below a newer
+  version) without checking object lock, so a file under legal hold or
+  retention could be overwritten from the dashboard. It is refused now, as an
+  S3 PUT is, and a refusal on the node a cluster forwards the upload to is
+  answered 403 rather than 500. Every earlier version is affected.
+- **Keys that name the server's own files are refused.** A key beginning with
+  `.vs/` (the version store), `.ec/` (erasure shards) or `.multipart/`, or
+  with a segment beginning `.vaults3-tmp-`, named files the storage engine
+  keeps inside the bucket: a dashboard upload of `.vs/X/null` replaced the
+  content of `X`. Such keys are refused with 400.
+- **Dashboard uploads and rollbacks are held to the bucket quota.** They were
+  never checked, so a user allowed to upload could fill a bucket, and the
+  disk, past any size or object count quota.
+- **A versioned bucket is held to its quota.** With versioning enabled every
+  version, the latest included, is kept in the bucket's version store, which
+  the bucket's size skipped: a versioned bucket counted as empty, so its quota
+  limited nothing. Every stored version now counts, in bytes on disk and as
+  an object, in the quota, in S3 `GET ?quota` and in the Prometheus bucket
+  metrics. The dashboard's bucket pages still show live objects at their
+  recorded size.
+- **An upload of unknown length no longer holds the whole object in memory
+  with erasure coding.** A chunked upload, or an aws-chunked one without a
+  decoded length, was read into memory in full before it was erasure coded, so
+  one upload held up to the 5 GiB object limit in RAM and a few at once could
+  exhaust the server. At most one block is now held: a larger object is copied
+  to a file on the data volume, sealed with a key that exists only in memory
+  so the copy is never plaintext on disk, and erasure coded from there with
+  its length known. Such an upload briefly needs its own size in free disk
+  space, and a copy left by a stopped server is removed at startup.
+- **Multipart upload parts count against the bucket quota.** Parts are kept
+  outside the bucket until the upload completes, so the bucket's size never
+  counted them and neither an uploaded nor a copied part (UploadPartCopy) was
+  held to the quota: parts nobody completed could fill the disk whatever the
+  quota. A part is now refused with `QuotaExceeded` once the stored objects
+  and every uploaded part in the bucket would pass the quota (re-uploading a
+  part replaces its old copy, which then does not count). A part whose
+  declared length is past the quota is refused before its body is read.
+  Parts uploaded at the same moment are each checked against the parts
+  already stored, as concurrent PutObjects are, so they can pass the quota by
+  what is in flight.
+- **CopyObject is held to the destination bucket's quota.** It never checked
+  the size or object count quota, so copies filled a bucket past both. A
+  copy is now refused with `QuotaExceeded` as a PutObject of the same size is.
+- **A bucket already past its size quota refuses uploads of unknown length.**
+  When a quota was lowered below what a bucket held, the room left was
+  negative, which the streaming checks read as no quota at all: a chunked
+  upload (or an aws-chunked one without a decoded length) of any size was
+  stored. Such a bucket now refuses every upload that adds bytes.
+
+### Fixed
+- **An overwrite in a bucket at its quota is allowed when it fits.** In a
+  bucket without versioning, a write to an existing key replaces it, but the
+  quota counted it as one more object: an overwrite, or a copy of an object
+  onto itself to change its metadata (`rclone touch`,
+  `aws s3 cp --metadata-directive REPLACE`), was refused in a bucket at its
+  quota. The replaced object's bytes on disk are given back too, so a copy
+  in place of a large object fits. A suspended bucket rewrites the null
+  version in place and is treated the same. A packed or erasure coded object
+  gives back its count only.
+- **In a cluster, an upload whose holder failed after `100 Continue` was
+  answered 200 and not stored.** A client that sends `Expect: 100-continue`
+  (curl does for a body over 1 MB, and so do many SDKs) to a node that does
+  not hold the key had the holder's 100 passed through to it; if the holder
+  then failed mid-body, the forwarding node took the 1xx for the answer,
+  wrote nothing more, and the client got an empty 200 for an object that was
+  never stored. It now gets 503 `SlowDown` and retries. Every earlier
+  version with clustering is affected.
+- **A draining node refuses form uploads and DeleteObjects too.** The drain
+  gate refused only requests naming a key, so a node being evacuated still
+  stored form uploads and ran multi-object deletes, which could then be lost
+  with the node. A presigned POST for a key another node holds is still
+  forwarded there, as a PutObject is.
+- **Active-active replication works.** From 4.4.56 the sync endpoint a site
+  pulls changes from accepted only the cluster secret, which a peer never
+  sends: a peer signs with the access key in its `replication.peers` entry, so
+  every sync was refused with 403 and nothing replicated in either direction.
+  The endpoint now accepts that SigV4 signature, checks the request body
+  against its signed SHA-256, and answers with only the changes that key may
+  both list and read (`s3:ListBucket` on the bucket and `s3:GetObject` on the
+  object, so the change log never names a key the peer could not list, with
+  the same policy condition keys as an S3 request and each change judged as a
+  listing of its own key or one of its folders, `s3:prefix` included, so
+  AWS's home-folder policy works); the
+  cluster secret is still accepted and sees every change. Both sites need
+  5.0.11. A bucket with versioning is not replicated yet: a change was applied
+  as a plain write, which corrupted its version history, so such changes are
+  skipped and logged. A change to a locked object, or to a key this server
+  cannot store, is skipped the same way, so it neither replaces nor removes a
+  locked object nor holds the sync for good.
+- **Browser uploads signed with a POST policy work** (what the SDKs call a
+  presigned POST, such as boto3 `generate_presigned_post`). They were refused
+  with `AccessDenied`, because the server required an `Authorization` header
+  that such a form never has, although the documentation said POST policies
+  were supported. The form is now checked from the fields before the file,
+  and nothing of the file is read for a form that fails: the SigV4 signature
+  over the policy (field names in any case), its expiry, every condition
+  (`eq`, `starts-with`, `content-length-range`, exact matches, with the bucket
+  compared to the one in the URL, and an unknown condition refused), that
+  every field is named by the policy, the signer's IP allowlist and their
+  permission to write the key. Everything before the file, part headers
+  included, is bounded (320 KiB, and 1000 parts) and must arrive within the
+  header time limit (30 s), so a
+  client that stalls them is cut off. The file then streams into storage with
+  no time limit, held to the size range and the bucket quota, and checked
+  against any `x-amz-checksum-*` field
+  (`BadDigest` when it does not match). Content-Type, Cache-Control,
+  Content-Disposition, Content-Encoding, Content-Language, `x-amz-meta-*` and
+  `tagging` fields are stored, a `bucket` field (minio-go sends one) must name
+  the bucket the form is posted to, and `x-amz-server-side-encryption: AES256`
+  is accepted as PutObject accepts it. The object's type comes only from the
+  signed Content-Type field, never from the file part's own header. A field
+  the server cannot honour, such as SSE-C keys, SSE-KMS or a storage class, is
+  refused with
+  `NotImplemented` rather than ignored. Signature Version 2 forms are refused.
+  The old check, which a form upload never reached, accepted a policy for one
+  bucket on another and ignored `eq` conditions. In a cluster the form is
+  routed by the key it names, to that key's holder, which checks it again:
+  routed by the bucket alone, as before, the object was stored on a node
+  that reads of the key never ask, and a slow file through another node was
+  cut off after 30 s. A forwarded upload is charged to the per-key rate limit
+  and audited once, by the node that stores it.
+- **Push replication signs the bodies it sends.** It sent every object as
+  `UNSIGNED-PAYLOAD`, so a body changed between the two sites (over plain
+  HTTP) was stored by the peer as the object. The SHA-256 of each body is now
+  signed, and a peer on 5.0.9 or later refuses a changed one, which
+  replication then retries. Older peers accept the signed hash as before.
+  Each replicated object is read twice from local disk, once to hash it and
+  once to send it. Active-active replication pulls objects with GET, and S3
+  does not sign an answer, so between sites on an untrusted network use
+  `https://` peer URLs.
+- **Copy and multipart answers say when an object is encrypted.** With
+  encryption at rest on, PutObject, GET and HEAD returned
+  `x-amz-server-side-encryption: AES256`, but CopyObject,
+  CreateMultipartUpload and CompleteMultipartUpload did not, although they
+  write the same encrypted object. They do now, as does a form upload, and as before only for a
+  bucket that is really encrypted. UploadPart and UploadPartCopy do not say
+  it: a part is stored as sent until the upload completes, and only the
+  completed object is encrypted.
+- **The `Location` of a completed multipart upload or a form upload is
+  percent-encoded.** It was the raw key, so a key with a space, `#` or `?`
+  gave a link to another object or none.
+- **Versions written in the same second are listed newest first.**
+  ListObjectVersions sorted by LastModified, in whole seconds, and left
+  versions from the same second in the store's order, oldest first, so a
+  client reading "the previous version" could get another one. The version ID,
+  which begins with the write time in nanoseconds, now breaks the tie. The
+  null version carries no time and is placed last among versions of the same
+  second, which is wrong only when it was written between them. The lifecycle
+  worker sorts the same way and always keeps the version marked current. A
+  dashboard upload to a bucket with versioning suspended writes the null
+  version in place, as S3 does; it left the old null version's bytes behind
+  and listed two null versions. Six more versioning tests of the Ceph
+  s3-tests suite pass, and the conformance gate grows from 317 to 323.
+- **A lifecycle rule's ID is returned** by GetBucketLifecycleConfiguration. It
+  was stored but left out of the answer.
+- **A multipart part for an upload held by another cluster node is forwarded
+  as sent.** It was forwarded only after the router had decoded its
+  aws-chunked body, so the holder got decoded bytes under a `STREAMING-*`
+  payload hash, without the `Content-Encoding` the client had signed, and
+  refused the part.
+- **A cluster node that answers `100 Continue` no longer hides its real
+  answer.** The failover proxy took any first status for the answer, so a 404
+  it should have tried the next node for, or an error, was replaced by the 1xx.
+- **An object uploaded as `gzip,aws-chunked` keeps `Content-Encoding: gzip`.**
+  The aws-chunked marker was removed by dropping the whole header.
+- **HTTP/2 requests no longer leave a 10 second timer behind.** The bounded
+  drain of an unread body applies to HTTP/1.1 only; HTTP/2 resets the stream.
+
+### Removed
+- **Moving objects to the cold tier.** Nothing read from the cold tier: the
+  S3 API and the dashboard read the hot directory only, and objects were moved
+  below the encryption and compression layers. Every object the tiering scan
+  or a manual migration moved there answered NoSuchKey until it was moved
+  back. Until reads go through the tier, the scan does not run and the `cold`
+  direction is refused. RestoreObject now moves the data back (it only marked
+  the record hot, so a restored object stayed unreadable), and so does the
+  tiering API's `hot` direction; both also bring back objects 5.0.10 had
+  "restored" that way, and accept `versionId=null`. A restore puts the data
+  back only where no hot file exists, so it never replaces what a PUT wrote
+  meanwhile, and answers 409 when there is nothing to restore. It keeps the
+  cold copy when another key's folder now uses the object's path, does not
+  bring back an object deleted on purpose, and leaves nothing behind when a
+  DELETE lands while it runs. Every earlier
+  version with tiering is affected.
+- **FIFO quota eviction.** A bucket flag (never settable through any API)
+  made an upload past the quota delete the bucket's oldest objects, judged on
+  the upload's declared size before its body arrived. A full bucket now always
+  refuses the upload with `QuotaExceeded`.
+
+### Dependencies
+- `golang.org/x/net` 0.62.0, `golang.org/x/crypto` 0.58.0, `golang.org/x/sys`
+  0.49.0 and `golang.org/x/text` 0.43.0.
+
 ## [5.0.10] - 2026-11-08
 ### Fixed
 - **Migrating from a MinIO (or any S3 server) on your own network works
@@ -3650,7 +3896,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.10...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.11...HEAD
+[5.0.11]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.10...v5.0.11
 [5.0.10]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.9...v5.0.10
 [5.0.9]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.8...v5.0.9
 [5.0.8]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.7...v5.0.8

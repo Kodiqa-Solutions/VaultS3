@@ -86,6 +86,7 @@ func (h *ObjectHandler) CreateMultipartUpload(w http.ResponseWriter, r *http.Req
 		UploadId string   `xml:"UploadId"`
 	}
 
+	h.setSSEHeader(w, bucket)
 	writeXML(w, http.StatusOK, initResult{
 		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
 		Bucket:   bucket,
@@ -95,14 +96,11 @@ func (h *ObjectHandler) CreateMultipartUpload(w http.ResponseWriter, r *http.Req
 }
 
 // requireUpload resolves an upload ID for a request that names one. It returns
-// the record and true when this node holds it and should serve the request
-// locally. It returns false when the caller must stop, either because a peer
-// holding the upload has already answered, or because the upload genuinely does
-// not exist anywhere and a NoSuchUpload has been written.
-//
-// Every multipart handler goes through here so none of them can reintroduce the
-// bug where a node that lacks the record answers NoSuchUpload for an upload that
-// is alive on a different node (issue #47 bug B).
+// the record and true when this node holds it. It returns false, with a
+// NoSuchUpload written, when it does not. A request for an upload another node
+// holds never reaches here: the router forwards it to that node first
+// (forwardToUploadHolder), before the body is decoded, so the holder gets the
+// part exactly as the client sent it (issue #47 bug B).
 //
 // The upload must also belong to the bucket and key in the URL. That was never
 // compared, so an upload id was a capability for whatever object it was started
@@ -120,11 +118,25 @@ func (h *ObjectHandler) requireUpload(w http.ResponseWriter, r *http.Request, up
 		}
 		return upload, true
 	}
-	if h.multipartHolder != nil && h.multipartHolder(w, r, uploadID) {
-		return nil, false
-	}
+	// An upload held by another node was forwarded by the router before its
+	// body was read (forwardToUploadHolder), so not finding it here means no
+	// node has it.
 	writeS3Error(w, "NoSuchUpload", "Upload not found", http.StatusNotFound)
 	return nil, false
+}
+
+// forwardToUploadHolder sends a request for a multipart upload this node has
+// no record of to the node that holds it, and reports whether it did. Called
+// by the router before the request body is decoded or checked, so the holder
+// receives the request exactly as the client sent it.
+func (h *ObjectHandler) forwardToUploadHolder(w http.ResponseWriter, r *http.Request, uploadID string) bool {
+	if h.multipartHolder == nil {
+		return false
+	}
+	if _, err := h.multipartStore().GetMultipartUpload(uploadID); err == nil {
+		return false
+	}
+	return h.multipartHolder(w, r, uploadID)
 }
 
 // lockUpload serializes the requests that end an upload. Two concurrent
@@ -162,8 +174,16 @@ func (h *ObjectHandler) UploadPart(w http.ResponseWriter, r *http.Request, bucke
 	// A part is checked against its Content-MD5 and x-amz-checksum-* the same
 	// way a whole object is, inside the reader, so a part that arrives damaged
 	// never replaces a good copy of itself. Neither was checked at all.
+	// Parts live outside the bucket until the upload completes, so the
+	// bucket's size does not count them. They are held to the quota here, or
+	// parts nobody completes could fill the disk however small the quota.
+	limit := h.partQuotaLimit(bucket, uploadID, partNum)
+	if limit >= 0 && r.ContentLength > limit {
+		writeS3Error(w, "QuotaExceeded", "Maximum bucket size exceeded", http.StatusForbidden)
+		return
+	}
 	digests := newPutDigests(r, r.Body)
-	digests.checkInline(r, -1)
+	digests.checkInline(r, limit)
 	// For a part this is a second layer: writePart's first read returns the
 	// same failure before anything is renamed into place. PutObject needs it,
 	// since an engine given a size of 0 may save without reading.
@@ -192,6 +212,8 @@ func (h *ObjectHandler) UploadPart(w http.ResponseWriter, r *http.Request, bucke
 	w.Header().Set("ETag", etag)
 	setChecksumHeaders(w, &metadata.ObjectMeta{ChecksumSHA256: digests.sums.SHA256, ChecksumCRC32: digests.sums.CRC32,
 		ChecksumCRC32C: digests.sums.CRC32C, ChecksumSHA1: digests.sums.SHA1, ChecksumCRC64NVME: digests.sums.CRC64NVME})
+	// No x-amz-server-side-encryption here: a part is stored as sent until
+	// the upload completes, and only the completed object is encrypted.
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -353,7 +375,7 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	for _, p := range req.Parts {
 		estimatedSize += sizes[p.PartNumber]
 	}
-	if !h.checkQuota(w, bucket, estimatedSize) {
+	if !h.checkQuotaFor(w, bucket, key, estimatedSize) {
 		return
 	}
 
@@ -499,9 +521,10 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	if meta.VersionID != "" {
 		w.Header().Set("X-Amz-Version-Id", meta.VersionID)
 	}
+	h.setSSEHeader(w, bucket)
 	writeXML(w, http.StatusOK, completeResult{
 		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
-		Location: fmt.Sprintf("/%s/%s", bucket, key),
+		Location: objectLocation(bucket, key),
 		Bucket:   bucket,
 		Key:      key,
 		ETag:     meta.ETag,
@@ -563,6 +586,7 @@ func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, b
 	}
 
 	var dataReader io.Reader = reader
+	copyLen := srcSize
 
 	// Parse optional range header
 	if rangeHeader := r.Header.Get("X-Amz-Copy-Source-Range"); rangeHeader != "" {
@@ -587,6 +611,15 @@ func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, b
 			return
 		}
 		dataReader = io.LimitReader(reader, end-start+1)
+		copyLen = end - start + 1
+	}
+
+	// A copied part is held to the bucket's quota like an uploaded one. It
+	// used to skip the check, so copies of an object already in the bucket
+	// filled the disk past the quota with parts nobody completed.
+	if limit := h.partQuotaLimit(bucket, uploadID, partNum); limit >= 0 && copyLen > limit {
+		writeS3Error(w, "QuotaExceeded", "Maximum bucket size exceeded", http.StatusForbidden)
+		return
 	}
 
 	// Write to the part file through the same temp-then-rename path as a normal
@@ -617,6 +650,8 @@ func (h *ObjectHandler) UploadPartCopy(w http.ResponseWriter, r *http.Request, b
 	if srcMeta.VersionID != "" {
 		w.Header().Set("X-Amz-Copy-Source-Version-Id", srcMeta.VersionID)
 	}
+	// No x-amz-server-side-encryption, as for UploadPart: the part is not
+	// encrypted until the upload completes.
 	writeXML(w, http.StatusOK, copyPartResult{
 		ETag:         etag,
 		LastModified: now.Format(time.RFC3339),
@@ -750,4 +785,35 @@ func uploadLockRequest(u *metadata.MultipartUpload) *http.Request {
 		}
 	}
 	return &http.Request{Header: h}
+}
+
+// partQuotaLimit is how many bytes part partNum of uploadID may hold under the
+// bucket's quota: what the quota leaves after the stored objects and the
+// parts already uploaded to every multipart upload in the bucket, except the
+// copy of this part being replaced. -1 when the bucket has no size quota.
+func (h *ObjectHandler) partQuotaLimit(bucket, uploadID string, partNum int) int64 {
+	limit := h.quotaByteLimit(bucket)
+	if limit < 0 {
+		return -1
+	}
+	uploads, err := h.multipartStore().ListMultipartUploads(bucket)
+	if err != nil {
+		return limit
+	}
+	for _, u := range uploads {
+		parts, err := h.multipartStore().ListParts(u.UploadID)
+		if err != nil {
+			continue
+		}
+		for _, p := range parts {
+			if u.UploadID == uploadID && p.PartNumber == partNum {
+				continue
+			}
+			limit -= p.Size
+		}
+	}
+	if limit < 0 {
+		return 0
+	}
+	return limit
 }

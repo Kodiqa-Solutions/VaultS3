@@ -3,6 +3,8 @@ package replication
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -171,7 +173,8 @@ func (w *BiDirectionalWorker) syncPeer(ctx context.Context, name string, peer co
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-VaultS3-Replication", "active-active")
-	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	reqSum := sha256.Sum256(reqBody)
+	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(reqSum[:]))
 	signV4(req, peer.AccessKey, peer.SecretKey, "us-east-1")
 
 	resp, err := w.client.Do(req)
@@ -242,8 +245,31 @@ func (w *BiDirectionalWorker) syncPeer(ctx context.Context, name string, peer co
 }
 
 func (w *BiDirectionalWorker) applyRemoteChange(ctx context.Context, peer config.ReplicationPeer, change ChangeEntry) error {
+	// A change is applied as a plain write or delete. In a bucket with
+	// versioning that corrupted its history (two versions both latest, a
+	// replicated object outside the version store), so such a bucket is not
+	// replicated yet: the change is skipped and said so. Sync never worked
+	// before 5.0.11, so this never ran.
+	// A key the server cannot store (one with "./" or "//", which would name
+	// another key's file) is skipped, so one such change cannot hold the
+	// cursor and stop replication for good.
+	if msg := storage.KeyProblem(change.Key); msg != "" {
+		slog.Warn("bidirectional: skipping a change to a key this server cannot store", "bucket", change.Bucket, "key", change.Key, "reason", msg)
+		return nil
+	}
+	if v, _ := w.store.GetBucketVersioning(change.Bucket); v != "" {
+		slog.Warn("bidirectional: skipping a change to a bucket with versioning, which active-active does not replicate yet",
+			"bucket", change.Bucket, "key", change.Key, "versioning", v)
+		return nil
+	}
 	// Check for conflict with local state
 	localMeta, err := w.store.GetObjectMeta(change.Bucket, change.Key)
+	// Object lock holds against a replicated write or delete as against any
+	// other: a locked object is not replaced or removed.
+	if err == nil && localMeta != nil && objectLocked(localMeta) {
+		slog.Warn("bidirectional: skipping a change to a locked object", "bucket", change.Bucket, "key", change.Key)
+		return nil
+	}
 
 	if change.EventType == "delete" {
 		if err != nil {
@@ -326,7 +352,7 @@ func (w *BiDirectionalWorker) applyRemoteChange(ctx context.Context, peer config
 		return fmt.Errorf("create GET request: %w", err)
 	}
 	getReq.Header.Set("X-VaultS3-Replication", "active-active")
-	getReq.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	getReq.Header.Set("X-Amz-Content-Sha256", emptyPayloadSHA256)
 	signV4(getReq, peer.AccessKey, peer.SecretKey, "us-east-1")
 
 	getResp, err := w.client.Do(getReq)
@@ -410,6 +436,18 @@ func (w *BiDirectionalWorker) HandleSyncRequest(rw http.ResponseWriter, r *http.
 		return
 	}
 
+	// A peer that signed with an access key sees only the changes that key may
+	// read. The cursor still moves past the others (LastSeq).
+	if may, ok := r.Context().Value(syncReaderKey{}).(SyncReader); ok {
+		readable := changes[:0:0]
+		for _, c := range changes {
+			if may(c.Bucket, c.Key) {
+				readable = append(readable, c)
+			}
+		}
+		changes = readable
+	}
+
 	resp := SyncResponse{
 		SiteID:  w.siteID,
 		Changes: changes,
@@ -422,6 +460,25 @@ func (w *BiDirectionalWorker) HandleSyncRequest(rw http.ResponseWriter, r *http.
 	}
 }
 
+// SyncReader reports whether the peer asking for a sync may read an object.
+type SyncReader func(bucket, key string) bool
+
+type syncReaderKey struct{}
+
+// WithSyncReader limits the sync answer for r to the changes may allows.
+func WithSyncReader(r *http.Request, may SyncReader) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), syncReaderKey{}, may))
+}
+
 // maxSyncBatch caps how many change log entries one sync answer carries. It is
 // a variable so a test can lower it instead of writing a thousand entries.
 var maxSyncBatch = 1000
+
+// objectLocked reports whether object lock forbids replacing or removing the
+// object: a legal hold, or retention that has not expired.
+func objectLocked(m *metadata.ObjectMeta) bool {
+	if m.LegalHold {
+		return true
+	}
+	return m.RetentionMode != "" && m.RetentionUntil > 0 && time.Now().UTC().Unix() < m.RetentionUntil
+}

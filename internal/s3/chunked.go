@@ -79,8 +79,21 @@ func decodeAwsChunked(r *http.Request, signer *chunkSigner) {
 			r.Header.Set("Content-Length", dl)
 		}
 	}
-	// Drop the encoding markers so nothing downstream double-decodes.
-	r.Header.Del("Content-Encoding")
+	// Drop the aws-chunked marker so nothing downstream decodes again, and
+	// keep any other encoding, which belongs to the object: a client storing a
+	// gzip file sends "gzip,aws-chunked", and the whole header used to be
+	// dropped, so the object lost its Content-Encoding.
+	var kept []string
+	for _, enc := range strings.Split(r.Header.Get("Content-Encoding"), ",") {
+		if enc = strings.TrimSpace(enc); enc != "" && !strings.EqualFold(enc, "aws-chunked") {
+			kept = append(kept, enc)
+		}
+	}
+	if len(kept) > 0 {
+		r.Header.Set("Content-Encoding", strings.Join(kept, ","))
+	} else {
+		r.Header.Del("Content-Encoding")
+	}
 }
 
 // maxTrailerBytes bounds the trailer read after an aws-chunked body. A real one

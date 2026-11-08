@@ -198,17 +198,23 @@ func TestUnreadableLockRefusesTheDelete(t *testing.T) {
 	}
 }
 
-// FIFO eviction is a delete, so it skips what object lock protects.
-func TestFifoEvictionSkipsLockedObjects(t *testing.T) {
+// A full bucket refuses the next upload and keeps every object it holds. FIFO
+// eviction, which deleted the oldest objects instead on the strength of an
+// upload's declared size, was removed in 5.0.11 (nothing could turn it on).
+func TestFullBucketRefusesAndKeepsItsObjects(t *testing.T) {
 	e := newFixEnv(t)
-	e.admin(t, http.MethodPut, "/fifob", "").must(t, "create bucket")
-	e.admin(t, http.MethodPut, "/fifob/a", "held", "X-Amz-Object-Lock-Legal-Hold", "ON").must(t, "put held")
-	e.admin(t, http.MethodPut, "/fifob/b", "free").must(t, "put free")
-	e.h.objects.fifoEvict("fifob", 1, 0)
-	if got := e.admin(t, http.MethodGet, "/fifob/a", ""); got.body != "held" {
-		t.Errorf("eviction removed an object under legal hold: %d %q", got.code, got.body)
+	e.admin(t, http.MethodPut, "/fullb", "").must(t, "create bucket")
+	e.admin(t, http.MethodPut, "/fullb/a", "first").must(t, "put a")
+	e.admin(t, http.MethodPut, "/fullb/b", "second").must(t, "put b")
+	if err := e.store.UpdateBucketQuota("fullb", 0, 2); err != nil {
+		t.Fatal(err)
 	}
-	expect(t, "the unlocked object was the one evicted", e.admin(t, http.MethodGet, "/fifob/b", ""), http.StatusNotFound, "NoSuchKey")
+	expect(t, "an upload to a full bucket", e.admin(t, http.MethodPut, "/fullb/c", "third"), http.StatusForbidden, "QuotaExceeded")
+	for key, want := range map[string]string{"a": "first", "b": "second"} {
+		if got := e.admin(t, http.MethodGet, "/fullb/"+key, ""); got.body != want {
+			t.Errorf("%s reads %d %q after the refused upload, want %q", key, got.code, got.body, want)
+		}
+	}
 }
 
 func md5sum(s string) []byte { return md5Bytes(s) }

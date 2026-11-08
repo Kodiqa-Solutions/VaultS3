@@ -693,6 +693,14 @@ backup:
   combine both layers for full disk-*and*-node protection.
 - **Backup:** local target only. Restore is a manual file copy.
 - **Replication:** VaultS3↔VaultS3 only. Not to AWS S3 or other providers.
+- **Bucket quotas are counted per node.** Each node holds a bucket to its quota
+  with the objects and parts it stores itself, so with fewer replicas than nodes
+  a bucket can hold more than its quota across the cluster.
+- **Form uploads signed with an Authorization header** (not a POST policy) are routed by
+  their bucket, since the key is inside the form and the signature covers the body as sent,
+  so the form cannot be rebuilt for the key's own node. In a cluster where a bucket has fewer
+  replicas than there are nodes, use PutObject or a presigned POST (POST policy) instead,
+  which is routed by its key.
 - **Config nit:** sample `heal_interval_secs: 300` vs. an older code default of 3600, set it
   explicitly to avoid surprises.
 

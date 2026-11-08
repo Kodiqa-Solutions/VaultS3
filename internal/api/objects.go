@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/search"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 type objectListItem struct {
@@ -312,7 +314,12 @@ func (h *APIHandler) consoleDeleteObject(bucket, key string) error {
 	if reason := objectLockReason(meta); reason != "" {
 		return &deleteLockedError{reason: reason}
 	}
-	if err := h.engine.DeleteObject(bucket, key); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	// A record an earlier version stored under a key the server now refuses
+	// ("./doc", ".vs/X/null") names another object's file. Only the record
+	// goes; deleting the file would destroy that other object, past its lock.
+	if storage.KeyProblem(key) != "" {
+		slog.Warn("deleting the record of a key this server no longer accepts, keeping the file it named", "bucket", bucket, "key", key)
+	} else if err := h.engine.DeleteObject(bucket, key); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("delete data: %w", err)
 	}
 	if err := h.store.DeleteObjectMeta(bucket, key); err != nil {
@@ -390,8 +397,12 @@ func objectLockReason(meta *metadata.ObjectMeta) string {
 // latest version when the bucket is versioned (data then lives under .vs/, not
 // at the plain key path).
 func (h *APIHandler) getLatestObject(bucket, key string) (io.ReadCloser, int64, *metadata.ObjectMeta, error) {
+	// A key with no record is not an object, whatever is on disk at its
+	// path: read without one, "%2E/secret/doc" (a dot the URL does not
+	// redirect) served secret/doc past the policy written for it, and
+	// ".vs/k/<id>" served a deleted version.
 	meta, _ := h.store.GetObjectMeta(bucket, key)
-	if meta != nil && meta.DeleteMarker {
+	if meta == nil || meta.DeleteMarker {
 		return nil, 0, meta, errObjectNotFound
 	}
 	versionID := ""
@@ -426,6 +437,12 @@ func (h *APIHandler) handleDownload(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
+	// A key the server refuses names another object's file ("./secret/doc"
+	// is secret/doc), even where an earlier version left a record for it.
+	if validateObjectKey(key) != nil {
+		writeError(w, http.StatusNotFound, "object not found")
+		return
+	}
 	reader, size, meta, err := h.getLatestObject(bucket, key)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "object not found")
@@ -475,13 +492,26 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 	versioning, _ := h.store.GetBucketVersioning(bucket)
 	user, _ := h.authenticateUser(r)
 	var results []uploadResult
-	var anyFailed, anyDenied bool
+	var anyFailed, anyDenied, anyOverQuota bool
 
 	// fail records a per-file failure: it logs the real reason (uploads used to
 	// swallow write errors silently and still return 200, so a full disk or a
 	// permission error surfaced only as a blank "upload failed" with no logs —
 	// issue #26) and reports it back to the client.
 	fail := func(key string, err error) {
+		// Over quota is the caller's answer, not a server failure: 403
+		// QuotaExceeded, as on the S3 API, and not logged as an error.
+		if errors.Is(err, errUploadQuota) {
+			results = append(results, uploadResult{Key: key, Error: errUploadQuota.Error()})
+			anyOverQuota = true
+			return
+		}
+		var refused *ownerRefusal
+		if errors.As(err, &refused) {
+			results = append(results, uploadResult{Key: key, Error: refused.msg})
+			anyDenied = true
+			return
+		}
 		slog.Error("dashboard upload failed", "bucket", bucket, "key", key, "error", err)
 		results = append(results, uploadResult{Key: key, Error: err.Error()})
 		anyFailed = true
@@ -554,17 +584,58 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 			}
 		}
 
+		// Held to the bucket's quota as an S3 upload is. Dashboard uploads
+		// never were, so a user allowed to upload could fill the disk past
+		// any quota.
+		limit, qerr := h.uploadQuota(bucket, key, versioning)
+		if qerr != nil {
+			part.Close()
+			fail(key, qerr)
+			continue
+		}
+
+		// Without versioning, or suspended, an upload replaces the current
+		// object (the null version), so object lock has to refuse it, as it
+		// refuses an S3 PUT. Dashboard uploads never checked, so a locked
+		// object could be overwritten from the dashboard.
+		current, _ := h.store.GetObjectMeta(bucket, key)
+		// What the upload replaces: the current object, or in a suspended
+		// bucket the null version, which may sit below a newer version (then
+		// the latest pointer is not the one to check, as on the S3 path).
+		replaced := current
+		if versioning == "Suspended" && current != nil && current.VersionID != "" && current.VersionID != nullVersionID {
+			replaced, _ = h.store.GetObjectVersion(bucket, key, nullVersionID)
+		}
+		if versioning != "Enabled" && replaced != nil && !replaced.DeleteMarker {
+			if reason := objectLockReason(replaced); reason != "" {
+				part.Close()
+				results = append(results, uploadResult{Key: key, Error: "AccessDenied: " + reason})
+				anyDenied = true
+				continue
+			}
+		}
+		var body io.Reader = part
+		if limit >= 0 {
+			body = &quotaReader{r: part, left: limit}
+		}
+
 		now := time.Now().UTC().Unix()
 		var written int64
 		var etag string
 
 		// size -1: the part is streamed, so its length is unknown up front; the
 		// engine reports the actual bytes written.
-		if versioning == "Enabled" {
+		if versioning == "Enabled" || versioning == "Suspended" {
 			// Versioned bucket: write a new version so the object has history
 			// (and is snapshot/restore-able), mirroring the S3 PutObject path.
+			// A suspended bucket writes the null version in place, as S3
+			// does; it used to take the plain path, which left the null
+			// version's bytes behind and listed a second null version.
 			versionID := genVersionID()
-			written, etag, err = h.engine.PutObjectVersion(bucket, key, versionID, part, -1)
+			if versioning == "Suspended" {
+				versionID = nullVersionID
+			}
+			written, etag, err = h.engine.PutObjectVersion(bucket, key, versionID, body, -1)
 			part.Close()
 			if err != nil {
 				fail(key, err)
@@ -584,11 +655,18 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 				fail(key, err)
 				continue
 			}
+			// A null version from before versioning lived at the plain path;
+			// the new null version replaces it.
+			if versioning == "Suspended" && current != nil && current.VersionID == "" && !current.DeleteMarker {
+				if derr := h.engine.DeleteObject(bucket, key); derr != nil {
+					slog.Warn("could not remove the replaced pre-versioning copy", "bucket", bucket, "key", key, "error", derr)
+				}
+			}
 			if h.onReplication != nil {
 				h.onReplication("s3:ObjectCreated:Put", bucket, key, written, etag, versionID)
 			}
 		} else {
-			written, etag, err = h.engine.PutObject(bucket, key, part, -1)
+			written, etag, err = h.engine.PutObject(bucket, key, body, -1)
 			part.Close()
 			if err != nil {
 				fail(key, err)
@@ -630,7 +708,7 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 	switch {
 	case anyFailed:
 		status = http.StatusInternalServerError
-	case anyDenied:
+	case anyDenied, anyOverQuota:
 		status = http.StatusForbidden
 	}
 	writeJSON(w, status, results)
@@ -701,6 +779,12 @@ func (h *APIHandler) handleBulkDelete(w http.ResponseWriter, r *http.Request, bu
 	user, _ := h.authenticateUser(r)
 
 	for _, key := range req.Keys {
+		// The keys come from the body, where nothing cleans them: "./doc"
+		// named doc's file under another name, past its lock and its policy.
+		if err := validateObjectKey(key); err != nil {
+			results = append(results, deleteResult{Key: key, Error: err.Error()})
+			continue
+		}
 		// The route gate checked DeleteObject on the bucket wildcard only, so a
 		// Deny on a prefix inside the bucket never applied here.
 		if err := h.authorizeConsoleAction(r, user, consoleAction{action: "s3:DeleteObject", bucket: bucket, key: key}); err != nil {
@@ -937,4 +1021,70 @@ func (h *APIHandler) handleDownloadZip(w http.ResponseWriter, r *http.Request, b
 			}
 		}
 	}
+}
+
+// errUploadQuota refuses a dashboard upload past the bucket's quota.
+var errUploadQuota = errors.New("QuotaExceeded: the bucket's quota does not leave room for this file")
+
+// uploadQuota is how many bytes a dashboard upload to key may write, or -1
+// when the bucket has no size quota, and an error when its object count quota
+// leaves no room. A write to an existing key in a bucket without versioning
+// replaces it, so it is not one more object, as for an S3 PutObject.
+func (h *APIHandler) uploadQuota(bucket, key, versioning string) (int64, error) {
+	info, err := h.store.GetBucket(bucket)
+	if err != nil || (info.MaxSizeBytes == 0 && info.MaxObjects == 0) {
+		return -1, nil
+	}
+	size, count, _ := h.engine.BucketSize(bucket)
+	// An overwrite is not one more object, and gives back the replaced
+	// file's size on disk (the quota counts bytes on disk, which a compressed
+	// object's recorded size is not). A suspended bucket rewrites the null
+	// version in place.
+	if versioning != "Enabled" {
+		if meta, merr := h.store.GetObjectMeta(bucket, key); merr == nil && meta != nil && !meta.DeleteMarker {
+			switch {
+			case versioning == "":
+				count--
+				size -= regularFileSize(h.engine.ObjectPath(bucket, key))
+			case meta.VersionID == "null":
+				count--
+				size -= regularFileSize(h.engine.ObjectPath(bucket, ".vs/"+key+"/null"))
+			case meta.VersionID == "":
+				count--
+				size -= regularFileSize(h.engine.ObjectPath(bucket, key))
+			}
+		}
+	}
+	if info.MaxObjects > 0 && count >= info.MaxObjects {
+		return 0, errUploadQuota
+	}
+	if info.MaxSizeBytes == 0 {
+		return -1, nil
+	}
+	return max(0, info.MaxSizeBytes-size), nil
+}
+
+// quotaReader fails the read once more than left bytes arrive, so the engine
+// abandons the write instead of storing past the quota.
+type quotaReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (q *quotaReader) Read(p []byte) (int, error) {
+	n, err := q.r.Read(p)
+	q.left -= int64(n)
+	if q.left < 0 {
+		return n, errUploadQuota
+	}
+	return n, err
+}
+
+// regularFileSize is the size on disk of a regular file at path, or 0, without
+// following a symbolic link (the bucket's disk walk counts the link itself).
+func regularFileSize(path string) int64 {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() {
+		return fi.Size()
+	}
+	return 0
 }

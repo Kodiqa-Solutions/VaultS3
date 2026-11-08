@@ -63,6 +63,126 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.11
+
+Nothing to migrate, and rolling back to 5.0.10 is safe. What behaves
+differently:
+
+- **A Deny in a policy now covers keys that contain a `*`.** A key such as
+  `private/*x` was not matched by a Deny on `bucket/private/*` and could be
+  read through a broader Allow. If you rely on Deny statements, look in your
+  audit log for reads of keys containing a `*` that the Deny should have
+  refused. An Allow pattern may now also grant keys with a `*` that it
+  wrongly refused before. A `?` now stands for one character rather than one
+  byte, which cuts both ways for a key with a non-ASCII character: `b/?.txt`
+  now matches `é.txt` (an Allow grants it, a Deny covers it), and `b/??.txt`
+  no longer does.
+- **An anonymous `s3:GetObject` grant no longer serves an object's
+  sub-resources or older versions.** A public bucket used to answer anonymous
+  requests for tags, ACL, attributes, legal hold, retention, upload parts and
+  `?versionId`. Each is now checked as its own action, as on AWS: grant
+  `s3:GetObjectVersion`, `s3:GetObjectTagging` and so on to `*` in the bucket
+  policy to keep one public. A client that reads public objects anonymously is
+  not affected; one that reads their tags or old versions anonymously under a
+  `s3:GetObject`-only policy now gets 403.
+- **Anonymous `response-*` overrides are refused** with 400 `InvalidRequest`,
+  as on AWS. Signed and presigned URLs keep them, from any key the public grant
+  covers; a page that links to a public object with
+  `?response-content-disposition=attachment` must presign it.
+- **Dashboard uploads and rollbacks are held to the bucket quota**, as S3
+  uploads are.
+- **A versioned bucket's size and object count now include every stored
+  version**, in the quota, S3 `GET ?quota` and the Prometheus bucket metrics
+  (`vaults3_bucket_*`). Earlier versions counted a versioned bucket as empty. A
+  versioned bucket with a quota may now be over it and refuse writes: raise the
+  quota, or expire old versions, before upgrading. Grafana dashboards and
+  alerts on bucket size will show the jump. The dashboard's own bucket pages
+  show live objects as before. A quota on a versioned bucket now costs a walk
+  of every stored version on each write, as it already did for an unversioned
+  bucket's objects.
+- **An overwrite or a copy in place at the quota is allowed when it fits**,
+  in a bucket without versioning or with versioning suspended: it replaces the
+  old object, whose bytes on disk are given back, instead of counting as one
+  more.
+- **Keys with a `.` or empty segment (`./a`, `a/./b`, `a//b`), keys beginning
+  with `.vs/`, `.ec/` or `.multipart/`, and keys with a segment beginning
+  `.vaults3-tmp-` are refused** with 400, in requests, Snowball entries (after
+  `./` is cleaned, so `tar -C dir .` archives still import), migrations and
+  replication. The first named another key's file; the others, the server's
+  own. Earlier versions stored records under such keys. Do not delete them
+  before upgrading: on 5.0.10 that destroys the file they name, which belongs
+  to another object. After upgrading, S3 refuses these keys, and the
+  dashboard's single-object delete removes such a record without touching the
+  file.
+- **A dashboard upload over a locked object is refused** with 403, as an S3
+  PUT already was.
+- **Lambda trigger output is not stored into a bucket with versioning, or over
+  a locked object**: it is logged and dropped. Point the output at a bucket
+  without versioning.
+- **Active-active replication syncs.** It was refused on every sync from
+  4.4.56 on, so sites set up since then have not been replicating: once both
+  are on 5.0.11 they pull every change in their change logs. The access key
+  in each `replication.peers` entry now decides what that peer receives: only
+  changes in buckets the key may list (`s3:ListBucket`) to objects it may read
+  (`s3:GetObject`). The others are skipped for good, not held back: a peer key
+  given more access later receives only changes made after that, so copy
+  older objects across once (for example with `mc mirror`). Use the admin key,
+  or an IAM key allowed to read every bucket, for a full replica. Upgrade both
+  sites: 5.0.10 and earlier still refuse the sync. A bucket with versioning
+  (enabled or suspended) is not replicated yet: its changes are skipped and
+  logged, as are changes to a locked object.
+- **CopyObject is held to the destination bucket's quota**, as PutObject is.
+  Earlier versions copied past both the size and the object count quota.
+- **Multipart upload parts count against a bucket's size quota**, copied parts
+  included. A part that would take the stored objects plus every uploaded part
+  past the quota is refused with `QuotaExceeded`. Earlier versions did not
+  count parts at all until the upload completed. Abort uploads you no longer
+  need: their parts now use quota. A PutObject is still held only to the
+  stored objects, not to pending parts. A bucket already past its quota (the
+  quota was lowered) now refuses uploads of unknown length too.
+- **Browser uploads signed with a POST policy (presigned POST) are accepted.**
+  They were refused before. Such a form only writes what the signer's IAM
+  permissions allow, so nothing becomes writable that was not already
+  writable by the signer. It is checked strictly: Signature Version 2 forms,
+  conditions the server does not understand and fields it cannot honour
+  (SSE-C keys, SSE-KMS, a storage class other than STANDARD) are refused,
+  where AWS would accept some of them. An `acl` field is accepted and
+  ignored, as PutObject's `x-amz-acl` is.
+- **UploadPart and UploadPartCopy answers do not carry
+  `x-amz-server-side-encryption`**, because parts are stored as sent until
+  the upload completes. CopyObject, CreateMultipartUpload and
+  CompleteMultipartUpload now carry it for a bucket that is encrypted, as
+  PUT, GET and HEAD already did.
+- **An object uploaded as `gzip,aws-chunked` is served with
+  `Content-Encoding: gzip`**, as the client sent it. Earlier versions dropped
+  the header, so a client that decompresses such objects automatically now
+  does.
+- **The `Location` of CompleteMultipartUpload and form uploads is
+  percent-encoded.**
+- **A draining node refuses form uploads and DeleteObjects** with 503
+  `SlowDown`, as it already refused PutObject, so clients retry them on
+  another node.
+- **A form upload signed with an Authorization header no longer checks a
+  `Policy` field it carries.** The header signature authorizes such an upload
+  on its own; a form that needs its policy enforced is a presigned POST, signed
+  with the policy instead of a header, and that is checked in full.
+- **Tiering no longer moves objects to the cold tier**, because objects there
+  could not be read: the scan does not run and the `cold` direction is
+  refused. If tiering was on, objects already moved answer NoSuchKey: bring
+  them back with `aws s3api restore-object` (RestoreObject now moves the data)
+  or the tiering API's `hot` direction. Keep `tiering.cold_data_dir` set until
+  they are all back.
+- **FIFO quota eviction is gone.** No API could turn it on; a full bucket now
+  always refuses an upload with `QuotaExceeded`.
+- **An upload of unknown length, of at least one erasure block (4 MiB by
+  default), to an erasure-coded server is staged on disk** in
+  `.erasure-spill/` on the data volume while it is encoded, sealed with a key
+  held only in memory, instead of being held in memory, so it briefly needs
+  its own size in free disk space. Smaller ones stay in memory.
+- **Push replication signs the body it sends.** Each replicated object is read
+  twice from local disk (to hash it, then to send it). Peers on 5.0.8 and
+  earlier keep working.
+
 ## Upgrading to 5.0.10
 
 Nothing to migrate. The changes are all in the dashboard's Migrate page, and in

@@ -43,7 +43,7 @@ func TestMigrationDoesNotDestroyConcurrentPut(t *testing.T) {
 	}
 	r.mgr.coldEngine = cold
 
-	r.mgr.ManualMigrate("b", "obj", "cold")
+	r.mgr.migrateToCol("b", "obj")
 
 	if tier := tierOf(t, r.store, "obj"); tier == "cold" {
 		t.Fatal("the new object was marked cold")

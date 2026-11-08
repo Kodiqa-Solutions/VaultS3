@@ -16,7 +16,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Per-bucket encryption keys**: For bucket-per-tenant setups, each bucket can be encrypted with its own key that is **not shared** with other tenants (or opt out and stay plaintext). Envelope encryption (master KEK wraps a per-bucket data key). Opt in per bucket via `PUT /{bucket}?encryption` or the dashboard. Supports key rotation and crypto-shredding. Enable with `encryption.per_bucket: true`, see [design doc](design/per-bucket-encryption.md)
 - **SSE-C (customer-provided keys)**: Operator-blind per-object encryption: the client supplies the key per request (`x-amz-server-side-encryption-customer-*`). The server encrypts/decrypts with it in the same chunked streaming format as SSE-S3, so Range reads decrypt a chunk at a time, and stores only the key's MD5, never the key
 - **Bucket policies**: Public-read, private, custom S3-compatible JSON policies. Supports the standard AWS `Principal` forms (`"*"`, `{"AWS": "*"}`, `{"AWS": ["*"]}`), wildcard actions, explicit `Deny` precedence, and per-bucket `Resource` matching. Granting `s3:GetObject` to everyone makes objects publicly readable and `s3:ListBucket` makes the listing public, as separate permissions. Bucket sub-resources (`?policy`, `?acl`, ...) always require authentication. **Public Access Block** (`BlockPublicPolicy` / `RestrictPublicBuckets`) overrides any policy and blocks anonymous access
-- **Quota management**: Per-bucket size and object count limits
+- **Quota management**: Per-bucket size and object count limits, enforced on every write path (PutObject, multipart parts, copies, form uploads, dashboard uploads and rollbacks). In a versioned bucket every stored version counts, in bytes and as an object
 - **Rate limiting**: Token bucket rate limiter per client IP and per access key to prevent abuse, enabled by default with a ceiling well above normal client traffic
 - **S3 Select**: Execute SQL queries on CSV, JSON, and Parquet objects without downloading the full file
 - **Multipart upload**: Full lifecycle (Create, UploadPart, UploadPartCopy, Complete, Abort, ListUploads, ListParts)
@@ -73,7 +73,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Cost estimator**: A dashboard panel that estimates what your stored data would cost on AWS S3, GCS, Cloudflare R2, Backblaze B2, and Wasabi (storage + egress) vs. self-hosting, egress-free, for free (`GET /api/v1/tco`)
 - **Bucket snapshots ("git-for-buckets")**: Capture a bucket's state, diff against the live bucket, and roll back in one click (commit / diff / restore), git-style history for your data, built on versioning with no external stack. Restore even resurrects deleted objects, and is itself reversible
 - **Webhook virus scanning**: POST uploaded objects to a configurable scan endpoint (ClamAV, VirusTotal, etc.) with quarantine bucket for infected files
-- **Data tiering**: Automatic hot/cold storage migration based on access patterns with transparent reads and manual migration API
+- **Data tiering**: moving objects to the cold tier is disabled from 5.0.11, because nothing reads from it yet; objects already there are moved back with RestoreObject or the manual migration API
 - **Backup scheduler**: Scheduled full/incremental backups to local directory targets with cron-like scheduling and backup history
 - **Git-like versioning**: Visual diff between object versions (text and binary), version tagging with labels, one-click rollback to any version
 - **FUSE mount**: Mount VaultS3 buckets as local filesystem directories with read/write support, lazy loading, and SigV4 authentication. LRU block cache (256KB blocks, configurable size), metadata cache with TTL, kernel attribute caching, and SigV4 derived key caching for fast repeated reads
@@ -127,7 +127,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Delete marker replication**: Optionally replicate delete markers to target buckets
 - **Site replication**: IAM and bucket configuration sync across sites
 - **KMS integration**: local key provider for envelope encryption. The HashiCorp Vault provider does not work yet, see docs/CONFIGURATION.md
-- **RestoreObject API**: `POST /{bucket}/{key}?restore` to initiate restore from cold tier
+- **RestoreObject API**: `POST /{bucket}/{key}?restore` moves an object back from the cold tier
 - **Storage classes**: STANDARD and REDUCED_REDUNDANCY storage class support
 - **Compression exclusions**: Skip compression for already-compressed file types (GZIP, JPEG, MP4, etc.)
 - **Real-time event streaming**: Server-Sent Events at `/api/v1/events` for live S3 event monitoring
@@ -140,9 +140,8 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **PROXY protocol v1**: Accept PROXY protocol connections for real client IP behind load balancers
 - **Inter-node network separation**: Bind cluster traffic to a dedicated network interface
 - **S3 Select on compressed files**: Query GZIP and BZIP2 compressed CSV/JSON objects with S3 Select
-- **S3 POST policy**: HTML form-based upload with policy document validation
+- **S3 POST policy (presigned POST)**: browser form uploads signed with a POST policy, as boto3 `generate_presigned_post` and the other SDKs produce. The signature, expiry, the conditions on the fields (bucket, key prefix, `eq`) and the signer's IAM permission to write the key are checked before any of the file is read; `content-length-range`, the bucket quota and `x-amz-checksum-*` fields are checked while it streams. Content headers, `x-amz-meta-*` and `tagging` fields are stored; a field the server cannot honour (SSE-C, a storage class) is refused with 501
 - **Snowball/TAR bulk upload**: Upload TAR archives that are automatically extracted into objects
-- **FIFO quota**: Automatically delete oldest objects when bucket quota is exceeded
 - **AMQP/RabbitMQ notifications**: Publish S3 events to RabbitMQ exchanges
 - **PostgreSQL notifications**: Insert S3 events into a PostgreSQL table
 - **Elasticsearch notifications**: Index S3 events in Elasticsearch

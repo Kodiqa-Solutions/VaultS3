@@ -48,8 +48,9 @@ func fullServer(t *testing.T) (*httptest.Server, *metadata.Store) {
 // result is a response's status and full body. A body cut short is reported in
 // the text, so a test sees it.
 type result struct {
-	code int
-	body string
+	code   int
+	body   string
+	header http.Header
 }
 
 // must fails the test unless the request succeeded.
@@ -95,9 +96,9 @@ func send(t *testing.T, req *http.Request) result {
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return result{resp.StatusCode, string(b) + " [body cut short: " + err.Error() + "]"}
+		return result{resp.StatusCode, string(b) + " [body cut short: " + err.Error() + "]", resp.Header}
 	}
-	return result{resp.StatusCode, string(b)}
+	return result{resp.StatusCode, string(b), resp.Header}
 }
 
 const versioningOn = `<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`

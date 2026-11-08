@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/bucketcrypto"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metrics"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/ratelimit"
@@ -204,6 +206,12 @@ func (h *Handler) SetReplicationFunc(fn ReplicationFunc) {
 	h.objects.onReplication = fn
 }
 
+// SetColdRestorer sets what RestoreObject calls to move an object back from
+// the cold tier.
+func (h *Handler) SetColdRestorer(fn func(bucket, key string) error) {
+	h.objects.coldRestorer = fn
+}
+
 // SetScanFunc sets the callback for virus scanning after uploads.
 func (h *Handler) SetScanFunc(fn ScanFunc) {
 	h.onScan = fn
@@ -272,6 +280,37 @@ func (sw *statusWriter) WriteHeader(code int) {
 	sw.ResponseWriter.WriteHeader(code)
 }
 
+// isSignedRequest reports a request that carries a signature, in the header
+// or as a presigned URL.
+func isSignedRequest(r *http.Request) bool {
+	return r.Header.Get("Authorization") != "" || r.URL.Query().Has("X-Amz-Signature")
+}
+
+// writesObjects reports a request that writes or deletes object data here: a
+// write to a key, a header-signed form upload to the bucket, or a
+// multi-object delete. The drain gate refuses these. Only keyed requests were
+// refused, so a draining node still stored form uploads and ran
+// DeleteObjects. A presigned POST is gated in servePolicyPost instead, once
+// it is known whether this node stores it or forwards it to the key's holder,
+// as a PutObject to a key held elsewhere is forwarded.
+func writesObjects(r *http.Request, bucket, key string) bool {
+	switch r.Method {
+	case http.MethodPut, http.MethodDelete:
+		return key != ""
+	case http.MethodPost:
+		if key == "" && isPolicyPost(r, bucket, key) {
+			return false
+		}
+		return key != "" || isFormPost(r) || r.URL.Query().Has("delete")
+	}
+	return false
+}
+
+// draining reports whether this node is being drained and takes no writes.
+func (h *Handler) draining() bool {
+	return h.writable != nil && !h.writable.Load()
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse bucket and key — support both path-style and virtual-hosted style
 	path := strings.TrimPrefix(r.URL.Path, "/")
@@ -281,7 +320,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Cluster proxy: forward to the correct node if this isn't the primary
 	// Skip if already proxied (X-VaultS3-Proxy header present) to prevent loops
-	if h.clusterProxy != nil && r.Header.Get("X-VaultS3-Proxy") == "" {
+	// A presigned POST names its key inside the form, so routing it here by
+	// the bucket alone sent it to the bucket's node, which then stored a key
+	// that GET looks for on other nodes: the object was unreadable everywhere.
+	// servePolicyPost reads the form first and routes by the real key.
+	if h.clusterProxy != nil && r.Header.Get("X-VaultS3-Proxy") == "" && !isPolicyPost(r, bucket, key) {
 		if h.clusterProxy(w, r, bucket, h.websiteRouteKey(r, bucket, key)) {
 			return
 		}
@@ -331,8 +374,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Drain gate: a node being evacuated (POST /api/v1/cluster/drain) rejects new
 	// object writes with 503 while still serving reads, so it can be replaced or
 	// taken down for maintenance without failing GETs.
-	if h.writable != nil && !h.writable.Load() && key != "" &&
-		(r.Method == http.MethodPut || r.Method == http.MethodPost || r.Method == http.MethodDelete) {
+	if h.draining() && writesObjects(r, bucket, key) {
 		writeS3Error(w, "SlowDown", "This node is draining and not accepting writes", http.StatusServiceUnavailable)
 		return
 	}
@@ -344,12 +386,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Check for public-read policy bypass on GET/HEAD object requests
 	authRequired := true
+	// publicGrant: the bucket policy grants this read to everyone. A signed
+	// request for it is authenticated (so a made-up signature is refused) but
+	// then allowed by the grant unless the key's own policy denies it, as on
+	// AWS, where a "Principal":"*" grant covers signed callers too.
+	publicGrant := false
 	if bucket != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		// The key is part of this decision: a policy scoped to one prefix
 		// publishes that prefix only, never the rest of the bucket.
 		anonCtx := anonymousPolicyContext(r)
-		if key != "" && h.store.IsObjectPublicRead(bucket, key, anonCtx) {
-			authRequired = false
+		// The policy is asked about the action this request really is: an
+		// object's tags, ACL, attributes, legal hold or retention, its upload
+		// parts and its older versions (?versionId) are separate actions on
+		// AWS. Every GET of a key was asked about s3:GetObject, so a public
+		// bucket gave away every object's tags, and every old version to
+		// anyone who knew its ID, even after a delete. A policy that grants
+		// one of those actions to everyone still makes it public.
+		if key != "" && h.store.IsObjectPublicAction(bucket, key, mapMethodToAction(r.Method, bucket, key, r.URL.Query()), anonCtx) {
+			publicGrant = true
+			// As on AWS, an anonymous read cannot choose its response
+			// headers: ?response-content-type=text/html made any public
+			// object a page served from the dashboard's own origin. A
+			// request with overrides is authenticated like any other, so a
+			// made-up Authorization header or X-Amz-Signature does not get
+			// them past this (the waiver would have skipped checking it).
+			switch {
+			case !hasResponseOverride(r.URL.Query()):
+				authRequired = false
+			case !isSignedRequest(r):
+				writeS3Error(w, "InvalidRequest", "Request specific response headers cannot be used for anonymous GET requests.", http.StatusBadRequest)
+				return
+			}
 		}
 		// A policy granting s3:ListBucket to everyone makes the object listing
 		// itself public. This is only ever the plain listing: every bucket
@@ -388,6 +455,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.rateLimiter != nil && !h.rateLimiter.Allow(rateLimitIP, "") {
 		w.Header().Set("Retry-After", "1")
 		writeS3Error(w, "SlowDown", "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	// A form upload signed with a POST policy carries its credentials in the
+	// form, so it is authenticated and authorized from there, before its file
+	// is read (postpolicy.go).
+	if isPolicyPost(r, bucket, key) {
+		h.servePolicyPost(w, r, bucket, rateLimitIP, clientIP)
 		return
 	}
 
@@ -446,7 +521,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !identity.IsAdmin {
 			action := mapMethodToAction(r.Method, bucket, key, r.URL.Query())
 			resource := formatResource(bucket, key)
-			if err := h.auth.AuthorizeWithContext(identity, action, resource, reqCtx); err != nil {
+			err := h.auth.AuthorizeWithContext(identity, action, resource, reqCtx)
+			// Not over an explicit Deny, a policy that failed to load, or a
+			// refusal from the external authorizer.
+			var external *iam.DeniedError
+			if err != nil && publicGrant && !identity.PolicyLoadFailed && !errors.As(err, &external) {
+				if _, explicitDeny := iam.EvaluateIdentity(identity, action, resource, reqCtx); !explicitDeny {
+					err = nil
+				}
+			}
+			if err != nil {
 				slog.Info("s3: request refused by policy", "reason", err.Error(), "access_key", identity.AccessKey)
 				if h.onAudit != nil {
 					h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Deny", clientIP, http.StatusForbidden)
@@ -498,6 +582,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				h.onAudit(identity.AccessKey, identity.UserID, action, resource, "Allow", clientIP, 0)
 			}
 		}
+	}
+
+	// A request naming a multipart upload this node does not hold goes to the
+	// node that holds it as it arrived, before its body is touched. It used to
+	// be forwarded only once the handler looked the upload up, after the body
+	// was decoded: the holder then got decoded bytes under a STREAMING-* payload
+	// hash, without the Content-Encoding the client had signed, and refused the
+	// part.
+	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" && key != "" && h.objects.forwardToUploadHolder(w, r, uploadID) {
+		return
 	}
 
 	// Decode an aws-chunked (streaming) request body, if present, before any
@@ -1418,6 +1512,13 @@ func requestConditionContext(r *http.Request) map[string]string {
 	return anonymousPolicyContext(r)
 }
 
+// RequestConditionContext is the context IAM conditions are evaluated
+// against for r (aws:SourceIp, aws:SecureTransport, aws:UserAgent and so on),
+// for a handler outside this package that authorizes with the same rules.
+func RequestConditionContext(r *http.Request) map[string]string {
+	return requestConditionContext(r)
+}
+
 // websiteRouteKey is the key a request is routed by on a cluster. A website
 // request for a directory names no object itself, it names the index document
 // under it, and that is the object whose holder can answer. Routed by the bare
@@ -1452,20 +1553,7 @@ func servesAsWebsite(r *http.Request) bool {
 // named "../victim/a.txt" overwrote another bucket's object. Every way a key
 // enters must ask this.
 func objectKeyProblem(key string) string {
-	switch {
-	case key == "":
-		return "Key must not be empty"
-	case strings.ContainsRune(key, 0):
-		return "Key must not contain a NUL byte"
-	case strings.HasPrefix(key, "/"):
-		return "Key must not begin with '/'"
-	}
-	for _, seg := range strings.Split(key, "/") {
-		if seg == ".." {
-			return "Key must not contain '..' path segments"
-		}
-	}
-	return ""
+	return storage.KeyProblem(key)
 }
 
 // anonymousPolicyContext is the condition context a bucket policy is evaluated

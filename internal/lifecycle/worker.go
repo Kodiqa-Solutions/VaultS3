@@ -191,9 +191,19 @@ func (w *Worker) scan() {
 			})
 
 			for key, versions := range keyVersions {
-				// Sort by LastModified descending
-				sort.Slice(versions, func(a, b int) bool {
-					return versions[a].LastModified > versions[b].LastModified
+				// Newest first, the version marked latest at the top. Sorted
+				// by LastModified alone, in whole seconds, two versions
+				// written in the same second came out in any order, and the
+				// first one is taken as the current version below, so the
+				// real current version could be expired as noncurrent.
+				sort.SliceStable(versions, func(a, b int) bool {
+					if versions[a].IsLatest != versions[b].IsLatest {
+						return versions[a].IsLatest
+					}
+					if versions[a].LastModified != versions[b].LastModified {
+						return versions[a].LastModified > versions[b].LastModified
+					}
+					return versionNewer(versions[a].VersionID, versions[b].VersionID)
 				})
 
 				// Find noncurrent versions (not the latest)
@@ -336,12 +346,12 @@ func (w *Worker) expireCurrent(snap metadata.ObjectMeta, versioning string, now 
 		if versioning == "Suspended" && (cur.VersionID == "" || cur.VersionID == "null") {
 			// The null version is replaced, data included.
 			markerID = "null"
-			if err := w.engine.DeleteObjectVersion(cur.Bucket, cur.Key, "null"); err != nil && !os.IsNotExist(err) {
+			if err := w.deleteVersionData(cur.Bucket, cur.Key, "null"); err != nil && !os.IsNotExist(err) {
 				slog.Error("lifecycle error deleting object", "bucket", cur.Bucket, "key", cur.Key, "error", err)
 				return false
 			}
 			if cur.VersionID == "" {
-				if err := w.engine.DeleteObject(cur.Bucket, cur.Key); err != nil && !os.IsNotExist(err) {
+				if err := w.deleteData(cur.Bucket, cur.Key); err != nil && !os.IsNotExist(err) {
 					slog.Error("lifecycle error deleting object", "bucket", cur.Bucket, "key", cur.Key, "error", err)
 					return false
 				}
@@ -389,7 +399,7 @@ func (w *Worker) expireCurrent(snap metadata.ObjectMeta, versioning string, now 
 		return true
 	}
 
-	if err := w.engine.DeleteObject(cur.Bucket, cur.Key); err != nil {
+	if err := w.deleteData(cur.Bucket, cur.Key); err != nil {
 		slog.Error("lifecycle error deleting object", "bucket", cur.Bucket, "key", cur.Key, "error", err)
 		return false
 	}
@@ -421,7 +431,7 @@ func (w *Worker) expireVersion(v metadata.ObjectMeta, now int64) bool {
 		return false
 	}
 	if !cur.DeleteMarker {
-		if err := w.engine.DeleteObjectVersion(v.Bucket, v.Key, v.VersionID); err != nil && !os.IsNotExist(err) {
+		if err := w.deleteVersionData(v.Bucket, v.Key, v.VersionID); err != nil && !os.IsNotExist(err) {
 			slog.Error("lifecycle error deleting noncurrent version", "bucket", v.Bucket, "key", v.Key, "version", v.VersionID, "error", err)
 			return false
 		}
@@ -431,7 +441,7 @@ func (w *Worker) expireVersion(v metadata.ObjectMeta, now int64) bool {
 		// on new writes go under the versions directory.
 		if v.VersionID == "null" {
 			if lerr != nil || latest == nil || latest.VersionID != "" {
-				if err := w.engine.DeleteObject(v.Bucket, v.Key); err != nil && !os.IsNotExist(err) {
+				if err := w.deleteData(v.Bucket, v.Key); err != nil && !os.IsNotExist(err) {
 					slog.Error("lifecycle error deleting noncurrent version", "bucket", v.Bucket, "key", v.Key, "version", v.VersionID, "error", err)
 					return false
 				}
@@ -479,4 +489,35 @@ func (w *Worker) pruneAndClean() {
 // IDs are server-generated, but this is defense in depth before an os.RemoveAll.
 func safeUploadID(id string) bool {
 	return id != "" && id != "." && id != ".." && !strings.ContainsAny(id, `/\`)
+}
+
+// versionNewer reports whether version ID a was written after b, for two
+// versions with the same LastModified second. Version IDs begin with their
+// nanosecond time; the null version (or no ID) counts as oldest.
+func versionNewer(a, b string) bool {
+	an, bn := a == "" || a == "null", b == "" || b == "null"
+	if an || bn {
+		return !an && bn
+	}
+	return a > b
+}
+
+// deleteData and deleteVersionData remove an expired object's bytes, except
+// for a key the server no longer accepts. Such a record was left by an
+// earlier version under a key like "./doc", which names another object's file:
+// expiring it destroyed doc's data, past its legal hold. Only the record goes.
+func (w *Worker) deleteData(bucket, key string) error {
+	if msg := storage.KeyProblem(key); msg != "" {
+		slog.Warn("lifecycle: expiring the record of a key this server no longer accepts, keeping the file it named", "bucket", bucket, "key", key)
+		return nil
+	}
+	return w.engine.DeleteObject(bucket, key)
+}
+
+func (w *Worker) deleteVersionData(bucket, key, versionID string) error {
+	if msg := storage.KeyProblem(key); msg != "" {
+		slog.Warn("lifecycle: expiring the record of a key this server no longer accepts, keeping the file it named", "bucket", bucket, "key", key)
+		return nil
+	}
+	return w.engine.DeleteObjectVersion(bucket, key, versionID)
 }

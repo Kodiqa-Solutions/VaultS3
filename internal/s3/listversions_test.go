@@ -102,3 +102,27 @@ func TestDeleteNullVersionRemovesTheObjectItself(t *testing.T) {
 		t.Error("metadata still present after deleting the null version")
 	}
 }
+
+// Regression (5.0.11): LastModified is whole seconds, and versions written in
+// the same second stayed in the store's order, oldest first, so four PUTs in
+// one second listed as [3,0,1,2] (newest, then oldest first). The version ID
+// begins with the nanosecond time and breaks the tie; null goes last.
+func TestSortVersionsBreaksSameSecondTiesByVersionID(t *testing.T) {
+	// As generateVersionID makes them: 16 hex digits of nanoseconds first.
+	ids := []string{"0000000000000001aaaaaaaa", "null", "0000000000000002ffffffff", "0000000000000003aaaaaaaa", "0000000000000004aaaaaaaa"}
+	// The store's order: oldest first, null among them.
+	versions := []metadata.ObjectMeta{
+		{Key: "k", VersionID: ids[1], LastModified: 100},
+		{Key: "k", VersionID: ids[0], LastModified: 100},
+		{Key: "k", VersionID: ids[2], LastModified: 100},
+		{Key: "k", VersionID: ids[3], LastModified: 100},
+		{Key: "k", VersionID: ids[4], LastModified: 100, IsLatest: true},
+	}
+	sortVersionsForListing(versions)
+	want := []string{ids[4], ids[3], ids[2], ids[0], "null"}
+	for i, v := range versions {
+		if v.VersionID != want[i] {
+			t.Fatalf("position %d: %q, want %q (order %v)", i, v.VersionID, want[i], versions)
+		}
+	}
+}

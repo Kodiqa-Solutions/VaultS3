@@ -70,3 +70,38 @@ func TestDrainGate(t *testing.T) {
 		t.Fatalf("PUT after undrain: status %d, want 200", resp.StatusCode)
 	}
 }
+
+// Regression (5.0.11 round 4): the drain gate refused only requests with a
+// key, so a draining node still stored presigned and header-signed form
+// uploads and ran DeleteObjects.
+func TestDrainGateRefusesBucketLevelWrites(t *testing.T) {
+	e := newFixEnv(t)
+	e.admin(t, http.MethodPut, "/pdrain", "").must(t, "bucket")
+	e.admin(t, http.MethodPut, "/pdrain/victim", "keep me").must(t, "object")
+	writable := &atomic.Bool{}
+	e.h.SetWritableFlag(writable) // false: draining
+	draining := func(what string, r result) {
+		t.Helper()
+		if r.code != http.StatusServiceUnavailable {
+			t.Errorf("%s on a draining node: %d %s, want 503", what, r.code, r.body)
+		}
+	}
+	p := policyPost{accessKey: testAccessKey, secretKey: testSecretKey, bucket: "pdrain", key: "u/post", prefix: "u/",
+		minSize: 0, maxSize: 100, file: []byte("x")}
+	ct, body := p.build(t)
+	draining("presigned POST", postForm(t, e.ts.URL, "pdrain", ct, body))
+	draining("DeleteObjects", e.admin(t, http.MethodPost, "/pdrain?delete",
+		`<Delete><Object><Key>victim</Key></Object></Delete>`, "Content-MD5", contentMD5(`<Delete><Object><Key>victim</Key></Object></Delete>`)))
+	writable.Store(true)
+	if got := e.admin(t, http.MethodGet, "/pdrain/victim", ""); got.body != "keep me" {
+		t.Errorf("DeleteObjects ran on a draining node: %d %q", got.code, got.body)
+	}
+	if got := e.admin(t, http.MethodHead, "/pdrain/u/post", ""); got.code != http.StatusNotFound {
+		t.Errorf("a presigned POST was stored on a draining node")
+	}
+	// Reads and bucket listing still work while draining.
+	writable.Store(false)
+	if got := e.admin(t, http.MethodGet, "/pdrain?list-type=2", ""); got.code != http.StatusOK {
+		t.Errorf("listing on a draining node: %d", got.code)
+	}
+}

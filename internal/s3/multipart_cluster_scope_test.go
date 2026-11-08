@@ -1,7 +1,9 @@
 package s3
 
 import (
+	"bytes"
 	"encoding/xml"
+	"io"
 	"net/http"
 	"testing"
 
@@ -210,5 +212,37 @@ func TestLocalUploadNeverConsultsPeers(t *testing.T) {
 	resp.Body.Close()
 	if consulted {
 		t.Error("a locally held upload triggered a peer lookup")
+	}
+}
+
+// Regression (5.0.11): a part for an upload another node holds was forwarded
+// only once the handler looked the upload up, after the router had decoded
+// its aws-chunked body. The holder got decoded bytes under a STREAMING-*
+// payload hash and without the Content-Encoding the client signed, and
+// refused the part. The request is now forwarded exactly as it arrived.
+func TestHolderGetsTheStreamingPartAsSent(t *testing.T) {
+	handler, store, _, ts := newObjTestServer(t)
+	if err := store.CreateBucket("hold"); err != nil {
+		t.Fatal(err)
+	}
+	var gotEncoding, gotHash string
+	var gotBody []byte
+	handler.SetMultipartHolderFallback(func(w http.ResponseWriter, r *http.Request, uploadID string) bool {
+		gotEncoding = r.Header.Get("Content-Encoding")
+		gotHash = r.Header.Get("X-Amz-Content-Sha256")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		return true
+	})
+	part := bytes.Repeat([]byte("q"), 200<<10)
+	r := signedStreamPut(t, ts, "/hold/big.bin?partNumber=1&uploadId=deadbeef", part, streamOpts{chunk: 64 << 10})
+	if r.code != http.StatusOK {
+		t.Fatalf("forwarded part: %d %s", r.code, r.body)
+	}
+	if gotEncoding != "aws-chunked" || gotHash != signedStreaming {
+		t.Fatalf("holder got Content-Encoding %q and payload hash %q, want the request as signed", gotEncoding, gotHash)
+	}
+	if !bytes.Contains(gotBody, []byte(";chunk-signature=")) || len(gotBody) <= len(part) {
+		t.Fatalf("holder got %d bytes without the chunk framing, want the body as sent", len(gotBody))
 	}
 }

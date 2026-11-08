@@ -2,13 +2,15 @@ package erasure
 
 import (
 	"bytes"
-	"crypto/md5"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
@@ -66,6 +68,11 @@ func NewEngine(inner storage.Engine, cfg Config) (*Engine, error) {
 		backends = append(backends, fs)
 	}
 
+	// Uploads spilled by a run that was stopped mid-write are never used.
+	if err := ClearSpill(inner.DataDir()); err != nil {
+		return nil, fmt.Errorf("clear spilled uploads: %w", err)
+	}
+
 	return &Engine{
 		inner:    inner,
 		encoder:  encoder,
@@ -113,62 +120,111 @@ func (e *Engine) PutObject(bucket, key string, reader io.Reader, size int64) (in
 		return e.putObjectStreaming(bucket, key, reader, size)
 	}
 
-	// Read all data into memory
-	data, err := io.ReadAll(reader)
+	// The length is unknown (a chunked upload, or aws-chunked without a
+	// decoded length) or small. At most one block is read into memory: an
+	// object that fits is stored whole, and a larger one is spilled to disk
+	// and streamed with its length known. Reading it all into memory let one
+	// such upload hold up to the 5 GiB object limit in RAM, and a few at once
+	// exhaust the server.
+	data, err := io.ReadAll(io.LimitReader(reader, e.cfg.BlockSize))
 	if err != nil {
 		return 0, "", fmt.Errorf("read object data: %w", err)
 	}
-	actualSize := int64(len(data))
-
-	// Small objects: store directly without EC
-	if actualSize < e.cfg.BlockSize {
-		return e.putPlain(bucket, key, bytes.NewReader(data), actualSize)
+	if int64(len(data)) < e.cfg.BlockSize {
+		return e.putPlain(bucket, key, bytes.NewReader(data), int64(len(data)))
 	}
+	return e.putSpilled(bucket, key, data, reader)
+}
 
-	// Erasure code the object
-	shards, err := e.encoder.Encode(data)
+// spillDir holds uploads of unknown length while they are copied to disk, so
+// they can be erasure coded as a stream. On the data volume, which is always
+// writable; the leading dot keeps the reclaim scan away from it.
+const spillDir = ".erasure-spill"
+
+// putSpilled writes head and the rest of an upload of unknown length to a
+// file on the data volume, then erasure codes it from there with its length
+// known, so memory stays at one stripe whatever the object's size.
+func (e *Engine) putSpilled(bucket, key string, head []byte, rest io.Reader) (int64, string, error) {
+	dir := filepath.Join(e.inner.DataDir(), spillDir)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return 0, "", fmt.Errorf("create spill directory: %w", err)
+	}
+	f, err := os.CreateTemp(dir, "put-*")
 	if err != nil {
-		return 0, "", fmt.Errorf("erasure encode: %w", err)
+		return 0, "", fmt.Errorf("create spill file: %w", err)
 	}
-
-	// Compute ETag on original data
-	hash := md5.Sum(data)
-	etag := fmt.Sprintf("%x", hash)
-
-	// The shards go under a fresh generation and meta.json is switched last,
-	// exactly as in the streaming path. This path used to write meta.json
-	// FIRST, so for the length of the write every reader was pointed at a
-	// half-written set of shards.
-	meta := &ShardMeta{
-		OriginalSize: actualSize,
-		DataShards:   e.cfg.DataShards,
-		ParityShards: e.cfg.ParityShards,
-		BlockSize:    e.cfg.BlockSize,
-		ShardSizes:   make([]int64, len(shards)),
-		ETag:         etag,
-		CreatedAt:    time.Now().UTC(),
-		Generation:   newGeneration(),
-		ShardCRC:     make([]string, len(shards)),
-		CRCStripe:    crcStripeBytes,
+	defer func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}()
+	// The spill file is sealed with a key that only ever lives in memory.
+	// Erasure coding sits above encryption at rest, so this is the upload's
+	// plaintext: written as is, it reached the disk on a server configured
+	// to encrypt everything, and a copy left by a crash stayed readable.
+	// Sealed, a leftover is unreadable once the process is gone.
+	enc, dec, err := spillCipher()
+	if err != nil {
+		return 0, "", fmt.Errorf("seal spill file: %w", err)
 	}
+	w := &sealWriter{s: enc, w: f, buf: make([]byte, 32<<10)}
+	if _, err := w.Write(head); err != nil {
+		return 0, "", fmt.Errorf("spill object data: %w", err)
+	}
+	n, err := io.Copy(w, rest)
+	if err != nil {
+		return 0, "", fmt.Errorf("read object data: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, "", fmt.Errorf("rewind spill file: %w", err)
+	}
+	return e.putObjectStreaming(bucket, key, &cipher.StreamReader{S: dec, R: f}, int64(len(head))+n)
+}
 
-	// Distribute shards across backends
-	for i, shard := range shards {
-		meta.ShardSizes[i] = int64(len(shard))
-		sum := newStripeSummer(crcStripeBytes)
-		sum.Write(shard)
-		meta.ShardCRC[i] = sum.encoded()
-		if _, _, err := e.backendFor(i).PutObject(bucket, meta.shardPath(key, i), bytes.NewReader(shard), int64(len(shard))); err != nil {
-			e.removeShards(bucket, key, meta, i+1)
-			return 0, "", fmt.Errorf("store shard %d: %w", i, err)
+// sealWriter encrypts into one reused buffer. cipher.StreamWriter allocates a
+// buffer the size of every write, which for a large upload added up to its
+// whole size in allocations.
+type sealWriter struct {
+	s   cipher.Stream
+	w   io.Writer
+	buf []byte
+}
+
+func (s *sealWriter) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		n := min(len(p), len(s.buf))
+		s.s.XORKeyStream(s.buf[:n], p[:n])
+		if _, err := s.w.Write(s.buf[:n]); err != nil {
+			return written, err
 		}
+		written += n
+		p = p[n:]
 	}
+	return written, nil
+}
 
-	if err := e.commitMeta(bucket, key, meta); err != nil {
-		e.removeShards(bucket, key, meta, -1)
-		return 0, "", err
+// spillCipher returns a matching AES-256-CTR pair for one spill file, under a
+// random key that is never stored.
+func spillCipher() (enc, dec cipher.Stream, err error) {
+	var key [32]byte
+	var iv [aes.BlockSize]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return nil, nil, err
 	}
-	return actualSize, etag, nil
+	if _, err := rand.Read(iv[:]); err != nil {
+		return nil, nil, err
+	}
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, nil, err
+	}
+	return cipher.NewCTR(block, iv[:]), cipher.NewCTR(block, iv[:]), nil
+}
+
+// ClearSpill removes uploads a previous run left spilled, when it was stopped
+// part way through one. Called when the engine is built.
+func ClearSpill(dataDir string) error {
+	return os.RemoveAll(filepath.Join(dataDir, spillDir))
 }
 
 // putPlain stores an object whole in the inner engine and then retires any

@@ -43,7 +43,7 @@ What is planned, and what has already shipped.
 - [x] Presigned upload restrictions (max size, content type whitelist, key prefix enforcement)
 - [x] Full-text search (in-memory index over keys, content types, tags. `GET /api/v1/search`)
 - [x] Webhook virus scanning (ClamAV/VirusTotal integration, quarantine bucket, fail-open/closed modes)
-- [x] Data tiering (hot/cold storage, automatic migration based on access patterns, transparent reads, manual migration API)
+- [ ] Data tiering: moving to cold disabled in 5.0.11 (reads never went through the cold tier); restore works
 - [x] Backup scheduler (full/incremental backups to local targets, cron scheduling, backup history, trigger API)
 - [x] Git-like versioning (visual diff with LCS, version tagging with labels, one-click rollback)
 - [x] FUSE mount (mount buckets as local filesystem, read/write, lazy loading via range requests)
@@ -144,7 +144,7 @@ What is planned, and what has already shipped.
 - [x] S3 POST policy (HTML form-based upload)
 - [ ] S3 Inventory reports (periodic CSV): code exists, no API route
 - [x] Snowball/TAR bulk upload
-- [x] FIFO quota (delete oldest objects when quota exceeded)
+- [ ] FIFO quota (delete oldest objects when quota exceeded): removed in 5.0.11, it was never settable
 - [x] AMQP/RabbitMQ notification backend (amqp091-go client with lazy connection and topic exchange)
 - [x] PostgreSQL notification backend (lib/pq driver, auto-create table, JSONB storage)
 - [x] Elasticsearch notification backend

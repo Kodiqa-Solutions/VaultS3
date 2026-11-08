@@ -18,7 +18,7 @@ VaultS3 is designed with security in mind:
 - **SSRF prevention**: webhook, lambda, and notification URLs blocked from targeting localhost, private IPs, and cloud metadata endpoints
 - **Upload size limits**: 5GB per PUT (S3 spec), enforced with `http.MaxBytesReader`
 - **Rate limiting**: per-IP and per-access-key token bucket, **on by default** (2000 req/s, 4000 burst), using `RemoteAddr` (not spoofable via `X-Forwarded-For`). The ceiling sits far above real client traffic so it bounds a flood without throttling legitimate use. Because the per-IP bucket keys on the connection address, every client behind a reverse proxy or ingress shares one bucket: raise `requests_per_sec` in that setup rather than lowering it
-- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (local key provider, the HashiCorp Vault provider does not work yet) modes
+- **AES-256-GCM encryption at rest**: SSE-S3 (static key) and SSE-KMS (local key provider, the HashiCorp Vault provider does not work yet) modes. Encryption is a server setting: with it off, a request asking for SSE-S3 is stored unencrypted (not refused), and no response claims `x-amz-server-side-encryption` for a bucket that does not encrypt at rest
 - **IAM with default-deny**: policy evaluation engine with wildcard matching
 - **Security headers**: CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 - **Non-root Docker**: container runs as `vaults3` user (UID 1000)
@@ -48,7 +48,7 @@ VaultS3 is designed with security in mind:
 - **Replication queue limit cap**: Queue listing capped at 1000 entries to prevent memory exhaustion
 - **Backup path traversal protection**: Backup target validates resolved paths stay within base directory
 - **LIKE pattern O(n*m) matching**, Iterative DP algorithm replaces recursive backtracking, preventing ReDoS
-- **Tiering promotion safety**: Async cold-to-hot promotion re-checks tier state and orders operations safely
+- **Tiering restore safety**: moving objects to the cold tier is disabled from 5.0.11 (nothing read from it). A restore puts the data back only where no hot file exists, never over data a PUT wrote meanwhile, and drops the stale cold copy
 - **Lambda output key validation**: Output key template expansion validated against path traversal
 - **S3 Select record cap**: JSON/CSV parsing capped at 1M records to prevent memory exhaustion
 - **FUSE cache size caps**: Signature cache, HEAD cache, and LIST cache bounded to prevent unbounded memory growth
@@ -58,7 +58,7 @@ VaultS3 is designed with security in mind:
 - **PROXY protocol v1**: Real client IP extraction behind PROXY protocol-aware load balancers
 - **Governance bypass protection**: `x-amz-bypass-governance-retention` restricted to authorized principals
 - **IAM policy conditions**: `StringEquals`, `StringLike`, `IpAddress`, `DateLessThan` condition evaluation
-- **POST policy validation**: HTML form upload policies validated for expiration, conditions, and signature
+- **POST policy validation**: a browser form upload signed with a POST policy (presigned POST) is checked from the fields before the file, and nothing of the file is read until it passes: the SigV4 signature over the policy, its expiry, every condition (an unknown one refuses the form, and the bucket is compared to the one in the URL), that no field is left out of the policy, the signer's IP allowlist and permission to write the key, then the size range and the bucket quota while the file streams. Everything before the file, part headers included, is bounded (320 KiB) and must arrive within the header time limit, since nobody is authenticated yet. A policy is valid until the expiration it states, which is not capped (presigned URLs are, at 7 days), so give policies a short expiration and rotate a key whose policies leaked
 - **Content-MD5 validation**: Server-side integrity verification on PUT rejects corrupted uploads
 - **S3 Checksum API**: CRC32, CRC32C, CRC64NVME, SHA1, SHA256 checksums verified on upload (as a header or an aws-chunked trailer) and returned on download
 - **Conditional request handling**: `If-Match`/`If-None-Match` ETag checks prevent lost updates (412 Precondition Failed)

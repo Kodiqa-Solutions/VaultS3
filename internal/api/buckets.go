@@ -174,9 +174,9 @@ func (h *APIHandler) handleDeleteBucket(w http.ResponseWriter, _ *http.Request, 
 	}
 
 	// Emptiness comes from the metadata store, which sees versions and delete
-	// markers. The disk walk alone skips .vs/, so a versioning enabled bucket
-	// always counted as empty and was deleted with every version in it, locked
-	// ones included. An error refuses the delete: an unreadable store is not an
+	// markers. The disk walk skipped .vs/ before 5.0.11, so a versioning
+	// enabled bucket counted as empty and was deleted with every version in
+	// it, locked ones included. An error refuses the delete: an unreadable store is not an
 	// empty bucket. The disk count stays as a second check, and its error used
 	// to be ignored.
 	hasData, err := metadata.BucketHasData(h.store, name)

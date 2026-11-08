@@ -118,6 +118,24 @@ curl http://localhost:9000/api/v1/replication/queue     # pending queue entries
 
 For one-way push, replication only needs to be enabled on the **source**. The **target** does not need `replication.enabled`, it just needs the peer `access_key`/`secret_key` (from the source's config) to be valid credentials on it. Enable replication on both sides only for `mode: active-active`.
 
+### Active-active
+
+Both sites set `mode: "active-active"`, their own `site_id`, and a peer entry for the other site:
+
+```yaml
+replication:
+  enabled: true
+  mode: "active-active"
+  site_id: "dc1"
+  peers:
+    - name: "dc2"
+      url: "https://dc2.example.com"
+      access_key: "<a key on dc2>"
+      secret_key: "<its secret>"
+```
+
+Each site pulls the other's changes every `scan_interval_secs`, signing with the peer entry's key (VaultS3 5.0.11 or later on both sites: earlier versions refused every sync). That key, which belongs to the *other* site, decides what this site receives: only changes in buckets the key may list (`s3:ListBucket`) to objects it may read (`s3:GetObject`). Use the other site's admin key, or an IAM key there that may list and read every bucket, for a full replica. Objects are pulled with GET, and S3 does not sign an answer, so use `https://` peer URLs between sites on an untrusted network. Conflicting writes are settled by `conflict_strategy`. A bucket with versioning (enabled or suspended) is not replicated by active-active yet: its changes are skipped and logged. A change to an object under legal hold or retention is skipped too.
+
 
 ## Webhook Virus Scanning
 

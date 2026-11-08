@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -513,5 +514,33 @@ func TestStalledDashboardLoginBodyIsCutOff(t *testing.T) {
 	// 10x the header timeout and 3x the idle timeout.
 	if !closedWithin(conn, 3*time.Second) {
 		t.Fatal("unauthenticated login with a stalled body still holds the connection after 3s (header limit 300ms, idle 1s)")
+	}
+}
+
+// deadlineRecorder records SetReadDeadline calls made through
+// http.ResponseController.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	calls int
+}
+
+func (d *deadlineRecorder) SetReadDeadline(time.Time) error { d.calls++; return nil }
+
+// The post-answer drain deadline is for HTTP/1.1, where net/http drains an
+// unread body. HTTP/2 resets the stream instead, and a deadline there only
+// kept a timer and the stream alive for 10 s after every request (5.0.11).
+func TestBodyDrainDeadlineOnlyOnHTTP1(t *testing.T) {
+	h := boundBodyDrain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	for _, c := range []struct {
+		major int
+		want  int
+	}{{1, 1}, {2, 0}} {
+		rec := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		req := httptest.NewRequest(http.MethodPut, "/b/k", nil)
+		req.ProtoMajor = c.major
+		h.ServeHTTP(rec, req)
+		if rec.calls != c.want {
+			t.Errorf("HTTP/%d: %d drain deadlines set, want %d", c.major, rec.calls, c.want)
+		}
 	}
 }

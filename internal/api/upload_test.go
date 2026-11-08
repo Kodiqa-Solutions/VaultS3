@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
@@ -131,5 +132,71 @@ func TestUploadStreamsAndPreservesFolderPath(t *testing.T) {
 	}
 	if _, err := store.GetObjectMeta("vault", "report.bin"); err == nil {
 		t.Fatal("object was flattened to the base name report.bin")
+	}
+}
+
+// Regression (5.0.11 round 6, present in 5.0.10): dashboard uploads were never
+// held to the bucket quota, so a 50 KB upload went into a bucket with a 1 KB
+// quota. They are held to it now, as S3 uploads are, and an overwrite of an
+// existing file is not one more object.
+func TestUploadIsHeldToTheBucketQuota(t *testing.T) {
+	h, store := newTestAPI(t)
+	if err := store.CreateBucket("quota"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateBucketQuota("quota", 1000, 0); err != nil {
+		t.Fatal(err)
+	}
+	upload := func(name string, size int) []uploadResult {
+		t.Helper()
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		part, _ := mw.CreateFormFile("file", name)
+		part.Write(bytes.Repeat([]byte("q"), size))
+		mw.Close()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/buckets/quota/upload", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Header.Set("Authorization", "Bearer "+getToken(t, h))
+		rr := httptest.NewRecorder()
+		h.handleUpload(rr, req, "quota")
+		var results []uploadResult
+		_ = json.Unmarshal(rr.Body.Bytes(), &results)
+		if len(results) == 1 && results[0].Error != "" && (rr.Code != http.StatusForbidden || !strings.Contains(results[0].Error, "QuotaExceeded")) {
+			t.Errorf("%s refused: HTTP %d %q, want 403 QuotaExceeded", name, rr.Code, results[0].Error)
+		}
+		return results
+	}
+	if r := upload("big.bin", 50000); len(r) != 1 || r[0].Error == "" {
+		t.Fatalf("a 50000 byte upload into a 1000 byte quota: %+v, want it refused", r)
+	}
+	if _, err := store.GetObjectMeta("quota", "big.bin"); err == nil {
+		t.Fatal("the upload past the quota was stored")
+	}
+	if r := upload("small.bin", 800); len(r) != 1 || r[0].Error != "" {
+		t.Fatalf("an upload within the quota: %+v", r)
+	}
+	if r := upload("other.bin", 300); len(r) != 1 || r[0].Error == "" {
+		t.Fatalf("a second file past the quota: %+v, want it refused", r)
+	}
+	if err := store.UpdateBucketQuota("quota", 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if r := upload("third.bin", 10); len(r) != 1 || r[0].Error == "" {
+		t.Fatalf("a new file at the object count quota: %+v, want it refused", r)
+	}
+	if r := upload("small.bin", 10); len(r) != 1 || r[0].Error != "" {
+		t.Fatalf("an overwrite at the object count quota: %+v, want it stored", r)
+	}
+}
+
+// A dashboard key may not name the storage engine's own files (5.0.11).
+func TestValidateObjectKeyRefusesReservedNames(t *testing.T) {
+	for _, key := range []string{".vs/X/null", ".ec/a", "x/.vaults3-tmp-1"} {
+		if validateObjectKey(key) == nil {
+			t.Errorf("%q accepted", key)
+		}
+	}
+	if err := validateObjectKey("a/.vs/b"); err != nil {
+		t.Errorf("a/.vs/b refused: %v", err)
 	}
 }

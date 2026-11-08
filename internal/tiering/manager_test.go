@@ -2,6 +2,7 @@ package tiering
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"path/filepath"
 	"testing"
@@ -100,7 +101,7 @@ func TestManualMigrateToCold(t *testing.T) {
 	data := []byte("cold-me please, I am old data")
 	r.putHot(t, "obj", data, time.Now().Unix())
 
-	if err := r.mgr.ManualMigrate("b", "obj", "cold"); err != nil {
+	if err := r.mgr.migrateToCol("b", "obj"); err != nil {
 		t.Fatalf("migrate to cold: %v", err)
 	}
 
@@ -153,7 +154,7 @@ func TestTransparentReadAndPromotion(t *testing.T) {
 	r.putHot(t, "obj", data, time.Now().Unix())
 
 	// Push it to cold first.
-	if err := r.mgr.ManualMigrate("b", "obj", "cold"); err != nil {
+	if err := r.mgr.migrateToCol("b", "obj"); err != nil {
 		t.Fatalf("migrate to cold: %v", err)
 	}
 	if got := tierOf(t, r.store, "obj"); got != "cold" {
@@ -197,7 +198,13 @@ func TestMigrateToHotRoundTrip(t *testing.T) {
 	data := []byte("round trip data")
 	r.putHot(t, "obj", data, time.Now().Unix())
 
-	if err := r.mgr.ManualMigrate("b", "obj", "cold"); err != nil {
+	// Moving to cold is refused from outside (nothing reads the cold tier
+	// yet, 5.0.11); an object already there, as an earlier version left it,
+	// still comes back.
+	if err := r.mgr.ManualMigrate("b", "obj", "cold"); !errors.Is(err, ErrColdWritesDisabled) {
+		t.Fatalf("manual move to cold: %v, want ErrColdWritesDisabled", err)
+	}
+	if err := r.mgr.migrateToCol("b", "obj"); err != nil {
 		t.Fatalf("to cold: %v", err)
 	}
 	if err := r.mgr.MigrateToHot("b", "obj"); err != nil {

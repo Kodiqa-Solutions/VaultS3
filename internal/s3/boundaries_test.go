@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"mime/multipart"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -127,8 +128,10 @@ func TestSnowballEntriesStayInsideTheirBucket(t *testing.T) {
 
 func TestObjectKeyProblem(t *testing.T) {
 	for key, bad := range map[string]bool{
-		"a.txt": false, "dir/a.txt": false, "a..b": false, "..a/b": false, "a//b": false,
+		"a.txt": false, "dir/a.txt": false, "a..b": false, "..a/b": false, "dir/": false,
 		"": true, "../a": true, "a/../../b": true, "a/..": true, "/abs": true, "a\x00b": true,
+		// The path folds these into another key's file (5.0.11 round 11).
+		"a//b": true, "./a": true, "a/./b": true,
 	} {
 		if got := objectKeyProblem(key) != ""; got != bad {
 			t.Errorf("objectKeyProblem(%q) refused=%v, want %v", key, got, bad)
@@ -245,5 +248,55 @@ func TestPostUploadKeyStaysInsideItsBucket(t *testing.T) {
 	}
 	if r := call(t, ts, "GET", "/victim/a.txt", ""); r.body != "original" {
 		t.Errorf("victim/a.txt was overwritten: %q", r.body)
+	}
+}
+
+// Regression (5.0.11 round 11): a key with a "." or empty segment, carried in
+// a body where no URL redirect cleans it, named another key's file: a
+// DeleteObjects of "./doc" destroyed a doc under legal hold, and a form upload
+// of "a//secret/doc" overwrote a doc its signer was denied. Both are refused,
+// and a Snowball entry is checked after it is cleaned, so "./.vs/x" cannot
+// reach the version store while "./a.txt" still imports as a.txt.
+func TestBodyCarriedKeysCannotAliasAnotherKey(t *testing.T) {
+	e := newFixEnv(t)
+	e.admin(t, http.MethodPut, "/alias", "").must(t, "bucket")
+	e.admin(t, http.MethodPut, "/alias/doc", "keep").must(t, "doc")
+	m, _ := e.store.GetObjectMeta("alias", "doc")
+	m.LegalHold = true
+	if err := e.store.PutObjectMeta(*m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"./doc", "a/../doc"} {
+		body := `<Delete><Object><Key>` + k + `</Key></Object></Delete>`
+		e.admin(t, http.MethodPost, "/alias?delete", body, "Content-MD5", contentMD5(body))
+	}
+	if got := e.admin(t, http.MethodGet, "/alias/doc", ""); got.code != http.StatusOK || got.body != "keep" {
+		t.Errorf("a DeleteObjects of ./doc reached the held doc: %d %q", got.code, got.body)
+	}
+
+	e.admin(t, http.MethodPut, "/alias/a/secret/doc", "secret").must(t, "secret doc")
+	for _, k := range []string{"./doc", "a//secret/doc", "a/./secret/doc"} {
+		p := policyPost{accessKey: testAccessKey, secretKey: testSecretKey, bucket: "alias", key: k, prefix: "",
+			minSize: 0, maxSize: 100, file: []byte("EVIL")}
+		ct, body := p.build(t)
+		if r := postForm(t, e.ts.URL, "alias", ct, body); r.code != http.StatusBadRequest {
+			t.Errorf("a form upload to %q: %d %s, want 400", k, r.code, r.body)
+		}
+	}
+	if got := e.admin(t, http.MethodGet, "/alias/a/secret/doc", ""); got.body != "secret" {
+		t.Errorf("a form upload to an aliasing key overwrote a/secret/doc: %q", got.body)
+	}
+
+	// Snowball keys are the cleaned entry names (authorized as such), so
+	// "./a.txt" is a.txt; the cleaned name is checked, so ".vs/x" is refused.
+	archive := tarOf(t, map[string]string{"./a.txt": "fine", "./.vs/x": "EVIL"})
+	e.admin(t, http.MethodPut, "/alias/batch.tar", string(archive), "X-Amz-Meta-Snowball-Auto-Extract", "true").must(t, "snowball")
+	if got := e.admin(t, http.MethodGet, "/alias/a.txt", ""); got.body != "fine" {
+		t.Errorf("./a.txt did not import as a.txt: %d %q", got.code, got.body)
+	}
+	for _, k := range []string{".vs/x"} {
+		if _, err := e.store.GetObjectMeta("alias", k); err == nil {
+			t.Errorf("a Snowball entry was stored as %s", k)
+		}
 	}
 }

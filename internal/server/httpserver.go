@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/s3"
 )
 
 // Connection limits shared by every listener (S3 and dashboard, inter-node,
@@ -66,6 +67,12 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 func boundBodyDrain(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.ServeHTTP(w, r)
+		// HTTP/2 does not drain an unread body (the stream is reset), and a
+		// deadline there only kept a timer and the stream alive for 10 s
+		// after every request.
+		if r.ProtoMajor >= 2 {
+			return
+		}
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyDrainTimeout))
 	})
 }
@@ -88,6 +95,28 @@ func signInDeadline(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if readsBodyBeforeAuth(r) {
 			_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readHeaderTimeout))
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// dashboardAPIPrefix is the path the dashboard API is mounted at.
+const dashboardAPIPrefix = "/api/v1/"
+
+// policyPostDeadline gives a presigned POST's form fields the header limit.
+// They are read before anyone is authenticated, so a client that sent the
+// headers and stalled the body held the connection for ever. The handler
+// lifts the deadline once the form's signature and permission check out, and
+// the file then streams with no deadline. On a listener that also serves the
+// dashboard, its /api/v1/ routes are left alone: they authenticate first, and
+// an upload there must not be cut off. Only that prefix: every other path,
+// /api/ included, is an S3 request (bucket "api") and gets the limit.
+func policyPostDeadline(servesAPI bool, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s3.MayBePolicyPost(r) && !(servesAPI && strings.HasPrefix(r.URL.Path, dashboardAPIPrefix)) {
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(time.Now().Add(readHeaderTimeout))
+			r = s3.WithBodyDeadlineRelease(r, func() { _ = rc.SetReadDeadline(time.Time{}) })
 		}
 		h.ServeHTTP(w, r)
 	})

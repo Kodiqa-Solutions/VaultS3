@@ -420,12 +420,14 @@ func (fs *FileSystem) BucketSize(bucket string) (int64, int64, error) {
 		return 0, 0, fmt.Errorf("bucket directory: %w", err)
 	}
 
+	// The version store (.vs) is counted too. With versioning enabled every
+	// version of an object lives there, the latest included, and skipping it
+	// left a versioned bucket at size 0 and count 0, so its quota limited
+	// nothing. Every stored version takes disk, so each counts, in bytes and
+	// as an object.
 	err := filepath.Walk(bucketDir, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // skip inaccessible files within the bucket
-		}
-		if info.IsDir() && info.Name() == ".vs" {
-			return filepath.SkipDir
 		}
 		if !info.IsDir() && !strings.HasPrefix(info.Name(), ".vaults3-tmp-") {
 			totalSize += info.Size()

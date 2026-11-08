@@ -177,9 +177,9 @@ func (h *BucketHandler) DeleteBucket(w http.ResponseWriter, r *http.Request, buc
 	}
 
 	// A bucket is empty only when the metadata store holds no object, version
-	// or delete marker for it AND nothing is left on disk. The disk walk alone
-	// skips .vs/, so a versioning enabled bucket always looked empty and was
-	// deleted with every object in it, locked ones included.
+	// or delete marker for it AND nothing is left on disk. The disk walk
+	// skipped .vs/ before 5.0.11, so a versioning enabled bucket looked empty
+	// and was deleted with every object in it, locked ones included.
 	hasData, err := metadata.BucketHasData(h.store, bucket)
 	if err != nil {
 		slog.Error("could not tell whether a bucket is empty, refusing to delete it", "bucket", bucket, "error", err)
@@ -560,6 +560,9 @@ func (h *BucketHandler) GetBucketLifecycle(w http.ResponseWriter, r *http.Reques
 		Prefix string `xml:"Prefix,omitempty"`
 	}
 	type xmlRule struct {
+		// The rule's ID was stored but never returned, so a client that
+		// reads its configuration back lost the name it gave the rule.
+		ID                             string         `xml:"ID,omitempty"`
 		Expiration                     *xmlExpiration `xml:"Expiration,omitempty"`
 		AbortIncompleteMultipartUpload *xmlAbort      `xml:"AbortIncompleteMultipartUpload,omitempty"`
 		Filter                         xmlFilter      `xml:"Filter"`
@@ -572,6 +575,7 @@ func (h *BucketHandler) GetBucketLifecycle(w http.ResponseWriter, r *http.Reques
 	}
 
 	xr := xmlRule{
+		ID:     rule.ID,
 		Filter: xmlFilter{Prefix: rule.Prefix},
 		Status: rule.Status,
 	}

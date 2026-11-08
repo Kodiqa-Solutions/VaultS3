@@ -32,10 +32,12 @@ export const featureSetup: Record<FeatureKey, string> = {
   scanner: `scanner:
   enabled: true
   webhook_url: "http://localhost:3310/scan"`,
-  tiering: `tiering:
+  tiering: `# Moving objects to the cold tier is disabled from 5.0.11 (nothing reads
+# from it yet). Enable tiering only to restore objects an earlier version
+# moved there, with RestoreObject.
+tiering:
   enabled: true
-  cold_data_dir: "./cold_data"
-  migrate_after_days: 30`,
+  cold_data_dir: "./cold_data"`,
   backup: `backup:
   enabled: true
   targets:

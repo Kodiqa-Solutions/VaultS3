@@ -53,6 +53,11 @@ Captured 2026-08-24 against a single node with default settings:
 | failing | 155 |
 | errored | 492 |
 
+Grown on 2026-11-08 to **323** with 5.0.11, whose fix to the order of
+versions written in the same second makes six versioning tests pass
+(`create_overwrite_multipart`, `create_read_remove`, `create_versions_remove_all`,
+`create_versions_remove_special_names`, `list_marker`, `suspend_versions`).
+
 Grown on 2026-10-07 to **317 gated tests**, including 15 for object tagging,
 against 5.0.1 plus the tagging and object lock fixes that followed. That was the
 first sweep to run to the end. Before it, every sweep stopped part way: two

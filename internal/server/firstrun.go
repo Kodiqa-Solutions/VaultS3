@@ -4,15 +4,20 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
+	"maps"
+	"net"
 	"net/http"
 	"strings"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/api"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/replication"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/s3"
 )
 
@@ -205,6 +210,95 @@ func (s *Server) requireClusterSecret(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		next(w, r)
+	}
+}
+
+// maxSyncRequestBody bounds a /_replication/sync request, a small JSON
+// document naming a cursor and a batch size.
+const maxSyncRequestBody = 64 << 10
+
+// requireReplicationPeer guards /_replication/sync. A peer site pulls with the
+// access key in its replication.peers entry, signed with SigV4 exactly as its
+// object GETs are, so that is accepted here, and the answer then carries only
+// the changes that key may list and read (s3:ListBucket on the bucket and
+// s3:GetObject on the object). The cluster secret is accepted too, as before, and sees everything.
+//
+// Only the cluster secret was accepted from 4.4.56, which no peer ever sent:
+// every active-active sync was refused with 403 and nothing replicated.
+func (s *Server) requireReplicationPeer(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if secret := s.cfg.Cluster.Secret; secret != "" && hmac.Equal([]byte(r.Header.Get("X-Cluster-Secret")), []byte(secret)) {
+			next(w, r)
+			return
+		}
+		if s.s3Auth == nil || r.Header.Get("Authorization") == "" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		identity, err := s.s3Auth.Authenticate(r)
+		if err != nil {
+			slog.Info("replication sync refused at authentication", "reason", err.Error())
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		host, _, splitErr := net.SplitHostPort(r.RemoteAddr)
+		if splitErr != nil {
+			host = r.RemoteAddr
+		}
+		if err := s.s3Auth.CheckIPAccess(identity, host); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		// The signature covers the body only through X-Amz-Content-Sha256, so
+		// the body has to be checked against it here.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxSyncRequestBody+1))
+		if err != nil || len(body) > maxSyncRequestBody {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		sum := sha256.Sum256(body)
+		if !hmac.Equal([]byte(strings.ToLower(r.Header.Get("X-Amz-Content-Sha256"))), []byte(hex.EncodeToString(sum[:]))) {
+			http.Error(w, "the body does not match its signed SHA-256", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		// The change log lists keys, so a change is shown only to a key that
+		// may both list its bucket and read the object, as a ListObjects and
+		// a GET would need. GetObject alone let a key that may read objects
+		// by name, but not list the bucket, enumerate every key in it.
+		// The same condition keys as an S3 request (aws:SecureTransport,
+		// aws:UserAgent, ...), so a peer key whose Allow carries a condition
+		// is judged as its GETs are. With aws:SourceIp alone, such an Allow
+		// never applied and the peer received nothing.
+		reqCtx := s3.RequestConditionContext(r)
+		reqCtx["aws:SourceIp"] = host
+		// s3:prefix is taken from the query of an S3 listing. Here the
+		// caller's own query would choose it, so a key allowed to list only
+		// home/alice/ could send ?prefix=home/alice/x and see every key.
+		// Each change is judged as a listing of exactly its own key.
+		delete(reqCtx, "s3:prefix")
+		mayList := func(bucket, prefix string) bool {
+			list := maps.Clone(reqCtx)
+			list["s3:prefix"] = prefix
+			return s.s3Auth.AuthorizeWithContext(identity, "s3:ListBucket", "arn:aws:s3:::"+bucket, list) == nil
+		}
+		may := func(bucket, key string) bool {
+			// A listing under the key itself or under any of its folders
+			// ("", "home/", "home/alice/") would show the key, so any of
+			// them that the key may list is enough: AWS's home-folder policy
+			// allows s3:prefix equal to "home/alice/" exactly.
+			listable := mayList(bucket, key)
+			for i := 0; !listable && i <= len(key); i++ {
+				if i == 0 || key[i-1] == '/' {
+					listable = mayList(bucket, key[:i])
+				}
+			}
+			if !listable {
+				return false
+			}
+			return s.s3Auth.AuthorizeWithContext(identity, "s3:GetObject", "arn:aws:s3:::"+bucket+"/"+key, maps.Clone(reqCtx)) == nil
+		}
+		next(w, replication.WithSyncReader(r, may))
 	}
 }
 

@@ -248,6 +248,13 @@ func (p *peekWriter) WriteHeader(code int) {
 	if p.committed || p.discarded {
 		return
 	}
+	// An informational answer from the other node (100 Continue, 103 Early
+	// Hints) is not the status. It used to be taken for it, so the real one,
+	// a 404 to fall through on or an error, was dropped. The client's own
+	// Expect: 100-continue is answered by this server, so it is not passed on.
+	if code >= 100 && code < 200 {
+		return
+	}
 	if code == http.StatusNotFound && p.discardNotFound {
 		p.discarded = true
 		return
