@@ -81,8 +81,21 @@ jobs:
         run: |
           # Pinned: the installer from a release tag installing that release,
           # never whatever the main branch serves on the day of the build.
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.54.1/install.sh \
-            | sh -s -- -b /usr/local/bin v1.54.1
+          # Retried: GitHub answered 504 for the release's checksums file for
+          # over half an hour while serving its other assets, and that failed
+          # the whole release (5.0.9). The installer still verifies the
+          # download against the checksums, so a retry changes nothing else.
+          set -o pipefail
+          for attempt in 1 2 3 4 5; do
+            if curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.54.1/install.sh \
+              | sh -s -- -b /usr/local/bin v1.54.1; then
+              break
+            fi
+            echo "syft install failed (attempt $attempt of 5)"
+            if [ "$attempt" = 5 ]; then exit 1; fi
+            sleep 20
+          done
+          syft version
 
       - name: Generate the SBOM for this binary
         run: |
