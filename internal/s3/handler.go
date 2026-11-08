@@ -522,7 +522,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		signer = s
 	}
 	decodeAwsChunked(r, signer)
-	if err := verifyPayloadHash(r); err != nil {
+	if err := verifyPayloadHash(r, streamsToEngine(r, key)); err != nil {
 		if !writeReqError(w, err) {
 			writeS3Error(w, "IncompleteBody", "The request body could not be read.", http.StatusBadRequest)
 		}

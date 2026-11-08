@@ -43,7 +43,15 @@ func signV4(req *http.Request, accessKey, secretKey, region string) {
 	}
 	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
 
+	// Every x-amz-* header is signed: the server refuses one that is not, as
+	// AWS does, because an unsigned one (X-Amz-Copy-Source, say) could be
+	// changed on the way without breaking the signature.
 	signedHeaderNames := []string{"host", "x-amz-content-sha256", "x-amz-date"}
+	for name := range req.Header {
+		if ln := strings.ToLower(name); strings.HasPrefix(ln, "x-amz-") && ln != "x-amz-content-sha256" && ln != "x-amz-date" {
+			signedHeaderNames = append(signedHeaderNames, ln)
+		}
+	}
 	sort.Strings(signedHeaderNames)
 	signedHeaders := strings.Join(signedHeaderNames, ";")
 

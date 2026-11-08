@@ -307,7 +307,11 @@ func (h *ObjectHandler) settleDigests(bucket, key, versionID string, d *putDiges
 }
 
 // removeRejected removes the data of an upload refused after the engine saved
-// it. It has no metadata, so it is never served even if this fails.
+// it, a last resort for an engine that saved without reading the whole body
+// (the checks normally fail inside the engine's own read, before anything is
+// saved). A new key has no metadata, so it is never served even if this fails.
+// For an overwrite in a bucket without versioning, the engine already replaced
+// the previous data, so it cannot be restored here.
 func (h *ObjectHandler) removeRejected(bucket, key, versionID string) {
 	var err error
 	if versionID != "" {

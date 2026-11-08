@@ -225,6 +225,7 @@
   "settings.domain": "Домен",
   "settings.tls": "TLS",
   "settings.shutdownTimeout": "Таймаут завершения",
+  "settings.idleTimeout": "Таймаут простоя соединения",
   "settings.storage": "Хранилище",
   "settings.dataDirectory": "Каталог данных",
   "settings.metadataDirectory": "Каталог метаданных",

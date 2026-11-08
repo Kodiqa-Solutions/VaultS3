@@ -73,3 +73,27 @@ func TestSettingsFeatureKeysMatchDashboard(t *testing.T) {
 			"a mismatch here renders an empty row rather than failing", strings.Join(missing, ", "))
 	}
 }
+
+// Regression (sixth review): the Settings page showed idle_timeout_secs as
+// configured, so 0 or a negative value read "0s" while the server applied
+// 650 s. It shows the value the server applies.
+func TestSettingsShowTheIdleTimeoutTheServerApplies(t *testing.T) {
+	for _, c := range []struct{ secs, want int }{{900, 900}, {0, 650}, {-5, 650}} {
+		cfg := config.Defaults()
+		cfg.Server.IdleTimeoutSecs = c.secs
+		h := &APIHandler{cfg: cfg}
+		rec := httptest.NewRecorder()
+		h.handleSettings(rec, httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil))
+		var resp struct {
+			Server struct {
+				IdleTimeoutSecs int `json:"idleTimeoutSecs"`
+			} `json:"server"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Server.IdleTimeoutSecs != c.want {
+			t.Errorf("idle_timeout_secs %d: Settings shows %d, want %d", c.secs, resp.Server.IdleTimeoutSecs, c.want)
+		}
+	}
+}

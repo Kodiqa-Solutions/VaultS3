@@ -12,6 +12,7 @@ type settingsResponse struct {
 		Port                int    `json:"port"`
 		Domain              string `json:"domain,omitempty"`
 		ShutdownTimeoutSecs int    `json:"shutdownTimeoutSecs"`
+		IdleTimeoutSecs     int    `json:"idleTimeoutSecs"`
 		TLSEnabled          bool   `json:"tlsEnabled"`
 	} `json:"server"`
 	Storage struct {
@@ -62,6 +63,7 @@ func (h *APIHandler) handleSettings(w http.ResponseWriter, _ *http.Request) {
 	resp.Server.Port = h.cfg.Server.Port
 	resp.Server.Domain = h.cfg.Server.Domain
 	resp.Server.ShutdownTimeoutSecs = h.cfg.Server.ShutdownTimeoutSecs
+	resp.Server.IdleTimeoutSecs = h.cfg.Server.EffectiveIdleTimeoutSecs()
 	resp.Server.TLSEnabled = h.cfg.Server.TLS.Enabled
 
 	resp.Storage.DataDir = h.cfg.Storage.DataDir

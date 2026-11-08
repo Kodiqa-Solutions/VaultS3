@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -22,7 +23,26 @@ func (h *ObjectHandler) PostUpload(w http.ResponseWriter, r *http.Request, bucke
 	}
 
 	if err := r.ParseMultipartForm(128 * 1024 * 1024); err != nil {
-		writeS3Error(w, "MalformedPOSTRequest", "Could not parse multipart form", http.StatusBadRequest)
+		if !writeReqError(w, err) {
+			writeS3Error(w, "MalformedPOSTRequest", "Could not parse multipart form", http.StatusBadRequest)
+		}
+		return
+	}
+	// The form parser stops at the closing boundary, and its buffered reader
+	// can swallow an error returned with the body's last bytes. So read on to
+	// the end of the body: a body checked against a signed SHA-256 or signed
+	// chunks reports its failure there (the checks keep reporting it), and
+	// must before anything is stored. A checked body is read to its end
+	// however long the rest is, or a long epilogue would skip the check; any
+	// other body only up to 1 MiB.
+	var rest io.Reader = io.LimitReader(r.Body, 1<<20)
+	if bodyIsVerified(r.Body) {
+		rest = r.Body
+	}
+	if _, err := io.Copy(io.Discard, rest); err != nil {
+		if !writeReqError(w, err) {
+			writeS3Error(w, "IncompleteBody", "The request body could not be read", http.StatusBadRequest)
+		}
 		return
 	}
 

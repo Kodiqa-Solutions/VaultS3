@@ -5,17 +5,94 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+
+## [5.0.9] - 2026-11-08
+### Security
+- **Every `x-amz-*` header of a signed request must now be signed, as AWS
+  requires, for both an `Authorization` header and a presigned URL.** VaultS3
+  checked only the headers the signer chose to sign, so an attacker on a plain
+  HTTP connection, or anyone holding a presigned URL, could add an unsigned
+  header and change what the request did: `X-Amz-Copy-Source` turned an upload
+  into a copy of any object the signer could read, the Snowball header turned
+  it into an archive extraction over other keys, and SSE-C headers sealed the
+  data under the attacker's key. Such a request is now refused with
+  `AccessDenied` and a message naming the header. Three headers stay allowed
+  unsigned because they cannot change a request: `X-Amz-Content-Sha256` (a
+  header-signed request's signature covers it on its own line anyway, and on
+  a presigned URL the body is never checked against it and signed chunks are
+  refused), `X-Amz-Cf-Id` (added by
+  CloudFront) and `X-Amz-User-Agent` (sent unsigned by the AWS SDK for PHP,
+  and by the AWS SDK for .NET in browser mode). The AWS SDKs, the AWS CLI, `mc`, s3cmd and rclone already sign
+  every other `x-amz-*` header. The 5.0.8 `vaults3-cli` does not sign
+  `X-Amz-Copy-Source`, so upgrade it with the server to keep `object cp`
+  working. A form upload signed with an `Authorization` header must also sign
+  `Content-Type`: its boundary decides how the body is read, and with it
+  unsigned a changed boundary read a different form (another key and file)
+  out of the same signed bytes. A signed header name written with a space now
+  binds its value too.
+- **The body of a signed upload is now checked against its signature.** A
+  SigV4 signature covers the SHA-256 of the body that the client declares in
+  `x-amz-content-sha256`, or, for a signed streaming upload, the first link of
+  a chain of per-chunk signatures. It does not cover the body itself, and
+  VaultS3 never compared the two. So on a plain HTTP connection anyone on the
+  network path could replace the body of a correctly signed upload, and the
+  replaced bytes were stored (checked with boto3, and with `mcli` sending
+  signed chunks, through a proxy that altered one byte). Now a body that does
+  not match its declared SHA-256 is refused with `XAmzContentSHA256Mismatch`,
+  every chunk signature and the signed trailer of a signed streaming upload
+  are checked in order (`SignatureDoesNotMatch`), and an object upload or part
+  whose body is longer or shorter than its declared length is refused with
+  `IncompleteBody`. A refused upload stores nothing and leaves an object
+  already at the key as it was, also with erasure coding. Every other body (policies, lifecycle, CORS, versioning,
+  tagging, multi-object delete lists, multipart completion) is read and
+  checked in full before it is acted on, whether or not it declares a length,
+  since most of these stop reading at the closing XML tag. A Snowball archive
+  is checked before any entry is extracted (when its body is signed, as over
+  plain HTTP, the response comes once extraction ends, so a very large archive can need a longer
+  client read timeout, see UPGRADING), a signed form upload (`POST` to a
+  bucket) is read to its end and checked before the object is stored, and an
+  empty body must match the hash of an empty body. These checks need a body the client signed: one sent
+  as `UNSIGNED-PAYLOAD` (presigned uploads, and the `vaults3-cli` and FUSE
+  uploads) carries nothing to check it against and relies on HTTPS. HTTPS already
+  protected the body in transit, so this mainly affects servers reached over
+  plain HTTP.
+- **A Snowball archive can no longer store more than it carries.** A tar
+  entry in the PAX sparse format is read as a regular file of its declared
+  size, with its holes filled by zeros, so an archive of a few KiB stored an
+  object of any size, past the archive and object size limits, for anyone
+  allowed to upload to the bucket (a bucket quota did stop it). Sparse entries
+  are now refused, and an entry larger than 5 GiB, the limit of a single
+  upload, is refused too. Both are counted as refused and the rest of the
+  archive is extracted. Affects every earlier version with Snowball.
+- **Connections that send their headers too slowly are now closed.** The S3
+  and dashboard listener, the separate console listener and the inter-node
+  listener had no time limits at all, so a client sending its headers a byte
+  at a time could hold a connection open for ever, and enough of them could
+  exhaust the server (a slowloris attack). An HTTP/1.1 client now has 30
+  seconds to send its headers, the TLS handshake is held to the same 30
+  seconds, and a keep-alive connection idle between requests is closed after
+  `server.idle_timeout_secs` (650 by default, above the idle timeout of common
+  load balancers such as Google Cloud's 600 seconds). After a request has been
+  answered, the server waits at most 10 seconds for the rest of a body it did
+  not read, so a client that stalls its body after a refusal no longer holds
+  the connection either. The dashboard sign-in (password and OIDC) reads its
+  small body before anyone is authenticated, so that body also has 30
+  seconds. Any other body, read only once the request is authenticated, and
+  the response have no time limit, as before, so large or slow uploads,
+  downloads and the dashboard's live streams are not cut off.
+
 ### Fixed
 - **Checksums sent after the upload body are now checked.** Current AWS SDKs
   (boto3, the AWS CLI, the Go and JavaScript SDKs) send their CRC32 or
   CRC64NVME checksum as a trailer after an aws-chunked body when talking
   HTTPS, which is how most servers are reached. VaultS3 decoded the body but
   threw the trailer away, so these checksums were never compared with the
-  bytes or stored: an upload damaged in transit was accepted, and a trailer
-  with any value at all was stored. The trailer is now read, the checksum is
+  bytes, and never recorded on the object: an upload damaged in transit was
+  accepted, whatever value its trailer carried. The trailer is now read, the checksum is
   compared, a mismatch is refused with `BadDigest` and stores nothing, and the
   value is stored and returned on GET and HEAD. Also applies to UploadPart and
-  to servers with erasure coding.
+  to servers with erasure coding. Not yet to a Snowball archive: a checksum
+  it carries is not compared.
 - **CRC64NVME checksums are supported**, the checksum S3 itself uses by
   default. They were ignored, so a wrong value was stored without complaint.
   They are now checked, stored and returned on PUT, GET, HEAD,
@@ -31,34 +108,6 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
   still busy at the shutdown timeout, its remaining connections are now
   closed, and the S3, console and inter-node listeners drain at the same time
   instead of one after another.
-
-### Security
-- **The body of a signed upload is now checked against its signature.** A
-  SigV4 signature covers the SHA-256 of the body that the client declares in
-  `x-amz-content-sha256`, or, for a signed streaming upload, the first link of
-  a chain of per-chunk signatures. It does not cover the body itself, and
-  VaultS3 never compared the two. So on a plain HTTP connection anyone on the
-  network path could replace the body of a correctly signed upload, and the
-  replaced bytes were stored (checked with boto3, and with `mcli` sending
-  signed chunks, through a proxy that altered one byte). Now a body that does
-  not match its declared SHA-256 is refused with `XAmzContentSHA256Mismatch`,
-  every chunk signature and the signed trailer of a signed streaming upload
-  are checked in order (`SignatureDoesNotMatch`), and a body longer than its
-  declared length is refused with `IncompleteBody`. A refused upload stores
-  nothing and leaves an object already at the key as it was, also with
-  erasure coding. Configuration bodies (policies, lifecycle, CORS, tagging,
-  delete lists) are checked in full before they are applied. HTTPS already
-  protected the body in transit, so this mainly affects servers reached over
-  plain HTTP.
-- **Connections that send their headers too slowly are now closed.** The S3
-  and dashboard listener, the separate console listener and the inter-node
-  listener had no time limits at all, so a client sending its headers a byte
-  at a time could hold a connection open for ever, and enough of them could
-  exhaust the server (a slowloris attack). A client now has 30 seconds to send
-  its headers, which also bounds the TLS handshake, and a keep-alive
-  connection that sits idle between requests is closed after 2 minutes. The
-  body of a request and the response have no time limit, as before, so large
-  or slow uploads, downloads and the dashboard's live streams are not cut off.
 
 ## [5.0.8] - 2026-11-06
 ### Added
@@ -3560,7 +3609,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.8...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.9...HEAD
+[5.0.9]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.8...v5.0.9
 [5.0.8]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.7...v5.0.8
 [5.0.7]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.6...v5.0.7
 [5.0.6]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.5...v5.0.6

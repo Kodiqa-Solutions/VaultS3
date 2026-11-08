@@ -66,6 +66,20 @@ type putDigests struct {
 func (d *putDigests) checkInline(r *http.Request, limit int64) {
 	d.req = r
 	d.limit = limit
+	// A body declared empty is checked before the engine is called at all.
+	// An engine given a size of 0 may save an empty object without reading
+	// anything, which in a bucket without versioning already replaces the
+	// object at the key, so a check made later could only delete it.
+	if d.expect == 0 {
+		if err := d.probeEnd(); err == io.EOF {
+			d.done = true
+			sums, code, message, ok := d.verify(r)
+			if !ok {
+				d.failure = &reqError{code, message, http.StatusBadRequest}
+			}
+			d.sums = sums
+		}
+	}
 }
 
 // newPutDigests wraps body, enabling exactly the hashes this request needs.
@@ -114,6 +128,9 @@ func newPutDigests(r *http.Request, body io.Reader) *putDigests {
 var errBodyTooLong = &reqError{"IncompleteBody",
 	"The request body is longer than the length it declared.", http.StatusBadRequest}
 
+var errBodyTooShort = &reqError{"IncompleteBody",
+	"You did not provide the number of bytes specified by the Content-Length HTTP header.", http.StatusBadRequest}
+
 func (d *putDigests) Read(p []byte) (int, error) {
 	if d.failure != nil {
 		return 0, d.failure
@@ -156,6 +173,13 @@ func (d *putDigests) Read(p []byte) (int, error) {
 		if err != nil && err != io.EOF {
 			return n, err
 		}
+	}
+	// A body that ends before its declared length was cut short: an
+	// aws-chunked body declares its decoded length, and an unsigned one can
+	// lose its tail on the way. (A short plain body already fails in net/http.)
+	if err == io.EOF && d.req != nil && d.expect >= 0 && d.n < d.expect {
+		d.failure = errBodyTooShort
+		return n, d.failure
 	}
 	if err == io.EOF && d.req != nil {
 		d.done = true
@@ -251,7 +275,9 @@ func (d *putDigests) verify(r *http.Request) (sums objectChecksums, code, messag
 // trailerDeclares reports whether X-Amz-Trailer lists header (a comma list,
 // any case).
 func trailerDeclares(r *http.Request, header string) bool {
-	for _, t := range strings.Split(strings.Join(r.Header.Values("X-Amz-Trailer"), ","), ",") {
+	// Get, not Values: the signature covers the first value only, so a second
+	// X-Amz-Trailer header added on the way must not count.
+	for _, t := range strings.Split(r.Header.Get("X-Amz-Trailer"), ",") {
 		if strings.EqualFold(strings.TrimSpace(t), header) {
 			return true
 		}

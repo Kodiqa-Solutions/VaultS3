@@ -225,6 +225,7 @@
   "settings.domain": "域名",
   "settings.tls": "TLS",
   "settings.shutdownTimeout": "关闭超时",
+  "settings.idleTimeout": "空闲连接超时",
   "settings.storage": "存储",
   "settings.dataDirectory": "数据目录",
   "settings.metadataDirectory": "元数据目录",

@@ -37,6 +37,7 @@ data:
       address: "0.0.0.0"
       port: 9000
       shutdown_timeout_secs: 30
+      idle_timeout_secs: 650
     storage:
       data_dir: "/data"
       metadata_dir: "/metadata"

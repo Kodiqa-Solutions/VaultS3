@@ -44,6 +44,8 @@ S3 API: `http://localhost:9000`
 - **Backup scheduler** -- cron-based full/incremental backups
 - **Lambda triggers** -- webhook functions on S3 events
 - **Orphan reclaim** -- `vaults3-cli storage reclaim` frees data files that no metadata refers to, across every node
+- **Upload integrity** -- every signed upload is checked against its signature and checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256, as a header or a trailer) before anything is stored
+- **Slow client protection** -- 30 second header limit and a configurable idle timeout on every listener
 - **Rate limiting** -- per-IP and per-access-key token bucket, on by default
 - **PROXY protocol** -- real client IP behind load balancers
 - **Prometheus metrics** -- per-bucket request counts, bytes, errors at `/metrics`

@@ -78,13 +78,60 @@ checksum or signature, which is what the checks are for.
   then does not send it is refused with `MalformedTrailerError`, as on AWS.
 - The body of a signed upload is checked against what the signature covers:
   its declared `x-amz-content-sha256`, or the chunk and trailer signatures of
-  a signed streaming upload. A body changed on the way, or longer than the
-  length it declared, is refused. A presigned or anonymous request that claims
+  a signed streaming upload. A body changed on the way, or longer or shorter
+  than the length it declared, is refused. A presigned or anonymous request that claims
   signed chunks (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) is refused, since it has
   no signature to chain them from.
 
 boto3, the AWS CLI and minio-go clients (`mc`, `mcli`) are not affected: they
 were tested over HTTP and HTTPS, with and without erasure coding.
+
+**Upgrade `vaults3-cli` together with the server.** A signed request or
+presigned URL whose `x-amz-*` headers are not all signed is now refused with
+`AccessDenied` and a message naming the header, as on AWS. The 5.0.8 and older
+`vaults3-cli` sends `X-Amz-Copy-Source` unsigned, so its `object cp` fails
+against 5.0.9 (its other commands keep working). Older FUSE mounts keep
+working, replication between nodes is not affected, and other clients (AWS
+SDKs, AWS CLI, `mc`, s3cmd, rclone) sign every header already. If you hand out
+presigned URLs and the uploader adds an `x-amz-*` header (an ACL or metadata),
+include that header when signing the URL, as AWS also requires. VaultS3 behind
+CloudFront keeps working: `X-Amz-Cf-Id` is allowed unsigned. A form upload
+(`POST` to a bucket) signed with an `Authorization` header must also sign
+`Content-Type`, whose boundary decides how the body is read; the AWS SDKs and
+minio-go sign it already.
+
+A Snowball archive whose body is signed (a SHA-256, or signed chunks, as
+boto3, the AWS CLI and `mc` send over plain HTTP) is now verified before any
+entry is extracted. It is staged in `.snowball/` on the data volume while that
+happens, so at its peak an upload needs about twice the archive's size in
+free space (the staged archive plus the extracted entries). The files it
+will store are held to the bucket's remaining quota, read from the tar
+headers as the archive arrives (entries it refuses do not count), and the archive itself to 5 GiB per upload; leftovers are
+removed at startup. Any archive, signed or not, now refuses a sparse tar
+entry and an entry larger than 5 GiB (both are counted in
+`X-Amz-Snowball-Refused-Count`, the rest is extracted). If you roll back to
+5.0.8, remove `.snowball/` by hand
+when no upload is running.
+
+The response to such an archive now comes once extraction ends, and the client
+gets no bytes while it runs. Each entry is written durably, which we measured
+at 4 to 6 ms per entry on Linux, and several times that on slower disks or
+macOS. So an archive of several thousand entries can outlast a client's 60
+second read timeout (boto3, the AWS CLI and minio-go all default to 60 s); the
+client then reports a timeout and retries while the server is still
+extracting. Raise the client's read timeout or split the archive. Over HTTPS
+these clients do not sign the body, so the archive is extracted as it arrives
+with no wait, but nothing checks it then: a checksum sent with a Snowball
+archive is not compared yet.
+
+Idle keep-alive connections are now closed after `server.idle_timeout_secs`,
+650 seconds by default (0 or a negative value also means 650; the limit cannot
+be turned off). A load balancer or proxy that keeps idle connections to
+VaultS3 open longer may send a request on a connection the server has just
+closed, which shows up as an occasional 502. The default is above Google Cloud's
+load balancer (600 s), AWS ALB's default (60 s), nginx (60 s) and Traefik
+(90 s). Envoy and Istio keep idle connections for 1 hour by default: set their
+upstream idle timeout below the server's, or raise `idle_timeout_secs`.
 
 ## Upgrading to 5.0.8
 

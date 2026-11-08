@@ -542,6 +542,10 @@ func (h *ObjectHandler) PutObject(w http.ResponseWriter, r *http.Request, bucket
 	// key is left exactly as it was.
 	digests := newPutDigests(r, r.Body)
 	digests.checkInline(r, h.quotaByteLimit(bucket))
+	if digests.failure != nil {
+		writeReqError(w, digests.failure)
+		return
+	}
 
 	meta, err := h.writeObject(newObject{
 		bucket: bucket,

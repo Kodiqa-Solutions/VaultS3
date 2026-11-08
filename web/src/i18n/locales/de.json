@@ -225,6 +225,7 @@
   "settings.domain": "Domain",
   "settings.tls": "TLS",
   "settings.shutdownTimeout": "Shutdown-Zeitlimit",
+  "settings.idleTimeout": "Zeitlimit für inaktive Verbindungen",
   "settings.storage": "Speicher",
   "settings.dataDirectory": "Datenverzeichnis",
   "settings.metadataDirectory": "Metadaten-Verzeichnis",

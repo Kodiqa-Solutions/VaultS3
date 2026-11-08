@@ -107,7 +107,7 @@ Everything in the box, in one list. The task guides linked from the documentatio
 - **Canned ACL headers**: `x-amz-acl` and `x-amz-grant-*` headers on PUT
 - **Replication status header**: `x-amz-replication-status` on GET/HEAD responses
 - **Website redirect**: `x-amz-website-redirect-location` header for per-object redirects
-- **S3 Checksum API**: CRC32, CRC32C, CRC64NVME, SHA1 and SHA256 checksums on upload and download, sent as a header or as an aws-chunked trailer (the default of current AWS SDKs over HTTPS). A checksum that does not match the bytes is refused with `BadDigest` and nothing is stored
+- **S3 Checksum API**: CRC32, CRC32C, CRC64NVME, SHA1 and SHA256 checksums on upload and download, sent as a header or as an aws-chunked trailer (the default of current AWS SDKs over HTTPS). A checksum that does not match the bytes is refused with `BadDigest` and nothing is stored (not yet checked on Snowball archives)
 - **Parts count header**: `x-amz-mp-parts-count` on HEAD for multipart objects
 - **ListObjectsV1**: Marker-based pagination (`GET /{bucket}?marker=`) for legacy client compatibility
 - **ListBuckets with prefix filter**: Filter bucket listing by name prefix

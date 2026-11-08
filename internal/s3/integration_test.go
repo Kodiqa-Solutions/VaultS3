@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -71,8 +72,8 @@ func signV4Request(r *http.Request, accessKey, secretKey string, body []byte) {
 	payloadHash := hex.EncodeToString(h[:])
 	r.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-	// Signed headers
-	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
+	// Signed headers: every x-amz-* header present, as an SDK signs them.
+	signedHeaders := signedHeaderList(r)
 
 	// Build canonical request (no reverse-proxy prefix in tests)
 	canonicalRequest := buildCanonicalRequest(r, signedHeaders, "")
@@ -89,6 +90,25 @@ func signV4Request(r *http.Request, accessKey, secretKey string, body []byte) {
 		"AWS4-HMAC-SHA256 Credential=%s, SignedHeaders=%s, Signature=%s",
 		credential, signedHeaders, signature,
 	))
+}
+
+// signedHeaderList is what a real SDK signs: host, the payload hash, the date,
+// and every other x-amz-* header present. The server refuses an unsigned
+// x-amz-* header, as AWS does.
+func signedHeaderList(r *http.Request) string {
+	names := map[string]bool{"host": true, "x-amz-content-sha256": true, "x-amz-date": true}
+	for k := range r.Header {
+		// The SDKs sign Content-Type too when it is set.
+		if lk := strings.ToLower(k); strings.HasPrefix(lk, "x-amz-") || lk == "content-type" {
+			names[lk] = true
+		}
+	}
+	list := make([]string, 0, len(names))
+	for n := range names {
+		list = append(list, n)
+	}
+	sort.Strings(list)
+	return strings.Join(list, ";")
 }
 
 // doSigned performs a signed HTTP request and returns the response.

@@ -147,7 +147,9 @@ func TestPresignedMaxSizeIsEnforcedOnTheBody(t *testing.T) {
 	req.ContentLength = int64(len(framed))
 	req.Header.Set("Content-Encoding", "aws-chunked")
 	req.Header.Set("X-Amz-Decoded-Content-Length", "5")
-	expect(t, "aws-chunked body declaring 5 bytes", send(t, req), http.StatusBadRequest, "EntityTooLarge")
+	// X-Amz-Decoded-Content-Length is an x-amz-* header the URL did not sign,
+	// so the request is refused at authentication, before its body is read.
+	expect(t, "aws-chunked body declaring 5 bytes with an unsigned length header", send(t, req), http.StatusForbidden, "AccessDenied")
 	expect(t, "nothing was stored", e.admin(t, http.MethodGet, "/psize/k", ""), http.StatusNotFound, "NoSuchKey")
 
 	req, _ = http.NewRequest(http.MethodPut, u, strings.NewReader("small"))

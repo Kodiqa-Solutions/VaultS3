@@ -6,6 +6,7 @@ export interface Settings {
     port: number
     domain?: string
     shutdownTimeoutSecs: number
+    idleTimeoutSecs: number
     tlsEnabled: boolean
   }
   storage: {

@@ -339,13 +339,30 @@ type SecurityConfig struct {
 	STSMaxDurationSecs int      `yaml:"sts_max_duration_secs"`
 }
 
+// DefaultIdleTimeoutSecs is server.idle_timeout_secs when it is unset, 0 or
+// negative: the limit cannot be turned off.
+const DefaultIdleTimeoutSecs = 650
+
+// EffectiveIdleTimeoutSecs is the idle limit the server applies.
+func (s ServerConfig) EffectiveIdleTimeoutSecs() int {
+	if s.IdleTimeoutSecs > 0 {
+		return s.IdleTimeoutSecs
+	}
+	return DefaultIdleTimeoutSecs
+}
+
 type ServerConfig struct {
-	Address             string    `yaml:"address"`
-	Port                int       `yaml:"port"`
-	Domain              string    `yaml:"domain"` // base domain for virtual-hosted URLs (e.g. "localhost", "s3.example.com")
-	ShutdownTimeoutSecs int       `yaml:"shutdown_timeout_secs"`
-	TLS                 TLSConfig `yaml:"tls"`
-	InterNodeAddress    string    `yaml:"internode_address"` // separate bind address for inter-node traffic
+	Address             string `yaml:"address"`
+	Port                int    `yaml:"port"`
+	Domain              string `yaml:"domain"` // base domain for virtual-hosted URLs (e.g. "localhost", "s3.example.com")
+	ShutdownTimeoutSecs int    `yaml:"shutdown_timeout_secs"`
+	// IdleTimeoutSecs closes a keep-alive connection idle between requests
+	// for this long. Keep it above the idle timeout of any load balancer or
+	// proxy in front (Google Cloud's is 600s), or it may reuse a connection
+	// the server just closed.
+	IdleTimeoutSecs  int       `yaml:"idle_timeout_secs"`
+	TLS              TLSConfig `yaml:"tls"`
+	InterNodeAddress string    `yaml:"internode_address"` // separate bind address for inter-node traffic
 	// TrustedProxies lists reverse proxies (addresses or CIDRs) whose
 	// X-Forwarded-For is believed. Without it every client behind nginx shares
 	// the proxy's address for rate limits, IP rules and aws:SourceIp.
@@ -554,6 +571,7 @@ func parse(data []byte) (*Config, error) {
 			Address:             "0.0.0.0",
 			Port:                9000,
 			ShutdownTimeoutSecs: 30,
+			IdleTimeoutSecs:     DefaultIdleTimeoutSecs,
 		},
 		Storage: StorageConfig{
 			DataDir:               "./data",

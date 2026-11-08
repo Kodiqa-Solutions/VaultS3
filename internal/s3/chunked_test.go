@@ -32,6 +32,9 @@ func newChunkedReq(data []byte, signed bool, sha string) *http.Request {
 	r.Header.Set("Content-Encoding", "aws-chunked")
 	r.Header.Set("X-Amz-Content-Sha256", sha)
 	r.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprintf("%d", len(data)))
+	// Real SDKs announce the trailer they will send. An unannounced checksum
+	// in the trailer is refused, since nothing hashed the body for it.
+	r.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
 	return r
 }
 

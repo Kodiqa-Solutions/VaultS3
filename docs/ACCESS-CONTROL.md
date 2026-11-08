@@ -402,6 +402,11 @@ Evaluation order: global blocklist (deny wins) → global allowlist → per-user
 
 ## Presigned Upload Restrictions
 
+An uploader using a presigned URL may only send `x-amz-*` headers (metadata,
+ACL, checksums) that were included when the URL was signed; any other is
+refused with `AccessDenied`, as on AWS. `X-Amz-Content-Sha256`, `X-Amz-Cf-Id`
+and `X-Amz-User-Agent` are allowed unsigned.
+
 Generate presigned PUT URLs with server-enforced restrictions:
 
 ```python

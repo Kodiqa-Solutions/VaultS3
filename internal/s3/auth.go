@@ -401,6 +401,22 @@ func (a *Authenticator) Authenticate(r *http.Request) (*iam.Identity, error) {
 	if !signsHost(signedHeaders) {
 		return nil, errAuthAccessDenied("host must be a signed header")
 	}
+	// Every x-amz-* header must be signed, as AWS requires. One that is not
+	// can be added or changed on the way without breaking the signature, and
+	// these headers decide what a request does: an added X-Amz-Copy-Source
+	// turned a signed upload into a copy of another object, the Snowball
+	// header turned it into an archive extraction, and SSE-C headers sealed
+	// it under someone else's key.
+	if name := unsignedAmzHeader(r, signedHeaders); name != "" {
+		return nil, errHeadersNotSigned(name)
+	}
+	// A form upload is read through the boundary its Content-Type names. The
+	// body hash covers the bytes, not how they are split, so with the boundary
+	// unsigned a changed one parsed a different form (another key, another
+	// file) out of the same signed bytes.
+	if isFormPost(r) && !signsHeader(signedHeaders, "content-type") {
+		return nil, errHeadersNotSigned("content-type")
+	}
 
 	identity, secretKey, err := a.resolveIdentity(reqAccessKey, r)
 	if err != nil && !isAfterSignature(err) {
@@ -429,14 +445,67 @@ func isAfterSignature(err error) bool {
 	return errors.As(err, &ae) && ae.afterSignature
 }
 
+// unsignedButHarmless are x-amz-* headers allowed without being signed:
+//   - x-amz-content-sha256 is the payload hash, which the canonical request
+//     carries on its own line whether or not it is also listed as a signed
+//     header, so changing it breaks the signature anyway. VaultS3's 5.0.8 FUSE
+//     mount sends it unlisted.
+//   - x-amz-cf-id is added by CloudFront to every request it forwards, after
+//     the client signed.
+//   - x-amz-user-agent is sent unsigned by the AWS SDK for PHP, and by the
+//     AWS SDK for .NET in its browser (Blazor) mode.
+//
+// VaultS3 never acts on the last two, so they cannot change what a request
+// does.
+var unsignedButHarmless = map[string]bool{
+	"x-amz-content-sha256": true,
+	"x-amz-cf-id":          true,
+	"x-amz-user-agent":     true,
+}
+
+// unsignedAmzHeader returns the first x-amz-* header of r that SignedHeaders
+// does not list and that is not harmless unsigned, or "".
+func unsignedAmzHeader(r *http.Request, signedHeaders string) string {
+	signed := make(map[string]bool)
+	for _, h := range strings.Split(signedHeaders, ";") {
+		signed[strings.ToLower(strings.TrimSpace(h))] = true
+	}
+	for name := range r.Header {
+		if ln := strings.ToLower(name); strings.HasPrefix(ln, "x-amz-") && !signed[ln] && !unsignedButHarmless[ln] {
+			return ln
+		}
+	}
+	return ""
+}
+
+// errHeadersNotSigned is AWS's answer to an unsigned x-amz-* header. It names
+// the header (not a secret), so a client behind a proxy that adds one can see
+// what happened.
+func errHeadersNotSigned(name string) *authError {
+	return &authError{code: "AccessDenied", status: http.StatusForbidden,
+		msg:    "There were headers present in the request which were not signed: " + name,
+		detail: "unsigned header " + name}
+}
+
 // signsHost reports whether a SignedHeaders list includes host.
 func signsHost(signedHeaders string) bool {
+	return signsHeader(signedHeaders, "host")
+}
+
+// signsHeader reports whether a SignedHeaders list includes name.
+func signsHeader(signedHeaders, name string) bool {
 	for _, h := range strings.Split(signedHeaders, ";") {
-		if strings.EqualFold(strings.TrimSpace(h), "host") {
+		if strings.EqualFold(strings.TrimSpace(h), name) {
 			return true
 		}
 	}
 	return false
+}
+
+// isFormPost reports a POST whose body is a multipart form, as a form upload
+// to a bucket is.
+func isFormPost(r *http.Request) bool {
+	return r.Method == http.MethodPost && strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data")
 }
 
 // requestTimestamp returns the request's signing time, in the ISO 8601 basic
@@ -514,6 +583,14 @@ func (a *Authenticator) authenticatePresigned(r *http.Request) (*iam.Identity, e
 	}
 	if !signsHost(signedHeaders) {
 		return nil, errAuthQueryParams("X-Amz-SignedHeaders must include host.")
+	}
+	// The same rule as for a header-signed request: every x-amz-* header must
+	// be signed. A presigned URL is handed to someone else, so without this
+	// its holder (or anyone on the path) could add X-Amz-Copy-Source and copy
+	// any object the URL's signer can read into the URL's key, or turn the
+	// upload into a Snowball extraction over other keys.
+	if name := unsignedAmzHeader(r, signedHeaders); name != "" {
+		return nil, errHeadersNotSigned(name)
 	}
 	region := credParts[2]
 	service := credParts[3]
@@ -693,6 +770,11 @@ func buildCanonicalRequest(r *http.Request, signedHeaders, basePrefix string) st
 	}
 
 	headerNames := strings.Split(signedHeaders, ";")
+	for i, name := range headerNames {
+		// Trimmed as the unsigned-header check trims them, so a name written
+		// with a space binds that header's value rather than an empty one.
+		headerNames[i] = strings.TrimSpace(name)
+	}
 	var canonicalHeaders strings.Builder
 	for _, name := range headerNames {
 		value := strings.TrimSpace(r.Header.Get(name))

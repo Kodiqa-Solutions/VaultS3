@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -199,6 +198,11 @@ func New(cfg *config.Config) (*Server, error) {
 	fs, err := storage.NewFileSystem(cfg.Storage.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("init storage: %w", err)
+	}
+	setIdleTimeout(cfg.Server)
+	// Archives staged by a run that was stopped mid-upload are never used.
+	if err := s3.ClearSnowballStaging(cfg.Storage.DataDir); err != nil {
+		slog.Warn("could not clear staged Snowball archives", "error", err)
 	}
 
 	var engine storage.Engine = fs
@@ -1518,6 +1522,9 @@ func (s *Server) Run() error {
 	handler = middleware.SecurityHeaders(handler)
 	handler = trustedProxies(s.cfg.Server.TrustedProxies, handler)
 	handler = middleware.PanicRecovery(handler)
+	if !splitConsole {
+		handler = signInDeadline(handler) // the dashboard API is on this listener
+	}
 
 	httpServer := newHTTPServer(addr, handler)
 	// Live streams only end when their client leaves, so end them as soon as
@@ -1781,7 +1788,7 @@ func (s *Server) Run() error {
 		chandler = middleware.SecurityHeaders(chandler)
 		chandler = trustedProxies(s.cfg.Server.TrustedProxies, chandler)
 		chandler = middleware.PanicRecovery(chandler)
-		consoleServer = newHTTPServer(consoleAddr, chandler)
+		consoleServer = newHTTPServer(consoleAddr, signInDeadline(chandler))
 		consoleServer.RegisterOnShutdown(apiHandler.CloseStreams)
 		go func() {
 			slog.Info("console (dashboard) listener started", "addr", consoleAddr)
@@ -1825,34 +1832,12 @@ func (s *Server) Run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// The listeners drain side by side, so a slow one cannot spend the time
-	// the others need. A listener still busy at the deadline has its
-	// remaining connections closed, so the process always stops.
-	var wg sync.WaitGroup
-	drain := func(name string, srv *http.Server, errOut *error) {
-		defer wg.Done()
-		if err := srv.Shutdown(ctx); err != nil {
-			slog.Error("graceful shutdown timed out, closing the remaining connections", "listener", name, "timeout", timeout, "error", err)
-			_ = srv.Close()
-			if errOut != nil {
-				*errOut = err
-			}
-		}
-	}
-	var mainErr error
-	wg.Add(1)
-	go drain("s3", httpServer, &mainErr)
-	if interNodeServer != nil {
-		wg.Add(1)
-		go drain("inter-node", interNodeServer, nil)
-	}
-	if consoleServer != nil {
-		wg.Add(1)
-		go drain("console", consoleServer, nil)
-	}
-	wg.Wait()
-	if mainErr != nil {
-		return mainErr
+	if err := drainServers(ctx, timeout,
+		namedServer{"s3", httpServer},
+		namedServer{"inter-node", interNodeServer},
+		namedServer{"console", consoleServer},
+	); err != nil {
+		return err
 	}
 
 	slog.Info("server stopped gracefully")

@@ -124,9 +124,9 @@ Windows, a `checksums.txt` signed with the project's release key, an SPDX SBOM
 per platform, and a Sigstore provenance bundle you can verify offline:
 
 ```bash
-sudo apt install ./vaults3_5.0.8_amd64.deb
+sudo apt install ./vaults3_5.0.9_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_5.0.8_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_5.0.9_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart or a single
@@ -168,7 +168,7 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 
 **Security:** VaultS3 was reviewed by an external white-box security assessment in August 2026, which reported 14 findings. All are fixed in 4.4.56. See [SECURITY.md](SECURITY.md) for the summary and [CHANGELOG.md](CHANGELOG.md) for each finding. If you run an earlier version, upgrade and read the [upgrade notes](docs/UPGRADING.md#upgrading-to-4456-security-release). Container images for versions before 4.4.56 have been withdrawn from Docker Hub, so those tags no longer pull.
 
-Defaults are chosen to be safe on a public network: authentication is required, policy evaluation is default-deny, and as of 4.4.65 rate limiting is on out of the box, at a ceiling far above real client traffic so it bounds a flood without throttling legitimate use. See the [hardening guide](docs/HARDENING.md).
+Defaults are chosen to be safe on a public network: authentication is required, policy evaluation is default-deny, and as of 4.4.65 rate limiting is on out of the box, at a ceiling far above real client traffic so it bounds a flood without throttling legitimate use. As of 5.0.9 the body of every signed upload is checked against its signature and checksums before anything is stored (signed chunks, trailers and CRC64NVME included), every `x-amz-*` header must be signed, and clients that send their headers too slowly are cut off. See the [hardening guide](docs/HARDENING.md).
 
 **S3 compatibility:** VaultS3 is measured against [ceph/s3-tests](https://github.com/ceph/s3-tests), the suite the rest of the object-storage world is tested with, rather than only against its own idea of the spec. CI gates on the tests it is expected to pass, and a weekly sweep runs the whole suite to find more to promote. The harness and the current baseline are in [scripts/s3-tests/](scripts/s3-tests/README.md).
 

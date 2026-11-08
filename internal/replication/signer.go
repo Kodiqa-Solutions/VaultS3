@@ -30,7 +30,10 @@ func signV4(req *http.Request, accessKey, secretKey, region string) {
 	signedHeaderNames := []string{"host", "x-amz-content-sha256", "x-amz-date"}
 	for name := range req.Header {
 		lower := strings.ToLower(name)
-		if lower == "x-vaults3-replication" {
+		// Every x-amz-* header is signed too: VaultS3 and AWS refuse one that
+		// is not.
+		if lower == "x-vaults3-replication" ||
+			(strings.HasPrefix(lower, "x-amz-") && lower != "x-amz-content-sha256" && lower != "x-amz-date") {
 			signedHeaderNames = append(signedHeaderNames, lower)
 		}
 	}

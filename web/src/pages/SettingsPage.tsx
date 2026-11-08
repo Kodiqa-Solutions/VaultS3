@@ -78,6 +78,7 @@ export default function SettingsPage() {
           <Row label={t('settings.domain')} value={settings.server.domain || '(not set)'} />
           <Row label={t('settings.tls')} value={settings.server.tlsEnabled ? t('common.enabled') : t('common.disabled')} />
           <Row label={t('settings.shutdownTimeout')} value={`${settings.server.shutdownTimeoutSecs}s`} />
+          <Row label={t('settings.idleTimeout')} value={`${settings.server.idleTimeoutSecs}s`} />
         </Section>
 
         {/* Storage */}

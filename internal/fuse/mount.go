@@ -618,11 +618,30 @@ func signRequest(req *http.Request, accessKey, secretKey, region string) {
 	// whose name holds a space failed its signature check.
 	canonicalQuery := canonicalQueryString(req.URL.Query())
 
-	signedHeaders := "host;x-amz-date"
-	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-date:%s\n", req.URL.Host, amzdate)
-
 	payloadHash := "UNSIGNED-PAYLOAD"
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+
+	// Every x-amz-* header is signed, as AWS expects: the server refuses an
+	// unsigned one. (It still allows X-Amz-Content-Sha256 unsigned, since the
+	// signature covers it on the payload hash line, so 5.0.8 mounts that sent
+	// it unlisted keep working.)
+	names := []string{"host"}
+	for name := range req.Header {
+		if ln := strings.ToLower(name); strings.HasPrefix(ln, "x-amz-") {
+			names = append(names, ln)
+		}
+	}
+	sort.Strings(names)
+	var ch strings.Builder
+	for _, n := range names {
+		v := req.URL.Host
+		if n != "host" {
+			v = strings.TrimSpace(req.Header.Get(n))
+		}
+		ch.WriteString(n + ":" + v + "\n")
+	}
+	signedHeaders := strings.Join(names, ";")
+	canonicalHeaders := ch.String()
 
 	canonicalRequest := strings.Join([]string{
 		req.Method, canonicalURI, canonicalQuery,

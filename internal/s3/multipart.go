@@ -128,6 +128,9 @@ func (h *ObjectHandler) requireUpload(w http.ResponseWriter, r *http.Request, up
 }
 
 // lockUpload serializes the requests that end an upload. Two concurrent
+// maxCompleteBodySize bounds a CompleteMultipartUpload body.
+const maxCompleteBodySize = 8 << 20
+
 // CompleteMultipartUpload calls for one upload used to assemble into the same
 // fixed temp file at once and interleave their bytes, and an abort could remove
 // the parts from under a completion halfway through assembling them.
@@ -161,6 +164,13 @@ func (h *ObjectHandler) UploadPart(w http.ResponseWriter, r *http.Request, bucke
 	// never replaces a good copy of itself. Neither was checked at all.
 	digests := newPutDigests(r, r.Body)
 	digests.checkInline(r, -1)
+	// For a part this is a second layer: writePart's first read returns the
+	// same failure before anything is renamed into place. PutObject needs it,
+	// since an engine given a size of 0 may save without reading.
+	if digests.failure != nil {
+		writeReqError(w, digests.failure)
+		return
+	}
 
 	written, etag, ok := h.writePart(w, digests, uploadID, partNum)
 	if !ok {
@@ -317,7 +327,6 @@ func (h *ObjectHandler) CompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// (~2,000+ parts), so xml.Decode failed with "MalformedXML" — the exact error
 	// aws-cli hit uploading a multi-GB object (issue #26). 8MiB fits 10,000 parts
 	// with room to spare while staying bounded.
-	const maxCompleteBodySize = 8 << 20
 	var req completeRequest
 	if err := xml.NewDecoder(io.LimitReader(r.Body, maxCompleteBodySize)).Decode(&req); err != nil {
 		writeS3Error(w, "MalformedXML", "Could not parse request body", http.StatusBadRequest)

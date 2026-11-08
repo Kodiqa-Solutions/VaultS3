@@ -123,7 +123,7 @@ func signStreamingTrailer(r *http.Request) {
 	r.Header.Set("X-Amz-Date", amzDate)
 	r.Header.Set("Host", r.Host)
 	r.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-	signed := "host;x-amz-content-sha256;x-amz-date"
+	signed := signedHeaderList(r)
 	canonical := buildCanonicalRequest(r, signed, "")
 	toSign := buildStringToSign(dateStr, testRegion, "s3", canonical, r)
 	sig := hex.EncodeToString(hmacSHA256(deriveSigningKey(testSecretKey, dateStr, testRegion, "s3"), []byte(toSign)))
@@ -337,5 +337,31 @@ func TestTrailerIsVerifiedWhenTheEngineStopsAtTheDeclaredSize(t *testing.T) {
 	}
 	if code, _ := headChecksum(t, ts, "/exact/bad", "crc32"); code != http.StatusNotFound {
 		t.Fatalf("refused upload is readable: HEAD %d", code)
+	}
+}
+
+// Regression (seventh review): an aws-chunked upload without
+// X-Amz-Decoded-Content-Length was held to its framed Content-Length, so the
+// shorter decoded body was refused as cut short (5.0.8 stored it). Its
+// decoded length is unknown, on either engine.
+func TestAwsChunkedUploadWithoutDecodedLengthIsStored(t *testing.T) {
+	plain, _ := fullServer(t)
+	exact, _ := exactSizeServer(t)
+	for name, ts := range map[string]*httptest.Server{"plain": plain, "exact-size engine": exact} {
+		t.Run(name, func(t *testing.T) {
+			call(t, ts, http.MethodPut, "/nodl", "").must(t, "create bucket")
+			body := bytes.Repeat([]byte("hello world "), 300)
+			framed := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(body), body)
+			req, _ := http.NewRequest(http.MethodPut, ts.URL+"/nodl/k", strings.NewReader(framed))
+			req.ContentLength = int64(len(framed))
+			req.Header.Set("Content-Encoding", "aws-chunked")
+			signStreamingTrailer(req)
+			if r := send(t, req); r.code != http.StatusOK {
+				t.Fatalf("aws-chunked PUT without a decoded length: %d %s, want 200", r.code, r.body)
+			}
+			if got := call(t, ts, http.MethodGet, "/nodl/k", ""); got.body != string(body) {
+				t.Fatalf("stored %d bytes, want %d", len(got.body), len(body))
+			}
+		})
 	}
 }

@@ -68,8 +68,13 @@ func decodeAwsChunked(r *http.Request, signer *chunkSigner) {
 	// The decoded object length lives in this header, not Content-Length (which
 	// counts the framed bytes). Fix ContentLength so size-based logic — quota,
 	// multipart/part-size caps, metrics — sees the true size.
+	// Without it the decoded length is unknown, not the framed one: holding
+	// the decoded bytes to the framed count refused every such upload as cut
+	// short, which 5.0.8 stored. AWS requires the header, some clients omit it.
+	r.ContentLength = -1
+	r.Header.Del("Content-Length")
 	if dl := r.Header.Get("X-Amz-Decoded-Content-Length"); dl != "" {
-		if n, err := strconv.ParseInt(dl, 10, 64); err == nil {
+		if n, err := strconv.ParseInt(dl, 10, 64); err == nil && n >= 0 {
 			r.ContentLength = n
 			r.Header.Set("Content-Length", dl)
 		}
@@ -282,8 +287,15 @@ func (b *awsChunkedBody) readTrailer() error {
 			continue
 		}
 		canonical.WriteString(name + ":" + value + "\n")
-		if header, known := trailerChecksums[name]; known && b.req.Header.Get(header) == "" {
-			b.req.Header.Set(header, value)
+		if header, known := trailerChecksums[name]; known {
+			// Only a checksum announced in X-Amz-Trailer is hashed while the
+			// body streams, so an unannounced one could not be checked.
+			if !trailerDeclares(b.req, header) {
+				return errMalformedTrail
+			}
+			if b.req.Header.Get(header) == "" {
+				b.req.Header.Set(header, value)
+			}
 		}
 	}
 	if b.signedTrailer {

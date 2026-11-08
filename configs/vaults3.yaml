@@ -3,6 +3,7 @@ server:
   port: 9000
   domain: ""  # set to enable virtual-hosted style URLs (e.g. "localhost", "s3.example.com")
   shutdown_timeout_secs: 30  # how long running requests get to finish on shutdown
+  idle_timeout_secs: 650     # close keep-alive connections idle this long; keep above any proxy's idle timeout (0 means 650)
   # `docker stop` waits only 10s before killing the process, so give it more:
   # `docker stop -t 35`, or `stop_grace_period: 35s` in Compose. Kubernetes waits
   # 30s by default (`terminationGracePeriodSeconds`).
