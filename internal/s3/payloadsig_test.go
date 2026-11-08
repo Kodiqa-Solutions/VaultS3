@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -811,22 +810,45 @@ func TestDecodedLengthZeroCannotHideAConfigurationBody(t *testing.T) {
 	}
 }
 
-// countingReader counts how much of a body the server read.
-type countingReader struct {
-	n   atomic.Int64
-	max int64
+// sendStalled sends req with a body that declares maxVerifiedBody bytes,
+// sends 1 MiB of it and then stalls, and returns the answer. A server that
+// had to read more of the body before answering never answers, and the test
+// fails after 10 s. (Counting the bytes the client wrote instead depended on
+// the kernel's socket buffers: Linux runners buffer several MiB.)
+func sendStalled(t *testing.T, req *http.Request) result {
+	t.Helper()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	req.Body = io.NopCloser(&stallingReader{after: 1 << 20, release: release})
+	req.ContentLength = maxVerifiedBody
+	done := make(chan result, 1)
+	go func() { done <- send(t, req) }()
+	select {
+	case r := <-done:
+		return r
+	case <-time.After(10 * time.Second):
+		t.Fatal("no answer while the body stalled after 1 MiB: the server waited for more of it")
+		return result{}
+	}
 }
 
-func (c *countingReader) Read(p []byte) (int, error) {
-	if c.n.Load() >= c.max {
+// stallingReader yields zeros up to after bytes, then blocks until release.
+type stallingReader struct {
+	n, after int64
+	release  chan struct{}
+}
+
+func (s *stallingReader) Read(p []byte) (int, error) {
+	if s.n >= s.after {
+		<-s.release
 		return 0, io.EOF
 	}
-	n := len(p)
-	if rem := c.max - c.n.Load(); int64(n) > rem {
-		n = int(rem)
+	if rem := s.after - s.n; int64(len(p)) > rem {
+		p = p[:rem]
 	}
-	c.n.Add(int64(n))
-	return n, nil
+	clear(p)
+	s.n += int64(len(p))
+	return len(p), nil
 }
 
 // Regression (third review): an anonymous request (here a GET on a public
@@ -841,19 +863,11 @@ func TestAnonymousRequestsAreNotBufferedForTheHashCheck(t *testing.T) {
 	if err := store.PutBucketPolicy("anonbuf", []byte(policy)); err != nil {
 		t.Fatal(err)
 	}
-	cr := &countingReader{max: maxVerifiedBody}
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/anonbuf/public/a", cr)
-	req.ContentLength = maxVerifiedBody
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/anonbuf/public/a", nil)
 	s := sha256.Sum256([]byte("whatever"))
 	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(s[:]))
-	r := send(t, req)
-	if r.code != http.StatusOK || r.body != "hi" {
-		t.Fatalf("anonymous GET: %d %q, want 200 \"hi\" (it read %d body bytes)", r.code, r.body, cr.n.Load())
-	}
-	// Counted on the client side: net/http drains up to 256 KiB after the
-	// handler, plus TCP buffers. Reading it for the check would be 8 MiB.
-	if n := cr.n.Load(); n > 2<<20 {
-		t.Fatalf("the anonymous body was read to %d bytes", n)
+	if r := sendStalled(t, req); r.code != http.StatusOK || r.body != "hi" {
+		t.Fatalf("anonymous GET: %d %q, want 200 \"hi\"", r.code, r.body)
 	}
 
 	// Anonymous writes are never allowed, so the PUT that reaches this rule
@@ -880,14 +894,8 @@ func TestSignedGetBodyIsNotCheckedOrRead(t *testing.T) {
 	call(t, ts, http.MethodPut, "/getbody/k", "hi").must(t, "object")
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/getbody/k", nil)
 	signV4Request(req, testAccessKey, testSecretKey, []byte("a body this GET never sends"))
-	cr := &countingReader{max: maxVerifiedBody}
-	req.Body = io.NopCloser(cr)
-	req.ContentLength = maxVerifiedBody
-	if r := send(t, req); r.code != http.StatusOK || r.body != "hi" {
-		t.Fatalf("signed GET with a body: %d %q, want 200 \"hi\" (read %d body bytes)", r.code, r.body, cr.n.Load())
-	}
-	if n := cr.n.Load(); n > 2<<20 {
-		t.Fatalf("the GET body was read to %d bytes", n)
+	if r := sendStalled(t, req); r.code != http.StatusOK || r.body != "hi" {
+		t.Fatalf("signed GET with a body: %d %q, want 200 \"hi\"", r.code, r.body)
 	}
 }
 
@@ -1374,17 +1382,12 @@ func TestSmallConfigurationBodiesAreNotOverRead(t *testing.T) {
 	e := newFixEnv(t)
 	e.admin(t, http.MethodPut, "/buf", "").must(t, "bucket")
 	e.admin(t, http.MethodPut, "/buf/k", "x").must(t, "object")
-	cr := &countingReader{max: maxVerifiedBody}
 	req, _ := http.NewRequest(http.MethodPut, e.ts.URL+"/buf/k?tagging", nil)
 	signV4Request(req, testAccessKey, testSecretKey, []byte("<Tagging/>"))
-	req.Body = io.NopCloser(cr)
-	req.ContentLength = maxVerifiedBody
-	send(t, req)
-	// Counted on the client side, so TCP buffers and the up to 256 KiB that
-	// net/http drains after a handler answers add to the 256 KiB the check
-	// reads. Before the fix the whole 8 MiB was read.
-	if n := cr.n.Load(); n > 2<<20 {
-		t.Fatalf("a ?tagging body was read to %d bytes", n)
+	// Refused once 256 KiB have been read; before the fix the server read on
+	// toward 8 MiB and so never answered this stalled body.
+	if r := sendStalled(t, req); r.code != http.StatusBadRequest || !strings.Contains(r.body, "MaxMessageLengthExceeded") {
+		t.Fatalf("8 MiB ?tagging body: %d %s, want 400 MaxMessageLengthExceeded", r.code, r.body)
 	}
 }
 

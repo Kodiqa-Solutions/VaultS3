@@ -287,17 +287,28 @@ func TestShardWriteToAFollowerNamesTheLeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := fmt.Sprintf(`{"shard":0,"bucket":"b","data":%q}`, base64.StdEncoding.EncodeToString(cmd))
-	req, _ := http.NewRequest(http.MethodPost, follower.api.URL+shardApplyPath, strings.NewReader(body))
-	req.Header.Set(clusterSecretHeader, "shard-secret")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	// A follower learns the leader from its first heartbeat, so right after
+	// the election it may not know it yet and names nobody, which is right.
+	// Ask again until it does: under a loaded test run that took over a
+	// second, and the test failed on the empty name.
+	var got string
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		req, _ := http.NewRequest(http.MethodPost, follower.api.URL+shardApplyPath, strings.NewReader(body))
+		req.Header.Set(clusterSecretHeader, "shard-secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("a write to a shard follower returned %d, want 503", resp.StatusCode)
+		}
+		if got = resp.Header.Get(shardLeaderHeader); got != "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("a write to a shard follower returned %d, want 503", resp.StatusCode)
-	}
-	if got := resp.Header.Get(shardLeaderHeader); got != leader.id {
+	if got != leader.id {
 		t.Fatalf("follower named %q as the shard leader, want %q", got, leader.id)
 	}
 	// And it applied nothing of its own.
