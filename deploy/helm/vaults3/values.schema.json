@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "VaultS3 Helm chart values",
+  "description": "Values for the VaultS3 chart. Unknown keys are allowed, so values files written for earlier chart versions keep installing; the keys below are checked for type and range.",
+  "type": "object",
+  "properties": {
+    "controller": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["StatefulSet", "Deployment"],
+          "description": "StatefulSet gives each pod its own volumes and is required for clustering. Deployment is single-node only and can mount an existing claim."
+        }
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Keep at 1 unless cluster.enabled is true (StatefulSet only). For a fault-tolerant quorum use an odd number of at least 3."
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": {
+          "type": ["string", "number"],
+          "description": "Image tag. Empty uses the chart's appVersion."
+        },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "accessKey": { "type": "string", "minLength": 1, "description": "Admin access key." },
+        "secretKey": {
+          "type": "string",
+          "description": "Admin secret key. Empty generates a random one on install and keeps it across upgrades."
+        },
+        "clusterSecret": {
+          "type": "string",
+          "description": "Secret the cluster nodes authenticate each other with. Empty generates one."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Name of an existing Secret with keys access-key and secret-key (and optionally cluster-secret)."
+        }
+      }
+    },
+    "existingConfigMap": {
+      "type": "string",
+      "description": "Name of an existing ConfigMap with key vaults3.yaml, used instead of config."
+    },
+    "config": {
+      "type": "string",
+      "description": "The vaults3.yaml mounted at /etc/vaults3/vaults3.yaml, as a block string."
+    },
+    "defaultBuckets": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 3, "maxLength": 63 },
+      "description": "Buckets created on startup when missing."
+    },
+    "usageScanIntervalSecs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How often, at most, the server measures its own disk use. 0 switches it off."
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object" }
+      }
+    },
+    "cluster": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Raft clustering (beta). Needs controller.kind StatefulSet." },
+        "raftPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "metadataShards": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Metadata shard count. Fixed once the cluster commits its assignment."
+        },
+        "metadataReplicas": { "type": "integer", "minimum": 1 },
+        "repairIntervalSecs": {
+          "type": "integer",
+          "description": "Replica repair scan interval. 0 takes the server default, negative disables it."
+        }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "host": { "type": "string" },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "path": { "type": "string" },
+                    "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": { "type": "array" }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "data": { "$ref": "#/definitions/volume" },
+        "metadata": { "$ref": "#/definitions/volume" }
+      }
+    },
+    "resources": { "type": "object" },
+    "livenessProbe": { "type": "object" },
+    "readinessProbe": { "type": "object" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "interval": { "type": "string" },
+        "scrapeTimeout": { "type": "string" },
+        "labels": { "type": "object" }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": {
+          "type": ["integer", "string"],
+          "description": "A number of pods, or a percentage such as \"50%\"."
+        }
+      }
+    },
+    "extraEnv": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" }
+  },
+  "definitions": {
+    "volume": {
+      "type": "object",
+      "properties": {
+        "size": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?([EPTGMK]i?|[mk])?$",
+          "description": "A Kubernetes quantity, such as 50Gi."
+        },
+        "existingClaim": {
+          "type": "string",
+          "description": "Mount this existing PVC instead of creating one (Deployment mode)."
+        },
+        "storageClass": {
+          "type": "string",
+          "description": "Empty uses the cluster default; \"-\" disables dynamic provisioning."
+        },
+        "accessModes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"] }
+        }
+      }
+    }
+  }
+}

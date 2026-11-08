@@ -32,6 +32,8 @@ kubectl -n vaults3 port-forward svc/vaults3 9000:9000
 
 ## Key values
 
+The chart ships a `values.schema.json`, so `helm install` and `helm upgrade` refuse a value of the wrong type or out of range (a string for `replicaCount`, an unknown `controller.kind`, an invalid volume size) before anything is deployed. Keys it does not know are allowed, so values files written for earlier chart versions keep working.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `replicaCount` | `1` | Keep at 1 unless using Raft clustering (Beta). |

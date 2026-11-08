@@ -20,7 +20,26 @@ maintainers:
 icon: https://raw.githubusercontent.com/Kodiqa-Solutions/VaultS3/main/assets/logo-dark.svg
 # Shown on Artifact Hub (artifacthub.io). artifacthub.io/images must name the
 # appVersion image: the publish workflow refuses a chart where they differ.
+# artifacthub.io/changes is this chart version's changelog on Artifact Hub:
+# rewrite it at every release (kind: added, changed, deprecated, removed,
+# fixed or security), with the highlights of CHANGELOG.md.
 annotations:
+  artifacthub.io/changes: |
+    - kind: added
+      description: values.schema.json, so helm install and upgrade refuse a mistyped value (a string for a number, an unknown controller kind, an invalid size) before anything is deployed
+    - kind: security
+      description: "VaultS3 5.0.11: a Deny in IAM and bucket policies now covers keys containing *"
+      links:
+        - name: Changelog
+          url: https://github.com/Kodiqa-Solutions/VaultS3/blob/main/CHANGELOG.md
+    - kind: security
+      description: "VaultS3 5.0.11: public buckets no longer expose object tags and older versions, and keys with ./ or // no longer reach another object past object lock and IAM Deny"
+    - kind: added
+      description: "VaultS3 5.0.11: presigned POST (browser form uploads signed with a POST policy)"
+    - kind: fixed
+      description: "VaultS3 5.0.11: active-active replication syncs, and quotas hold on every write path, versioned buckets included"
+    - kind: changed
+      description: "VaultS3 5.0.11: moving objects to the cold tier is paused; RestoreObject brings back objects already there"
   artifacthub.io/license: AGPL-3.0
   artifacthub.io/category: storage
   artifacthub.io/links: |

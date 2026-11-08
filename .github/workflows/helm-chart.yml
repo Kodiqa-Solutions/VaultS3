@@ -46,6 +46,26 @@ jobs:
           fi
           echo "CHART_VERSION=$ver" >> "$GITHUB_ENV"
 
+      # The image is built by CI on the same tag, in parallel with the release,
+      # and can land after this job starts. Artifact Hub scans the chart's image
+      # as soon as the chart appears, and for 5.0.11 it found no image yet and
+      # recorded a failed security scan. Wait for the image (up to 45 minutes),
+      # and stop rather than publish a chart that points at nothing.
+      - name: Wait for the release image on Docker Hub
+        run: |
+          app="${TAG#v}"
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://hub.docker.com/v2/repositories/eniz1806/vaults3/tags/$app")
+            if [ "$code" = "200" ]; then
+              echo "eniz1806/vaults3:$app is published"
+              exit 0
+            fi
+            echo "eniz1806/vaults3:$app not published yet (HTTP $code), attempt $i of 90"
+            sleep 30
+          done
+          echo "eniz1806/vaults3:$app did not appear within 45 minutes, not publishing the chart"
+          exit 1
+
       # The same Helm image CI lints the chart with, so no third-party action
       # handles the registry token. The login lives in a scratch HOME outside
       # the workspace and is removed at the end.
