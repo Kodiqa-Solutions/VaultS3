@@ -1,6 +1,6 @@
 apiVersion: v2
 name: vaults3
-description: Lightweight S3-compatible object storage with a built-in dashboard — the maintained, honest alternative to MinIO.
+description: Lightweight S3-compatible object storage with a built-in dashboard, the maintained and honest alternative to MinIO.
 type: application
 # version  = the chart version (bump on chart changes)
 # appVersion = the VaultS3 image tag this chart defaults to
@@ -18,3 +18,18 @@ maintainers:
   - name: Kodiqa-Solutions
     url: https://github.com/Kodiqa-Solutions
 icon: https://raw.githubusercontent.com/Kodiqa-Solutions/VaultS3/main/assets/logo-dark.svg
+# Shown on Artifact Hub (artifacthub.io). artifacthub.io/images must name the
+# appVersion image: the publish workflow refuses a chart where they differ.
+annotations:
+  artifacthub.io/license: AGPL-3.0
+  artifacthub.io/category: storage
+  artifacthub.io/links: |
+    - name: Website
+      url: https://vaults3.com
+    - name: Documentation
+      url: https://github.com/Kodiqa-Solutions/VaultS3/tree/main/docs
+    - name: Moving from MinIO
+      url: https://vaults3.com/migrate-from-minio
+  artifacthub.io/images: |
+    - name: vaults3
+      image: eniz1806/vaults3:5.0.10

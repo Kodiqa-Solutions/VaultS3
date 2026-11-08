@@ -38,6 +38,12 @@ jobs:
             echo "Chart.yaml appVersion $app does not match the tag $TAG"
             exit 1
           fi
+          # Artifact Hub lists this image as the one the chart runs.
+          if grep -q 'artifacthub.io/images' deploy/helm/vaults3/Chart.yaml &&
+             ! grep -q "image: eniz1806/vaults3:$app\$" deploy/helm/vaults3/Chart.yaml; then
+            echo "Chart.yaml artifacthub.io/images does not name eniz1806/vaults3:$app"
+            exit 1
+          fi
           echo "CHART_VERSION=$ver" >> "$GITHUB_ENV"
 
       # The same Helm image CI lints the chart with, so no third-party action
@@ -56,3 +62,22 @@ jobs:
           echo "$REGISTRY_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
           helm push "out/vaults3-${CHART_VERSION}.tgz" oci://ghcr.io/kodiqa-solutions/charts
           helm registry logout ghcr.io
+
+      # Artifact Hub reads this file from the tag artifacthub.io next to the
+      # chart, and the repository ID in it marks the listing as published by
+      # whoever controls this registry (Verified Publisher). The ID is not a
+      # secret.
+      - name: Publish the Artifact Hub metadata
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          printf 'repositoryID: 4d5e57b9-6abb-408c-a4aa-79d4859e1fdd\n' > out/artifacthub-repo.yml
+          oras() {
+            docker run --rm -i -v "$PWD/out:/w" -w /w -v "$RUNNER_TEMP/helm:/h" -e HOME=/h ghcr.io/oras-project/oras:v1.2.0 "$@"
+          }
+          echo "$REGISTRY_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
+          oras push ghcr.io/kodiqa-solutions/charts/vaults3:artifacthub.io \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+          oras logout ghcr.io
