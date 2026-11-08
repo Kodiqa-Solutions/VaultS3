@@ -78,23 +78,31 @@ jobs:
       # answers nothing. One SBOM per platform, describing exactly the binary
       # that ships in both that platform's tarball and its packages.
       - name: Install syft
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Pinned: the installer from a release tag installing that release,
-          # never whatever the main branch serves on the day of the build.
-          # Retried: GitHub answered 504 for the release's checksums file for
-          # over half an hour while serving its other assets, and that failed
-          # the whole release (5.0.9). The installer still verifies the
-          # download against the checksums, so a retry changes nothing else.
-          set -o pipefail
+          # Pinned version, and the tarball is checked against a SHA-256 pinned
+          # here (it matches syft's own checksums file), so nothing fetched at
+          # build time decides what runs. Downloaded through the API with gh:
+          # on 2026-11-08 every github.com/.../releases/download URL answered
+          # 504 for hours while the API served the same assets, which failed
+          # the 5.0.9 release three times through syft's install script.
+          # Every job runs on ubuntu-latest, so the linux amd64 build is the one.
+          V=1.54.1
+          SHA256=c069905b391cc4c20a5ba65ad5c10be2a7ba074f8ea6ad203e24d14e303dad47
+          dir=$(mktemp -d)
           for attempt in 1 2 3 4 5; do
-            if curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.54.1/install.sh \
-              | sh -s -- -b /usr/local/bin v1.54.1; then
+            if gh release download "v$V" --repo anchore/syft --dir "$dir" --clobber \
+              --pattern "syft_${V}_linux_amd64.tar.gz"; then
               break
             fi
-            echo "syft install failed (attempt $attempt of 5)"
+            echo "syft download failed (attempt $attempt of 5)"
             if [ "$attempt" = 5 ]; then exit 1; fi
             sleep 20
           done
+          echo "$SHA256  $dir/syft_${V}_linux_amd64.tar.gz" | sha256sum --check
+          tar -xzf "$dir/syft_${V}_linux_amd64.tar.gz" -C "$dir" syft
+          install -m 0755 "$dir/syft" /usr/local/bin/syft
           syft version
 
       - name: Generate the SBOM for this binary
