@@ -307,3 +307,13 @@ jobs:
             **Supported platforms:** Linux (amd64, arm64), macOS (amd64, arm64), Windows (amd64)
 
             ---
+
+  # Publishes the Helm chart to GitHub Container Registry once the release is
+  # out. The steps live in helm-chart.yml so a chart can also be published for
+  # an existing tag by hand.
+  helm-chart:
+    needs: [publish]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/helm-chart.yml

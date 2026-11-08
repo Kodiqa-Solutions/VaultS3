@@ -1,0 +1,58 @@
+name: Helm chart
+
+# Publishes the Helm chart as an OCI artifact on GitHub Container Registry,
+# so it installs with one command instead of cloning the repository:
+#   helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3
+# Called by the release workflow after a release is published, or run by hand
+# with a tag to publish the chart of an existing release.
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag whose chart to publish, e.g. v5.0.10'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # A chart whose appVersion is not this release would install an older
+      # (or missing) image, so a mismatch stops the publish.
+      - name: Check the chart matches the release
+        run: |
+          app=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' deploy/helm/vaults3/Chart.yaml)
+          ver=$(sed -n 's/^version: *//p' deploy/helm/vaults3/Chart.yaml)
+          echo "chart $ver, appVersion $app, tag $TAG"
+          if [ "v$app" != "$TAG" ]; then
+            echo "Chart.yaml appVersion $app does not match the tag $TAG"
+            exit 1
+          fi
+          echo "CHART_VERSION=$ver" >> "$GITHUB_ENV"
+
+      # The same Helm image CI lints the chart with, so no third-party action
+      # handles the registry token. The login lives in a scratch HOME outside
+      # the workspace and is removed at the end.
+      - name: Package and push the chart
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/helm" out
+          helm() {
+            docker run --rm -i -v "$PWD:/w" -w /w -v "$RUNNER_TEMP/helm:/h" -e HOME=/h alpine/helm:4.3.0 "$@"
+          }
+          helm package deploy/helm/vaults3 --destination out
+          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
+          helm push "out/vaults3-${CHART_VERSION}.tgz" oci://ghcr.io/kodiqa-solutions/charts
+          helm registry logout ghcr.io
