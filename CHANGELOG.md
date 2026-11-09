@@ -5,6 +5,8 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+
+## [5.0.13] - 2026-11-09
 ### Added
 - **`PUID` and `PGID`, for NAS containers (Unraid, Synology, TrueNAS).**
   Docker creates a host folder that does not exist yet owned by root, and the
@@ -3998,7 +4000,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.12...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.13...HEAD
+[5.0.13]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.12...v5.0.13
 [5.0.12]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.11...v5.0.12
 [5.0.11]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.10...v5.0.11
 [5.0.10]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.9...v5.0.10
