@@ -80,7 +80,20 @@ jobs:
           }
           helm package deploy/helm/vaults3 --destination out
           echo "$REGISTRY_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
-          helm push "out/vaults3-${CHART_VERSION}.tgz" oci://ghcr.io/kodiqa-solutions/charts
+          # GHCR sometimes answers a push it has just accepted with "not
+          # found" (5.0.13: failed to perform "Tag" on destination), which a
+          # second try gets through. Pushing the same chart again is harmless.
+          for attempt in 1 2 3 4 5; do
+            if helm push "out/vaults3-${CHART_VERSION}.tgz" oci://ghcr.io/kodiqa-solutions/charts; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "chart push failed 5 times"
+              exit 1
+            fi
+            echo "chart push failed, attempt $attempt of 5, retrying in 20s"
+            sleep 20
+          done
           helm registry logout ghcr.io
 
       # Artifact Hub reads this file from the tag artifacthub.io next to the
@@ -97,7 +110,18 @@ jobs:
             docker run --rm -i -v "$PWD/out:/w" -w /w -v "$RUNNER_TEMP/helm:/h" -e HOME=/h ghcr.io/oras-project/oras:v1.2.0 "$@"
           }
           echo "$REGISTRY_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
-          oras push ghcr.io/kodiqa-solutions/charts/vaults3:artifacthub.io \
-            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
-            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+          # Retried like the chart push above, for the same GHCR glitch.
+          for attempt in 1 2 3 4 5; do
+            if oras push ghcr.io/kodiqa-solutions/charts/vaults3:artifacthub.io \
+                --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+                artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "Artifact Hub metadata push failed 5 times"
+              exit 1
+            fi
+            echo "metadata push failed, attempt $attempt of 5, retrying in 20s"
+            sleep 20
+          done
           oras logout ghcr.io
