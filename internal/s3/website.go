@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/middleware"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
@@ -19,6 +21,7 @@ func (h *Handler) serveWebsite(w http.ResponseWriter, r *http.Request, bucket, k
 		writeS3Error(w, "NoSuchWebsiteConfiguration", "No website configuration", http.StatusNotFound)
 		return
 	}
+	w.Header().Set("Content-Security-Policy", middleware.WebsiteSandboxCSP)
 
 	// Resolve index document for root or directory paths
 	resolvedKey := key
@@ -33,6 +36,11 @@ func (h *Handler) serveWebsite(w http.ResponseWriter, r *http.Request, bucket, k
 	}
 	if status == http.StatusForbidden {
 		http.Error(w, "403 Forbidden", http.StatusForbidden)
+		return
+	}
+	if status == statusMetadataUnavailable {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if status != http.StatusOK {
@@ -78,7 +86,10 @@ func (h *Handler) serveErrorDocument(w http.ResponseWriter, bucket, errorDoc str
 // under .vs/, so every page was a 404), and handed out an SSE-C object's stored
 // ciphertext as if it were the page.
 func (h *Handler) openWebsiteObject(bucket, key string) (*metadata.ObjectMeta, storage.ReadSeekCloser, int64, int) {
-	meta, _ := h.store.GetObjectMetaConsistent(bucket, key)
+	meta, err := h.store.GetObjectMetaConsistent(bucket, key)
+	if meta == nil && errors.Is(err, metadata.ErrShardUnavailable) {
+		return nil, nil, 0, statusMetadataUnavailable
+	}
 	if meta == nil || meta.DeleteMarker {
 		return nil, nil, 0, http.StatusNotFound
 	}
@@ -105,3 +116,8 @@ func websiteContentType(meta *metadata.ObjectMeta, key, fallback string) string 
 	}
 	return fallback
 }
+
+// statusMetadataUnavailable is openWebsiteObject's answer when this node
+// cannot tell whether the page exists (it could not catch up with the
+// cluster leader): the visitor is asked to retry, not shown a 404.
+const statusMetadataUnavailable = 599

@@ -4,6 +4,8 @@ import (
 	"crypto/hmac"
 	"net"
 	"net/http"
+
+	"github.com/Kodiqa-Solutions/VaultS3/internal/middleware"
 )
 
 // ClientIPHeader carries the address of the client a forwarded request came
@@ -21,6 +23,11 @@ import (
 // secret, so a client cannot choose its own address by sending it.
 const ClientIPHeader = "X-VaultS3-Client-IP"
 
+// ClientTLSHeader carries whether the client's connection to the forwarding
+// node was TLS ("1" or "0"), for aws:SecureTransport. Believed under the same
+// proof as ClientIPHeader.
+const ClientTLSHeader = "X-VaultS3-Client-TLS"
+
 // markForwardedClient stamps an outbound forwarded request with the address
 // the inbound one came from and the cluster secret that makes the receiving
 // node trust it. out.RemoteAddr is the inbound peer: on a request that already
@@ -28,10 +35,19 @@ const ClientIPHeader = "X-VaultS3-Client-IP"
 // client, so a second hop passes the same client along.
 func markForwardedClient(out *http.Request, secret string) {
 	out.Header.Del(ClientIPHeader)
+	out.Header.Del(ClientTLSHeader)
 	out.Header.Del(clusterSecretHeader)
 	if secret == "" {
 		return
 	}
+	// Whether the client's connection was TLS: the receiving node sees only
+	// the hop between the nodes. It is the same request object, so a second
+	// hop passes on what the first recorded.
+	tls := "0"
+	if middleware.SecureTransport(out) {
+		tls = "1"
+	}
+	out.Header.Set(ClientTLSHeader, tls)
 	ip := hostOnly(out.RemoteAddr)
 	if net.ParseIP(ip) == nil {
 		return
@@ -48,13 +64,18 @@ func markForwardedClient(out *http.Request, secret string) {
 func TrustForwardedClient(secret string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		claimed := r.Header.Get(ClientIPHeader)
+		claimedTLS := r.Header.Get(ClientTLSHeader)
 		proof := r.Header.Get(clusterSecretHeader)
-		if claimed != "" || proof != "" {
+		if claimed != "" || claimedTLS != "" || proof != "" {
 			r.Header.Del(ClientIPHeader)
+			r.Header.Del(ClientTLSHeader)
 			r.Header.Del(clusterSecretHeader)
 			if secret != "" && proof != "" && hmac.Equal([]byte(proof), []byte(secret)) {
 				if ip := net.ParseIP(claimed); ip != nil {
 					r.RemoteAddr = net.JoinHostPort(ip.String(), "0")
+				}
+				if claimedTLS != "" {
+					r = middleware.WithForwardedTLS(r, claimedTLS == "1")
 				}
 			}
 		}

@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
@@ -8,6 +9,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -15,11 +17,79 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/parquet-go/parquet-go"
 )
 
 const maxSelectSize int64 = 256 * 1024 * 1024
+
+// S3 Select holds a request's records in memory, a map per row, at about
+// sixty times their size in the file. Only the stored size was limited, so a
+// 400 KB gzip of a 400 MB CSV took 2 GB of memory in one request, and a few at
+// once took the server down. These bound one request, and how many run at
+// once.
+var (
+	// maxSelectInput is the most input one request reads, after
+	// decompression.
+	maxSelectInput int64 = 64 << 20
+	// maxSelectCells is the most fields (rows times columns) one request
+	// holds.
+	maxSelectCells = 4_000_000
+	// maxSelectValueBytes is the most bytes of field values one request
+	// holds. The input limit alone did not bound it: a Parquet column whose
+	// dictionary repeats one large value, or a JSON record of a nested array,
+	// decodes to far more than its size in the file.
+	maxSelectValueBytes = 128 << 20
+	// maxSelectRecordBytes is the largest record, as on AWS (1 MiB).
+	maxSelectRecordBytes = 1 << 20
+	// selectSlots bounds the requests running at once.
+	selectSlots = make(chan struct{}, 2)
+	// selectWriteTimeout bounds sending the answer, which holds a slot, so a
+	// client that reads slowly cannot keep it.
+	selectWriteTimeout = 2 * time.Minute
+)
+
+var errSelectTooLarge = fmt.Errorf("input exceeds the S3 Select limit of %d MiB uncompressed, %d fields, %d MiB of values, or a record of %d MiB",
+	maxSelectInput>>20, maxSelectCells, maxSelectValueBytes>>20, maxSelectRecordBytes>>20)
+
+// selectBudget counts what one request holds.
+type selectBudget struct{ cells, bytes int }
+
+// record adds one record of n fields and size bytes (its values once
+// formatted).
+func (b *selectBudget) record(n, size int) error {
+	b.cells += n
+	b.bytes += size
+	if size > maxSelectRecordBytes || b.cells > maxSelectCells || b.bytes > maxSelectValueBytes {
+		return errSelectTooLarge
+	}
+	return nil
+}
+
+// selectLimit reads at most n bytes and fails past them, instead of
+// ending quietly as io.LimitReader does (which would answer on part of the
+// data as if it were all of it).
+type selectLimit struct {
+	r io.Reader
+	n int64
+}
+
+func (l *selectLimit) Read(p []byte) (int, error) {
+	if l.n <= 0 {
+		var one [1]byte
+		if k, _ := l.r.Read(one[:]); k > 0 {
+			return 0, errSelectTooLarge
+		}
+		return 0, io.EOF
+	}
+	if int64(len(p)) > l.n {
+		p = p[:l.n]
+	}
+	k, err := l.r.Read(p)
+	l.n -= int64(k)
+	return k, err
+}
 
 // SelectObjectContent handles POST /{bucket}/{key}?select&select-type=2.
 func (h *ObjectHandler) SelectObjectContent(w http.ResponseWriter, r *http.Request, bucket, key string) {
@@ -93,6 +163,15 @@ func (h *ObjectHandler) SelectObjectContent(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	select {
+	case selectSlots <- struct{}{}:
+		defer func() { <-selectSlots }()
+	default:
+		writeS3Error(w, "SlowDown", "Too many S3 Select requests at once, please retry", http.StatusServiceUnavailable)
+		return
+	}
+	dataReader = &selectLimit{r: dataReader, n: maxSelectInput}
+
 	// Determine input format
 	var records []map[string]string
 	if req.InputSerialization.CSV != nil {
@@ -103,6 +182,10 @@ func (h *ObjectHandler) SelectObjectContent(w http.ResponseWriter, r *http.Reque
 		records, err = parseParquetInput(dataReader)
 	} else {
 		writeS3Error(w, "InvalidArgument", "InputSerialization must specify CSV, JSON, or Parquet", http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, errSelectTooLarge) {
+		writeS3Error(w, "OverMaxRecordSize", err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err != nil {
@@ -154,6 +237,7 @@ func (h *ObjectHandler) SelectObjectContent(w http.ResponseWriter, r *http.Reque
 		scanned = meta.Size
 	}
 	out := payload.Bytes()
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(selectWriteTimeout))
 	w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 	w.WriteHeader(http.StatusOK)
 	writeEventMessage(w, "Records", "application/octet-stream", out)
@@ -480,16 +564,41 @@ func tokenize(expr string) []string {
 // Input parsers
 
 func parseCSVInput(reader io.Reader, cfg *csvInput) ([]map[string]string, error) {
-	cr := csv.NewReader(reader)
+	// csv.Reader builds a whole record before it is counted, so one record
+	// of 64 MiB of commas made 64 million fields (10 GiB). The input of one
+	// record is bounded instead, with room for the reader's read-ahead.
+	window := &recordWindow{r: reader, max: int64(maxSelectRecordBytes) + 64<<10}
+	cr := csv.NewReader(window)
 	if cfg.FieldDelimiter != "" {
 		cr.Comma = rune(cfg.FieldDelimiter[0])
 	}
 	cr.LazyQuotes = true
 	cr.FieldsPerRecord = -1
+	cr.ReuseRecord = false
 
-	allRows, err := cr.ReadAll()
-	if err != nil {
-		return nil, err
+	// Row by row, counting fields: ReadAll held the whole file as rows.
+	var allRows [][]string
+	var budget selectBudget
+	for {
+		row, err := cr.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if errors.Is(err, errSelectTooLarge) {
+				return nil, errSelectTooLarge
+			}
+			return nil, err
+		}
+		window.n = 0
+		size := 0
+		for _, v := range row {
+			size += len(v)
+		}
+		if err := budget.record(len(row), size); err != nil {
+			return nil, err
+		}
+		allRows = append(allRows, row)
 	}
 	if len(allRows) == 0 {
 		return nil, nil
@@ -538,65 +647,213 @@ func parseCSVInput(reader io.Reader, cfg *csvInput) ([]map[string]string, error)
 const maxSelectRecords = 1_000_000
 
 func parseJSONInput(reader io.Reader, cfg *jsonInput) ([]map[string]string, error) {
-	// Limit read to maxSelectSize (256MB) to prevent OOM
-	data, err := io.ReadAll(io.LimitReader(reader, maxSelectSize+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maxSelectSize {
-		return nil, fmt.Errorf("JSON input exceeds maximum size")
-	}
-
 	jsonType := strings.ToUpper(cfg.Type)
 	if jsonType == "" {
 		jsonType = "LINES"
 	}
-
-	var rawRecords []map[string]interface{}
+	var budget selectBudget
+	var records []map[string]string
+	// Each record is checked against the record size limit before it is
+	// decoded: a nested array decodes to many times its size in the file.
+	add := func(raw []byte) error {
+		if len(raw) > maxSelectRecordBytes {
+			return errSelectTooLarge
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return fmt.Errorf("cannot parse JSON record: %v", err)
+		}
+		rec := make(map[string]string, len(obj))
+		size := 0
+		for k, v := range obj {
+			s := fmt.Sprintf("%v", v)
+			size += len(k) + len(s)
+			rec[k] = s
+		}
+		if err := budget.record(len(rec), size); err != nil {
+			return err
+		}
+		if len(records) >= maxSelectRecords {
+			return fmt.Errorf("too many records (max %d)", maxSelectRecords)
+		}
+		records = append(records, rec)
+		return nil
+	}
 
 	switch jsonType {
 	case "DOCUMENT":
-		// Use json.Decoder with depth check via limited-size data
-		if err := json.Unmarshal(data, &rawRecords); err != nil {
-			// Try single object
-			var single map[string]interface{}
-			if err2 := json.Unmarshal(data, &single); err2 != nil {
-				return nil, fmt.Errorf("cannot parse JSON document: %v", err)
+		// An array of records, or records one after the other. Split
+		// while reading, so a record past the limit is refused before it
+		// is held whole.
+		br := bufio.NewReader(reader)
+		for {
+			c, err := skipJSONSpace(br)
+			if err == io.EOF {
+				break
 			}
-			rawRecords = []map[string]interface{}{single}
-		}
-		if len(rawRecords) > maxSelectRecords {
-			return nil, fmt.Errorf("too many records (max %d)", maxSelectRecords)
-		}
-	default: // LINES
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		if len(lines) > maxSelectRecords {
-			return nil, fmt.Errorf("too many lines (max %d)", maxSelectRecords)
-		}
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
+			if err != nil {
+				return nil, err
+			}
+			if c != '[' {
+				_ = br.UnreadByte()
+				val, err := readJSONValue(br)
+				if err != nil {
+					return nil, err
+				}
+				if err := add(val); err != nil {
+					return nil, err
+				}
 				continue
 			}
-			var rec map[string]interface{}
-			if err := json.Unmarshal([]byte(line), &rec); err != nil {
-				return nil, fmt.Errorf("cannot parse JSON line: %v", err)
+			for first := true; ; first = false {
+				c, err := skipJSONSpace(br)
+				if err != nil {
+					return nil, jsonDocError(err)
+				}
+				if c == ']' {
+					break
+				}
+				if !first {
+					if c != ',' {
+						return nil, fmt.Errorf("cannot parse JSON document: unexpected %q", c)
+					}
+				} else {
+					_ = br.UnreadByte()
+				}
+				val, err := readJSONValue(br)
+				if err != nil {
+					return nil, err
+				}
+				if err := add(val); err != nil {
+					return nil, err
+				}
 			}
-			rawRecords = append(rawRecords, rec)
+		}
+	default: // LINES
+		br := bufio.NewReader(reader)
+		for {
+			line, err := readSelectLine(br)
+			if len(bytes.TrimSpace(line)) > 0 {
+				if aerr := add(bytes.TrimSpace(line)); aerr != nil {
+					return nil, aerr
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-
-	// Convert to map[string]string
-	var records []map[string]string
-	for _, raw := range rawRecords {
-		rec := make(map[string]string)
-		for k, v := range raw {
-			rec[k] = fmt.Sprintf("%v", v)
-		}
-		records = append(records, rec)
-	}
-
 	return records, nil
+}
+
+func jsonDocError(err error) error {
+	if err == io.EOF {
+		return fmt.Errorf("cannot parse JSON document: unexpected end")
+	}
+	return err
+}
+
+// skipJSONSpace returns the next byte that is not white space.
+func skipJSONSpace(br *bufio.Reader) (byte, error) {
+	for {
+		c, err := br.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			return c, nil
+		}
+	}
+}
+
+// readJSONValue reads one JSON value (its syntax is checked when it is
+// decoded), failing once it passes the record limit.
+func readJSONValue(br *bufio.Reader) ([]byte, error) {
+	c, err := skipJSONSpace(br)
+	if err != nil {
+		return nil, jsonDocError(err)
+	}
+	val := []byte{c}
+	grow := func(b byte) error {
+		val = append(val, b)
+		if len(val) > maxSelectRecordBytes {
+			return errSelectTooLarge
+		}
+		return nil
+	}
+	switch c {
+	case '{', '[', '"':
+		depth, inStr, esc := 1, c == '"', false
+		if inStr {
+			depth = 0
+		}
+		for {
+			b, err := br.ReadByte()
+			if err != nil {
+				return nil, jsonDocError(err)
+			}
+			if err := grow(b); err != nil {
+				return nil, err
+			}
+			switch {
+			case inStr && esc:
+				esc = false
+			case inStr && b == '\\':
+				esc = true
+			case inStr && b == '"':
+				inStr = false
+				if depth == 0 {
+					return val, nil
+				}
+			case inStr:
+			case b == '"':
+				inStr = true
+			case b == '{' || b == '[':
+				depth++
+			case b == '}' || b == ']':
+				if depth--; depth == 0 {
+					return val, nil
+				}
+			}
+		}
+	default:
+		for {
+			b, err := br.ReadByte()
+			if err == io.EOF {
+				return val, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			if b == ',' || b == ']' || b == '}' || b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+				_ = br.UnreadByte()
+				return val, nil
+			}
+			if err := grow(b); err != nil {
+				return nil, err
+			}
+		}
+	}
+}
+
+// readSelectLine reads one line, failing once it passes the record limit
+// instead of holding all of it.
+func readSelectLine(br *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		line = append(line, chunk...)
+		if len(line) > maxSelectRecordBytes+1 {
+			return nil, errSelectTooLarge
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return line, err
+	}
 }
 
 // Query execution
@@ -781,13 +1038,16 @@ func parseParquetInput(reader io.Reader) ([]map[string]string, error) {
 	}
 
 	var records []map[string]string
+	var budget selectBudget
 	for _, rg := range file.RowGroups() {
 		rows := rg.NumRows()
 		if int64(len(records))+rows > int64(maxSelectRecords) {
 			return nil, fmt.Errorf("too many records (max %d)", maxSelectRecords)
 		}
 
-		rowBuf := make([]parquet.Row, 256)
+		// Few rows at a time: a row is decoded whole, and one value can be
+		// large.
+		rowBuf := make([]parquet.Row, 8)
 		rowReader := rg.Rows()
 		defer rowReader.Close()
 
@@ -795,11 +1055,17 @@ func parseParquetInput(reader io.Reader) ([]map[string]string, error) {
 			n, err := rowReader.ReadRows(rowBuf)
 			for i := 0; i < n; i++ {
 				rec := make(map[string]string, len(colNames))
+				size := 0
 				for _, v := range rowBuf[i] {
 					col := v.Column()
 					if col >= 0 && col < len(colNames) {
-						rec[colNames[col]] = fmt.Sprintf("%v", v)
+						s := fmt.Sprintf("%v", v)
+						size += len(s)
+						rec[colNames[col]] = s
 					}
+				}
+				if err := budget.record(len(colNames), size); err != nil {
+					return nil, err
 				}
 				records = append(records, rec)
 			}
@@ -810,4 +1076,20 @@ func parseParquetInput(reader io.Reader) ([]map[string]string, error) {
 	}
 
 	return records, nil
+}
+
+// recordWindow fails a read once more than max bytes have been read since
+// the caller last reset n, that is within one record.
+type recordWindow struct {
+	r      io.Reader
+	n, max int64
+}
+
+func (w *recordWindow) Read(p []byte) (int, error) {
+	if w.n > w.max {
+		return 0, errSelectTooLarge
+	}
+	k, err := w.r.Read(p)
+	w.n += int64(k)
+	return k, err
 }

@@ -111,6 +111,16 @@ func takeFile(p string, uid, gid int) error {
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	// A log path in a system folder (logging.file_path pointed at the
+	// server's binary, or /etc/shadow) would give that file away, as a
+	// folder setting would. Links in its folders are resolved first.
+	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return err
+	}
+	if sys := systemPath(filepath.Join(dir, filepath.Base(abs))); sys != "" {
+		return fmt.Errorf("the access log %s is in %s, a system folder; refusing to give it away", p, sys)
+	}
 	f, err := openLogNoFollow(abs)
 	if err != nil {
 		return err
@@ -131,4 +141,12 @@ func takeFile(p string, uid, gid int) error {
 // it if missing, never follows a link at it, and does not block on a FIFO.
 func openLogNoFollow(p string) (*os.File, error) {
 	return os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o640)
+}
+
+// linkCount is how many names a file has.
+func linkCount(fi os.FileInfo) uint64 {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Nlink)
+	}
+	return 1
 }

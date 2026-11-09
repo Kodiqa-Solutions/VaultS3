@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/versioning"
+
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 func (h *APIHandler) handleListVersions(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +118,10 @@ func (h *APIHandler) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bucket, key, versionId, and tag are required")
 		return
 	}
+	if storage.VersionIDProblem(req.VersionID) != "" {
+		writeError(w, http.StatusBadRequest, "invalid versionId")
+		return
+	}
 	if err := validateObjectKey(req.Key); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -171,6 +177,10 @@ func (h *APIHandler) handleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Bucket == "" || req.Key == "" || req.VersionID == "" {
 		writeError(w, http.StatusBadRequest, "bucket, key, and versionId are required")
+		return
+	}
+	if storage.VersionIDProblem(req.VersionID) != "" {
+		writeError(w, http.StatusBadRequest, "invalid versionId")
 		return
 	}
 	if err := validateObjectKey(req.Key); err != nil {

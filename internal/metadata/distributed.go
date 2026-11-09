@@ -70,6 +70,21 @@ func (d *DistributedStore) BucketExists(name string) bool {
 // spuriously 404 (issue #37). The WRITE path uses plain GetObjectMeta and stays
 // fast; a genuine miss returns not-found after the wait.
 func (d *DistributedStore) GetObjectMetaConsistent(bucket, key string) (*ObjectMeta, error) {
+	// Catch up with the leader first. Waiting only on a miss served an
+	// object written over on another node as it was before, old bytes and
+	// old ETag both, until this node applied the write: a GET straight after
+	// an acknowledged overwrite read the previous object.
+	if b, ok := d.raft.(readBarrier); ok && !d.raft.IsLeader() {
+		// A node that cannot catch up (it does not know the leader yet,
+		// just after a restart, or is cut off from it) answers that it
+		// cannot tell. It used to read its own copy, and a node restarted
+		// during a soak test answered objects written while it was down as
+		// missing, or as the object they replaced.
+		if err := b.ReadBarrier(ReadYourWritesTimeout); err != nil {
+			slog.Debug("metadata: read barrier failed", "error", err)
+			return nil, fmt.Errorf("%w: this node could not catch up with the cluster leader: %v", ErrShardUnavailable, err)
+		}
+	}
 	if meta, err := d.Store.GetObjectMeta(bucket, key); meta != nil {
 		return meta, err
 	}

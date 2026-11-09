@@ -30,7 +30,8 @@ server:
   # a request arriving from one of these has its client address taken from that
   # header, for rate limits, IP rules and aws:SourceIp conditions. Empty means
   # the TCP peer is the client, so behind nginx every client shares the proxy's
-  # address. (env: VAULTS3_TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8)
+  # address. Their X-Forwarded-Proto also decides aws:SecureTransport (TLS ended
+  # at the proxy). (env: VAULTS3_TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8)
   trusted_proxies: []
   internode_address: ""    # separate bind address for inter-node traffic (empty = disabled)
   internode_port: 0        # separate port for inter-node traffic (0 = disabled)
@@ -336,7 +337,7 @@ vector:
   auto_index: true             # embed text objects automatically on upload
   index_prefixes: []           # if set, only auto-index keys under these prefixes
   max_object_bytes: 1048576    # skip auto-indexing objects larger than this (1MB)
-  persist_path: "./data/vectors.gob"  # survive restarts (embeddings are costly)
+  persist_path: ""             # empty: vectors.gob in metadata_dir (kept across restarts; embeddings are costly)
   timeout_secs: 30
 
 # Auto-update (optional). Checks GitHub Releases daily and shows a dashboard

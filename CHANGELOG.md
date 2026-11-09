@@ -6,6 +6,114 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.14] - 2026-11-09
+### Security
+Found by an internal security review of 5.0.13 (authorization, data paths and
+an attack from outside on a running server).
+- **An object grant no longer reaches the bucket.** `arn:aws:s3:::bucket/*`
+  also matched the bucket itself, so a user allowed only object actions there
+  (`s3:Put*`, `s3:Get*`, `s3:Delete*`, or `s3:*`) could change the bucket's
+  policy (and make it public), its quota, versioning, lifecycle (expiring
+  everything), encryption and replication, and delete it when empty. Every
+  version since 1.0.0 is affected. A policy that relied on it needs
+  `arn:aws:s3:::bucket` added (see UPGRADING).
+- **A version ID cannot name another key's version.** A `versionId` with a
+  `/` named a version file of another key, so `DELETE /b/doc?versionId=secret/<id>`
+  destroyed version `<id>` of `doc/secret`, past COMPLIANCE retention and
+  legal hold, and past the caller's own policy, which allowed only `doc`.
+  Version IDs are now checked everywhere one is accepted.
+- **Object lock headers on an upload take the lock permission.** With only
+  `s3:PutObject`, a caller could lock what it wrote in COMPLIANCE mode until
+  the year 9999, so nobody, the admin included, could ever delete it or the
+  bucket. `x-amz-object-lock-*` headers now need `s3:PutObjectRetention` or
+  `s3:PutObjectLegalHold`, and a valid mode and a future date.
+- **Objects are served sandboxed.** They are served from the dashboard's own
+  origin, so an HTML object a user uploaded ran as the dashboard, and a link
+  to it opened by the admin handed over the admin's session. An S3 response
+  a browser could run as a page (HTML, SVG, XML, script, or an unknown type)
+  now carries `Content-Security-Policy: sandbox`; images, video, PDFs and
+  plain text are shown as before. A website bucket's pages keep their
+  scripts, in an origin of their own.
+- **S3 Select is bounded.** Only the stored size was limited, so a 400 KB
+  gzip of a 400 MB CSV took 2 GB of memory in one request. Input is limited to
+  64 MiB after decompression, 4 million fields and 128 MiB of values, a
+  record to 1 MiB (as on AWS), two requests at a time, and a client that
+  stops reading the answer loses its slot after two minutes.
+- **Shredding a bucket's keys from the dashboard is the admin's alone**, and
+  refused while any object or version is under retention or legal hold. Every
+  bucket setting in the dashboard took `s3:PutBucketPolicy`, so a user allowed
+  to change any setting could crypto-shred the bucket; the settings now take
+  the actions their S3 operations take, and snapshot changes are the admin's.
+- **A bucket policy's Deny applies to signed requests.** It was read only for
+  anonymous requests, so a Deny on deletes, without TLS or outside an address
+  range did nothing for any user with a key. Conditions are evaluated as on
+  AWS (a key the request lacks makes `StringEquals` false and
+  `StringNotEquals` true; `...IfExists` and `Null` are supported), and
+  `NotPrincipal`, `NotAction` and `NotResource` are honoured. Behind a
+  reverse proxy listed in `trusted_proxies`, its `X-Forwarded-Proto: https`
+  makes `aws:SecureTransport` true, and on a cluster a forwarded request
+  keeps the client's own connection's answer. Bucket policies are read as
+  AWS writes them (a bare `true`/`false` or number as a value, a single
+  `Statement` object, condition keys in any case); one that cannot be read
+  is refused with `MalformedPolicy` instead of being stored with none of its
+  Denies applying.
+- **Policy variables are substituted.** `${aws:username}` was compared as
+  literal text, so a Deny written with it never applied, and a home-folder
+  Allow granted the literal `${aws:username}` folder to every user holding it.
+- **Failed signatures are slowed down**, per access key and client address
+  (an IPv6 /64): past 20 failures in a row, each further failure is answered
+  after one second, so a weak secret cannot be guessed through S3 signatures
+  at full speed. A correct signature is never refused or delayed, so nobody
+  can lock a key out.
+- **Behind a proxy that adds its own X-Forwarded-For line**, the client can
+  no longer choose its address (`trusted_proxies`).
+- **A compressed dashboard response no longer holds memory for a client that
+  stopped reading**, and request headers are limited to 256 KB.
+- **With per-bucket encryption, a file that merely looks compressed is served
+  as stored**: one was decompressed (other bytes than were stored) with a
+  legacy key configured, or decoded in full on every read.
+- **Under PUID/PGID, the start no longer gives away hard-linked files or
+  system folders** (a `cold_data_dir` pointed at `/usr/local/bin`), or a
+  folder holding one (`/var`), or a shared one such as `/opt` or `/home`.
+
+### Fixed
+- **On a cluster, an overwrite is no longer lost to the copy of the object it
+  replaced.** Each write sends copies to the other replicas in the
+  background, in no order, and a node stored whatever copy arrived last. A
+  10 MiB multipart upload through one node followed by a small overwrite
+  through another left the old 10 MiB on the nodes (30 of 36 overwrites on
+  three nodes, still wrong 90 seconds later), and reads answered `SlowDown`
+  for good. A copy now names the object it is, and a node stores it only
+  while its metadata names that object; a client write and an arriving copy
+  of the same key take turns. A read whose holder is behind tries the other
+  holders. Every version since replicas were added is affected.
+- **On a cluster, a read straight after an overwrite through another node
+  returns the new object.** A node that had not yet applied the write served
+  the previous object, old bytes and old ETag (46 of 400 such reads on three
+  nodes). A read now catches up with the leader first; concurrent reads share
+  questions to it, a few per round trip however many are waiting. A node
+  that cannot reach the leader (just restarted, or cut off) answers 503,
+  which SDKs retry, instead of reading its own copy: restarted nodes served
+  objects written while they were down as missing or as their previous
+  version.
+- **A key longer than S3 allows**, or with a segment longer than a file name,
+  is refused with `KeyTooLongError` on upload instead of a 500. Objects
+  already stored under such a key (possible with small-file packing) can
+  still be read and deleted.
+- **The vector index is kept in the metadata directory by default**; the
+  sample config put it in the data directory, where a bucket of the same name
+  kept it from being saved.
+
+### Known issues
+Found by the cluster soak test, older than this release, planned for 5.0.15:
+- On a cluster, objects in a bucket with versioning are stored on the node
+  that wrote them only, whatever the replica count, and replica repair logs
+  "no surviving copy" for each of them.
+- A node that was down while an object was overwritten can keep the previous
+  bytes when the new object has the same size and is not checked against its
+  ETag (written more than a minute earlier, multipart, or over 64 MiB), and
+  serve them. Replica repair fills in missing copies only, not wrong ones.
+
 ## [5.0.13] - 2026-11-09
 ### Added
 - **`PUID` and `PGID`, for NAS containers (Unraid, Synology, TrueNAS).**
@@ -4000,7 +4108,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.13...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.14...HEAD
+[5.0.14]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.13...v5.0.14
 [5.0.13]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.12...v5.0.13
 [5.0.12]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.11...v5.0.12
 [5.0.11]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.10...v5.0.11

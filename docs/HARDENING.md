@@ -50,7 +50,11 @@ VaultS3 is designed with security in mind:
 - **LIKE pattern O(n*m) matching**, Iterative DP algorithm replaces recursive backtracking, preventing ReDoS
 - **Tiering safety**: an object moved to the cold tier is still read from there (5.0.12). A move removes the hot file only if it is still the one copied, so a PUT that lands during the move keeps its data. A restore puts the data back only where no hot file exists, never over data a PUT wrote meanwhile, and drops the stale cold copy
 - **Lambda output key validation**: Output key template expansion validated against path traversal
-- **S3 Select record cap**: JSON/CSV parsing capped at 1M records to prevent memory exhaustion
+- **S3 Select limits**: at most 64 MiB of input after decompression, 4 million fields, 128 MiB of values, 1 MiB per record and two requests at a time, so a small compressed object cannot expand into gigabytes of memory
+- **User content is sandboxed**: an S3 response a browser could run as a page (HTML, SVG, XML, script, unknown types) carries `Content-Security-Policy: sandbox`, so such an object served from the dashboard's own origin runs no script; a website bucket's pages run theirs in an origin of their own, away from the dashboard's session
+- **Signature guessing is slowed**: past 20 failed signatures in a row for one access key from one address (an IPv6 /64), each further failure is answered after one second; a correct signature is never refused or delayed, so the throttle cannot be used to lock a key out (a success clears the count)
+- **Version IDs are checked**: a version ID with a path separator or dots is refused, so it cannot name another key's version file
+- **Object lock on upload takes the lock permission**: `x-amz-object-lock-*` headers need `s3:PutObjectRetention` / `s3:PutObjectLegalHold`, like the lock API
 - **FUSE cache size caps**: Signature cache, HEAD cache, and LIST cache bounded to prevent unbounded memory growth
 - **GetObjectAttributes version support**: Respects `versionId` parameter and handles delete markers
 - **External authorization webhook**: Delegate the access decision to an HTTP endpoint. Deny-only by default, fail-closed by default, admin exempt so a broken endpoint cannot lock the operator out

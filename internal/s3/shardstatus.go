@@ -23,7 +23,7 @@ func metadataUnavailable(w http.ResponseWriter, err error) bool {
 	}
 	w.Header().Set("Retry-After", "1")
 	writeS3Error(w, "ServiceUnavailable",
-		"The metadata shard holding this bucket is temporarily unavailable, retry the request",
+		"The cluster metadata for this request is temporarily unavailable, retry the request",
 		http.StatusServiceUnavailable)
 	return true
 }

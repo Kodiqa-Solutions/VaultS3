@@ -52,6 +52,35 @@ requests.post(f"{API}/iam/policies", headers=headers,
 
 Policy evaluation follows AWS IAM semantics: default deny, explicit Allow required, explicit Deny always wins. The admin key has full access. Any other key is denied everything until a policy allows it, including a key with no user.
 
+- `arn:aws:s3:::my-bucket/*` is the bucket's **objects**. Bucket-level actions
+  (`s3:ListBucket`, `?policy`, `?versioning`, `?lifecycle`, `?quota`, deleting
+  the bucket) need the bucket itself, `arn:aws:s3:::my-bucket`. Before 5.0.14
+  an object grant covered the bucket too, so `s3:Put*` on `my-bucket/*` could
+  change the bucket's policy; a policy that relied on it needs the bucket ARN
+  added.
+- A **bucket policy's `Deny`** applies to signed requests as well as anonymous
+  ones (from 5.0.14), when its `Principal` is `"*"` or names the user
+  (`arn:aws:iam::<account>:user/<name>`, or the name), or its `NotPrincipal`
+  does not name the user. `NotAction` and `NotResource` work as on AWS. The
+  admin key is not affected. Conditions are evaluated as AWS does: a key the
+  request does not carry makes `StringEquals`, `StringLike`, `IpAddress`,
+  `Bool` and the date operators false, and `StringNotEquals`, `StringNotLike`
+  and `NotIpAddress` true; an `...IfExists` operator holds when the key is
+  missing, and `Null` tests for it. A `Deny` with an operator VaultS3 does not
+  implement (such as `ArnLike` or `NumericLessThan`) is ignored for signed
+  requests, with a warning in the log.
+- **`aws:SecureTransport`** is true for a request that reached VaultS3 over
+  TLS, or that reached a proxy listed in `server.trusted_proxies` over TLS
+  (the proxy's `X-Forwarded-Proto: https`). Behind nginx terminating TLS,
+  set both, or a "deny without TLS" policy refuses every request. On a
+  cluster, a request forwarded to another node keeps the answer for the
+  client's connection to the first node.
+- **Policy variables** `${aws:username}` and `${aws:userid}` are replaced by
+  the caller's user name in `Resource`, `NotResource` and `Condition` values
+  (from 5.0.14; before, they were compared as literal text). A statement whose
+  variable cannot be resolved grants nothing when it is an `Allow`, and still
+  applies when it is a `Deny`.
+
 ### What an access key can reach
 
 `POST /api/v1/keys` takes the user and at most one of three choices, and answers

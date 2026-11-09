@@ -15,6 +15,7 @@ import (
 	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metrics"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/middleware"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/ratelimit"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
@@ -148,7 +149,7 @@ func (h *Handler) SetMultipartPeerLister(fn func(bucket string) []metadata.Multi
 // SetPlacementReplicator wires the cluster hook that copies a just-written
 // object's data to the other nodes in its replica set (issue #37, replica_count
 // > 1). No-op single-node / replica_count 1.
-func (h *Handler) SetPlacementReplicator(fn func(bucket, key string)) {
+func (h *Handler) SetPlacementReplicator(fn func(bucket, key, etag string, size int64)) {
 	h.objects.replicatePlacement = fn
 }
 
@@ -294,6 +295,11 @@ func (sw *statusWriter) WriteHeader(code int) {
 	sw.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the connection (write
+// deadlines, flushing). Without it S3 Select's write deadline was never set,
+// so two slow readers held both Select slots for good.
+func (sw *statusWriter) Unwrap() http.ResponseWriter { return sw.ResponseWriter }
+
 // isSignedRequest reports a request that carries a signature, in the header
 // or as a presigned URL.
 func isSignedRequest(r *http.Request) bool {
@@ -332,6 +338,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	slog.Debug("S3 request", "method", r.Method, "bucket", bucket, "key", key)
 
+	// The server wraps every route in the dashboard's security headers, whose
+	// policy (default-src 'self') let an uploaded HTML object load another
+	// object as its script and run as the dashboard. User content gets its own
+	// policy below (sandboxWriter), or a website page's in serveWebsite; the
+	// dashboard's is dropped here, before the cluster proxy, so a proxied
+	// answer carries only the policy the holding node sets.
+	w.Header().Del("Content-Security-Policy")
+
 	// Cluster proxy: forward to the correct node if this isn't the primary
 	// Skip if already proxied (X-VaultS3-Proxy header present) to prevent loops
 	// A presigned POST names its key inside the form, so routing it here by
@@ -344,8 +358,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Everything this handler serves is a user's content, served from the
+	// dashboard's own origin: a type that could run as a page runs no script
+	// (see sandboxWriter). A website page is given its scripts back in
+	// serveWebsite, in an origin of its own. Set after the cluster proxy: the
+	// node holding the object decides, and a policy set here too was sent
+	// alongside a proxied website page's own, and browsers enforce both.
+	w = &sandboxWriter{ResponseWriter: w}
+
+	// A version ID names a file under its key's version folder; one with a
+	// path separator named another key's version (see storage.VersionIDProblem).
+	if vs, ok := r.URL.Query()["versionId"]; ok {
+		for _, v := range vs {
+			if storage.VersionIDProblem(v) != "" {
+				writeS3Error(w, "InvalidArgument", "Invalid version id specified", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
 	// Reject path traversal in keys
 	if key != "" {
+		// S3 limits a key to 1024 bytes, and the disk a path segment to 255:
+		// a longer one failed deep in the engine with a 500 and the object's
+		// path on disk in the log. Only a new object is refused: with packing
+		// on, a small object's key is not a file name, and such an object
+		// stored before must stay readable, deletable, and open to every
+		// other request (a legal hold must still be liftable).
+		if (r.Method == http.MethodPut || r.Method == http.MethodPost) && keyTooLong(key) && !objectStored(h.store, bucket, key) {
+			writeS3Error(w, "KeyTooLongError", "Your key is too long", http.StatusBadRequest)
+			return
+		}
 		if msg := objectKeyProblem(key); msg != "" {
 			writeS3Error(w, "InvalidArgument", msg, http.StatusBadRequest)
 			return
@@ -540,7 +583,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// refusal from the external authorizer.
 			var external *iam.DeniedError
 			if err != nil && publicGrant && !identity.PolicyLoadFailed && !errors.As(err, &external) {
-				if _, explicitDeny := iam.EvaluateIdentity(identity, action, resource, reqCtx); !explicitDeny {
+				if _, explicitDeny := iam.EvaluateIdentity(identity, action, resource, reqCtx); !explicitDeny &&
+					!h.auth.BucketPolicyDenies(identity, action, resource, reqCtx) {
 					err = nil
 				}
 			}
@@ -1582,7 +1626,7 @@ func anonymousPolicyContext(r *http.Request) map[string]string {
 	}
 	ctx := map[string]string{
 		"aws:SourceIp":        ip,
-		"aws:SecureTransport": strconv.FormatBool(r.TLS != nil),
+		"aws:SecureTransport": strconv.FormatBool(middleware.SecureTransport(r)),
 		"aws:CurrentTime":     time.Now().UTC().Format(time.RFC3339),
 	}
 	if ua := r.UserAgent(); ua != "" {
@@ -1596,4 +1640,26 @@ func anonymousPolicyContext(r *http.Request) map[string]string {
 		ctx["s3:prefix"] = q.Get("prefix")
 	}
 	return ctx
+}
+
+// longSegment reports a path segment of key longer than a file name may be.
+// keyTooLong reports a key longer than S3 allows, or with a segment longer
+// than a file name.
+func keyTooLong(key string) bool {
+	return len(key) > 1024 || longSegment(key)
+}
+
+// objectStored reports whether bucket holds an object (or a version) under key.
+func objectStored(store metadata.StoreAPI, bucket, key string) bool {
+	m, err := store.GetObjectMeta(bucket, key)
+	return err == nil && m != nil
+}
+
+func longSegment(key string) bool {
+	for _, seg := range strings.Split(key, "/") {
+		if len(seg) > 255 {
+			return true
+		}
+	}
+	return false
 }

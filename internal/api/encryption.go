@@ -57,6 +57,16 @@ func (h *APIHandler) handleBucketEncryption(w http.ResponseWriter, r *http.Reque
 	case "rotate":
 		err = h.keyMgr.Rotate(bucket)
 	case "shred":
+		// Shredding destroys every object, so object lock forbids it while
+		// any object or version is held, the admin included, as it forbids
+		// deleting them one by one.
+		if reason, lerr := h.bucketLockReason(bucket); lerr != nil {
+			writeError(w, http.StatusInternalServerError, "could not check the bucket for locked objects")
+			return
+		} else if reason != "" {
+			writeError(w, http.StatusConflict, "cannot shred: "+reason)
+			return
+		}
 		err = h.keyMgr.ShredBucket(bucket)
 	default:
 		writeError(w, http.StatusNotFound, "unknown encryption action")
@@ -67,4 +77,41 @@ func (h *APIHandler) handleBucketEncryption(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": action, "bucket": bucket})
+}
+
+// bucketLockReason says why object lock forbids destroying the bucket's data
+// (an object or version under legal hold or unexpired retention), or "".
+func (h *APIHandler) bucketLockReason(bucket string) (string, error) {
+	after := ""
+	for {
+		objs, more, err := h.store.ListLatestObjects(bucket, "", after, 1000)
+		if err != nil {
+			return "", err
+		}
+		for i := range objs {
+			if r := objectLockReason(&objs[i]); r != "" {
+				return objs[i].Key + ": " + r, nil
+			}
+		}
+		if !more || len(objs) == 0 {
+			break
+		}
+		after = objs[len(objs)-1].Key
+	}
+	keyMarker, versionMarker := "", ""
+	for {
+		vers, more, err := h.store.ListObjectVersions(bucket, "", keyMarker, versionMarker, 1000)
+		if err != nil {
+			return "", err
+		}
+		for i := range vers {
+			if r := objectLockReason(&vers[i]); r != "" {
+				return vers[i].Key + " (version " + vers[i].VersionID + "): " + r, nil
+			}
+		}
+		if !more || len(vers) == 0 {
+			return "", nil
+		}
+		keyMarker, versionMarker = vers[len(vers)-1].Key, vers[len(vers)-1].VersionID
+	}
 }

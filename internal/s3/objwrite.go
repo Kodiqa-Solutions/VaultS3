@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 )
 
 // reqError is a refusal that carries the S3 error code, message and status it
@@ -102,6 +103,14 @@ type newObject struct {
 // writeObject stores o as the new current object of its key, the way the
 // bucket's versioning state requires, and records its metadata.
 func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
+	// A request that carries the caller's identity is authorized for the
+	// lock it asks for; a multipart upload's was authorized when it began.
+	if o.lockFrom != nil {
+		id, _ := identityFrom(o.lockFrom)
+		if re := h.lockHeadersProblem(o.lockFrom, o.bucket, o.key, id != nil); re != nil {
+			return metadata.ObjectMeta{}, re
+		}
+	}
 	versioning, _ := h.store.GetBucketVersioning(o.bucket)
 	versioned := versioning == "Enabled" || versioning == "Suspended"
 	if o.ssec != nil && versioned {
@@ -129,6 +138,10 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 		versionID = nullVersionID
 		written, etag, err = h.engine.PutObjectVersion(o.bucket, o.key, versionID, o.body, o.size)
 	default:
+		// Held (shared) to the metadata commit: a replica copy of an older object,
+		// arriving from another node, waits and then finds the new metadata.
+		unlock := storage.LockObjectKeyShared(o.bucket, o.key)
+		defer unlock()
 		if o.ssec != nil {
 			// SSE-C seals with the customer key in the same chunked streaming
 			// format the encrypting engines use, so the body flows to the engine
@@ -189,7 +202,7 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 			return metadata.ObjectMeta{}, &metaWriteError{"PutObjectMeta", err}
 		}
 		if h.replicatePlacement != nil {
-			h.replicatePlacement(o.bucket, o.key) // copy data to replica-set peers (issue #37)
+			h.replicatePlacement(o.bucket, o.key, meta.ETag, meta.Size) // copy data to replica-set peers (issue #37)
 		}
 		return meta, nil
 	}

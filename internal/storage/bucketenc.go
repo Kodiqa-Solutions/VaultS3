@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"errors"
 	"fmt"
+	"github.com/klauspost/compress/zstd"
 	"io"
 	"sync"
 
@@ -313,12 +315,30 @@ func (e *PerBucketEngine) GetObjectVersion(bucket, key, versionID string) (ReadS
 //     never compressed by VaultS3, so it is never unwrapped.
 //   - A blob that does not decompress cleanly is the caller's own bytes.
 //   - A blob that does decompress is kept decompressed only when what is inside
-//     is sealed, or when a legacy server-wide key may have sealed it in the old
-//     headerless format. Otherwise it is returned as stored, and the compression
-//     layer above, when there is one, removes its own wrapping.
+//     is sealed, or when the legacy server-wide key actually opens it.
+//     Otherwise it is returned as stored, and the compression layer above,
+//     when there is one, removes its own wrapping.
+//
+// What was compressed was ciphertext, which does not compress, so a legacy
+// blob decompresses to about its stored size. The check decodes no further
+// than that: a user's file that decompresses to more is not legacy. It used
+// to be decoded in full on every GET (a 32 KB zstd file to 1 GB, with no
+// content size in its header), and with a legacy key configured any such
+// file was served decompressed, other bytes than were stored.
 func (e *PerBucketEngine) unwrapLegacyCompression(key string, reader ReadSeekCloser, stored int64) (ReadSeekCloser, int64, error) {
 	if neverCompressed(key) || !hasCompressionMagic(reader) {
 		return reader, stored, nil
+	}
+	if !e.isLegacyWrapped(reader, stored) {
+		if _, err := reader.Seek(0, io.SeekStart); err != nil {
+			_ = reader.Close()
+			return nil, 0, err
+		}
+		return reader, stored, nil
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		_ = reader.Close()
+		return nil, 0, err
 	}
 	dr, size, err := decompressIfCompressed(keepOpen{reader}, stored)
 	if err != nil {
@@ -377,4 +397,58 @@ func (c closeBoth) Close() error {
 		err = uerr
 	}
 	return err
+}
+
+// isLegacyWrapped reports whether a stored blob with a compression magic is
+// the pre-4.4.70 compression of sealed data: it decompresses to no more than
+// about its stored size, and what is inside carries a seal header or opens
+// with the legacy key. It reads the blob once, decoding at most that much.
+func (e *PerBucketEngine) isLegacyWrapped(reader ReadSeekCloser, stored int64) bool {
+	limit := stored + stored/8 + 64<<10
+	var dec io.Reader
+	var m [4]byte
+	n, _ := io.ReadFull(reader, m[:])
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+	switch {
+	case n == 4 && m[0] == 0x28 && m[1] == 0xB5 && m[2] == 0x2F && m[3] == 0xFD:
+		d, err := zstd.NewReader(reader, zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			return false
+		}
+		defer d.Close()
+		dec = d
+	case n >= 2 && m[0] == 0x1F && m[1] == 0x8B:
+		g, err := gzip.NewReader(reader)
+		if err != nil {
+			return false
+		}
+		defer func() { _ = g.Close() }()
+		dec = g
+	default:
+		return false
+	}
+	head := make([]byte, 4)
+	hn, _ := io.ReadFull(dec, head)
+	head = head[:hn]
+	sealed := string(head) == streamMagic || bucketcrypto.HasHeader(head)
+	if sealed {
+		rest, err := io.Copy(io.Discard, io.LimitReader(dec, limit))
+		return err == nil && int64(hn)+rest <= limit
+	}
+	if e.legacy == nil || stored > maxWholeObjectStored {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(dec, limit))
+	if err != nil || int64(hn+len(body)) > limit {
+		return false
+	}
+	data := append(head, body...)
+	ns := e.legacy.NonceSize()
+	if len(data) < ns {
+		return false
+	}
+	_, err = e.legacy.Open(nil, data[:ns], data[ns:], nil)
+	return err == nil
 }

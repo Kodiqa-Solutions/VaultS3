@@ -85,6 +85,9 @@ type StoreAPI interface {
 	IsBucketPublicList(bucket string, ctx map[string]string) bool
 	IsObjectPublicRead(bucket, key string, ctx map[string]string) bool
 	IsObjectPublicAction(bucket, key, action string, ctx map[string]string) bool
+	// BucketPolicyDenies reports a bucket-policy Deny that applies to a
+	// signed request by user.
+	BucketPolicyDenies(bucket, key, action, user string, ctx map[string]string) bool
 	IsBucketWebsite(bucket string) bool
 	IterateAllObjects(fn func(bucket, key string, meta ObjectMeta) bool) error
 	LatestObjectVersion(bucket, key string) (*ObjectMeta, error)

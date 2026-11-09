@@ -234,6 +234,10 @@ func (h *APIHandler) handlePutBucketPolicy(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid JSON policy")
 		return
 	}
+	if err := metadata.ValidateBucketPolicy(body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid policy: "+err.Error())
+		return
+	}
 
 	if err := h.store.PutBucketPolicy(name, body); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to set policy")

@@ -94,3 +94,21 @@ func TestOwnedPathsCoverEveryWrittenPath(t *testing.T) {
 		}
 	}
 }
+
+// Regression (5.0.14 security review): a setting such as cold_data_dir can
+// point anywhere; pointed at /usr/local/bin, the root start gave the server's
+// own binary to the PUID user. System folders are refused.
+func TestSystemFoldersAreNotGivenAway(t *testing.T) {
+	for _, p := range []string{"/usr/local/bin", "/usr", "/etc/vaults3", "/bin", "/lib64/x", "/proc/1", "/root/data",
+		// A folder holding one, or one shared with other software.
+		"/var", "/var/lib", "/var/spool/cron", "/opt", "/home", "/mnt", "/tmp"} {
+		if systemPath(p) == "" {
+			t.Errorf("%s was not seen as a system folder", p)
+		}
+	}
+	for _, p := range []string{"/data", "/metadata", "/mnt/user/appdata/vaults3/data", "/var/lib/vaults3/data", "/srv/cold", "/opt/vaults3/data", "/home/nas/vaults3"} {
+		if s := systemPath(p); s != "" {
+			t.Errorf("%s refused as %s", p, s)
+		}
+	}
+}

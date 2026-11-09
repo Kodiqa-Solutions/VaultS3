@@ -296,7 +296,9 @@ func (s *ShardedStore) GetObjectMeta(bucket, key string) (*ObjectMeta, error) {
 }
 
 func (s *ShardedStore) GetObjectMetaConsistent(bucket, key string) (*ObjectMeta, error) {
-	return s.meta(ShardRequest{Op: OpGetObjectMetaConsistent, Bucket: bucket, Key: key})
+	// The shard's leader has applied every write it acknowledged; a follower
+	// may still hold the previous object after an overwrite.
+	return s.meta(ShardRequest{Op: OpGetObjectMetaConsistent, Bucket: bucket, Key: key, LeaderOnly: true})
 }
 
 func (s *ShardedStore) GetObjectVersion(bucket, key, versionID string) (*ObjectMeta, error) {

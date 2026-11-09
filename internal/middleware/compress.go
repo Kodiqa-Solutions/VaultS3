@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // A gzip or zlib writer allocates about 800 KB of compressor state. The
@@ -119,6 +120,7 @@ type compressWriter struct {
 
 	writer      io.WriteCloser
 	wroteHeader bool
+	deadlineSet bool
 }
 
 func (w *compressWriter) WriteHeader(status int) {
@@ -159,14 +161,28 @@ func addVary(h http.Header, value string) {
 	h.Add("Vary", value)
 }
 
+// compressWriteTimeout bounds one write of a compressed response. A client
+// that stopped reading held its compressor (about 800 KB from the pool) for
+// as long as it kept the connection open, so a few hundred connections that
+// never read, from anyone, took hundreds of megabytes. A variable so a test
+// can shorten it.
+var compressWriteTimeout = 60 * time.Second
+
 func (w *compressWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
 	if w.writer != nil {
+		w.deadline()
 		return w.writer.Write(p)
 	}
 	return w.ResponseWriter.Write(p)
+}
+
+// deadline gives the next write compressWriteTimeout to reach the client.
+func (w *compressWriter) deadline() {
+	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(compressWriteTimeout))
+	w.deadlineSet = true
 }
 
 // Flush implements http.Flusher. SSE responses are not compressed, but the
@@ -194,7 +210,14 @@ func (w *compressWriter) Close() error {
 	if w.writer == nil {
 		return nil
 	}
+	w.deadline()
 	err := w.writer.Close()
+	// The connection serves the next request with no deadline, as before.
+	defer func() {
+		if w.deadlineSet {
+			_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Time{})
+		}
+	}()
 	switch zw := w.writer.(type) {
 	case *gzip.Writer:
 		zw.Reset(io.Discard)

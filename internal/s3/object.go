@@ -114,7 +114,7 @@ type ObjectHandler struct {
 	// just-written object's data to the other nodes in its replica set so a node
 	// loss doesn't make it unavailable (issue #37). Best-effort + asynchronous —
 	// never blocks or fails the client write; GET failover already tries replicas.
-	replicatePlacement func(bucket, key string)
+	replicatePlacement func(bucket, key, etag string, size int64)
 	// dataHolderFallback, if set (cluster mode), re-routes a read this node has
 	// metadata for but no readable data to a peer that holds the object's bytes.
 	// That gap is normal and transient while replicatePlacement above is still in
@@ -1196,6 +1196,54 @@ func (h *ObjectHandler) notifyDeleted(bucket, key, versionID string) {
 	}
 }
 
+// lockHeadersProblem checks a write's x-amz-object-lock-* headers, as S3
+// does, and returns the error to answer with, or nil. With authorize set the
+// caller must also hold s3:PutObjectRetention (mode and date) and
+// s3:PutObjectLegalHold (legal hold ON).
+//
+// The headers were applied as given: any caller allowed s3:PutObject could
+// lock an object in COMPLIANCE mode until the year 9999, without the
+// permission the lock actions take, so neither the bucket's owner nor the
+// admin could ever delete it, and the bucket could never be deleted either.
+func (h *ObjectHandler) lockHeadersProblem(r *http.Request, bucket, key string, authorize bool) *reqError {
+	if r == nil {
+		return nil
+	}
+	mode := r.Header.Get("X-Amz-Object-Lock-Mode")
+	until := r.Header.Get("X-Amz-Object-Lock-Retain-Until-Date")
+	hold := r.Header.Get("X-Amz-Object-Lock-Legal-Hold")
+	if mode == "" && until == "" && hold == "" {
+		return nil
+	}
+	// As PutObjectRetention and PutObjectLegalHold, which this server allows
+	// on any bucket, the lock takes the permission those actions take.
+	resource := formatResource(bucket, key)
+	if mode != "" || until != "" {
+		if mode != "GOVERNANCE" && mode != "COMPLIANCE" {
+			return &reqError{"InvalidArgument", "Unknown wormMode directive.", http.StatusBadRequest}
+		}
+		t, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			return &reqError{"InvalidArgument", "The retain until date must be provided in ISO 8601 format", http.StatusBadRequest}
+		}
+		if !t.After(time.Now()) {
+			return &reqError{"InvalidArgument", "The retain until date must be in the future!", http.StatusBadRequest}
+		}
+		if authorize && h.authorizeEntry(r, "s3:PutObjectRetention", resource) != nil {
+			return &reqError{"AccessDenied", "Access Denied", http.StatusForbidden}
+		}
+	}
+	if hold != "" {
+		if hold != "ON" && hold != "OFF" {
+			return &reqError{"InvalidArgument", "Legal Hold must be either of 'ON' or 'OFF'", http.StatusBadRequest}
+		}
+		if hold == "ON" && authorize && h.authorizeEntry(r, "s3:PutObjectLegalHold", resource) != nil {
+			return &reqError{"AccessDenied", "Access Denied", http.StatusForbidden}
+		}
+	}
+	return nil
+}
+
 // applyObjectLock populates meta's retention and legal-hold from the request's
 // inline object-lock headers, falling back to the bucket's default retention. It
 // is shared by every PutObject path (versioned, suspended, non-versioned) so WORM
@@ -1599,6 +1647,12 @@ func (h *ObjectHandler) BatchDelete(w http.ResponseWriter, r *http.Request, buck
 		// named version is s3:DeleteObjectVersion, which is a different permission
 		// from the recoverable s3:DeleteObject, so a policy that allows deletes
 		// while denying permanent destruction must hold here too.
+		if obj.VersionID != "" && storage.VersionIDProblem(obj.VersionID) != "" {
+			result.Errors = append(result.Errors, deleteError{
+				Key: obj.Key, VersionID: obj.VersionID, Code: "InvalidArgument", Message: "Invalid version id specified",
+			})
+			continue
+		}
 		entryAction := "s3:DeleteObject"
 		if obj.VersionID != "" {
 			entryAction = "s3:DeleteObjectVersion"

@@ -22,3 +22,5 @@ func dropPrivileges(cfg *config.Config) error {
 }
 
 func takeFile(string, int, int) error { return nil }
+
+func linkCount(os.FileInfo) uint64 { return 1 }

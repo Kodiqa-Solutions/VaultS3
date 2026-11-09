@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -520,6 +521,29 @@ func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
+		// A copy names the object it is (its ETag). Copies are sent after each
+		// write, in no order, so the copy of the previous object, a 10 MiB
+		// multipart upload still streaming, landed after the copy of the small
+		// object that replaced it and put the old bytes back. The sending node
+		// then read those and spread them: the acknowledged write was lost on
+		// every node. A copy is stored only while it is the object the
+		// metadata names, read after catching up with the leader.
+		if etag := r.Header.Get(ReplicaETagHeader); etag != "" {
+			unlock := storage.LockObjectKey(bucket, key)
+			defer unlock()
+			meta, err := h.store.GetObjectMetaConsistent(bucket, key)
+			if err != nil || meta == nil || meta.ETag != etag || meta.VersionID != "" ||
+				(meta.SSECustomerKeyMD5 == "" && r.ContentLength >= 0 && r.ContentLength != meta.Size) {
+				current := ""
+				if meta != nil {
+					current = meta.ETag
+				}
+				slog.Debug("refused a replica copy that is not the current object",
+					"bucket", bucket, "key", key, "copy_etag", etag, "current_etag", current, "error", err)
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+		}
 		if _, _, err := h.engine.PutObject(bucket, key, r.Body, r.ContentLength); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -527,6 +551,10 @@ func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 	}
 }
+
+// ReplicaETagHeader carries, on a replica copy, the ETag of the object the
+// copy is, so the receiving node can refuse a copy of an older object.
+const ReplicaETagHeader = "X-VaultS3-Replica-ETag"
 
 // handleClusterRebalance handles POST /api/v1/cluster/rebalance: trigger a
 // background pass that moves objects to their correct hash-ring owner (used after

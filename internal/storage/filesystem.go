@@ -235,6 +235,9 @@ func (fs *FileSystem) objectPath(bucket, key string) string {
 // neither the key nor the version ID can reach a plain object, another key's
 // versions or another bucket.
 func (fs *FileSystem) versionPath(bucket, key, versionID string) string {
+	if VersionIDProblem(versionID) != "" {
+		return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-version")
+	}
 	vs, ok := fs.containedPath(bucket, ".vs")
 	if !ok {
 		return filepath.Join(filepath.Clean(fs.dataDir), quarantineDir, "invalid-version")

@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/config"
 )
@@ -101,7 +103,7 @@ func ownedPaths(cfg *config.Config) []ownedPath {
 		}
 	}
 	if cfg.Vector.Enabled && cfg.Vector.PersistPath != "" {
-		add(filepath.Dir(cfg.Vector.PersistPath), ownTop)
+		add(filepath.Dir(cfg.Vector.PersistPath), ownTop) // the default is inside metadata_dir
 	}
 	if cfg.Logging.Enabled && cfg.Logging.FilePath != "" {
 		add(cfg.Logging.FilePath, ownFile)
@@ -133,6 +135,9 @@ func takeOwnership(p string, mode ownMode, uid, gid int, owner func(os.FileInfo)
 	if real == string(filepath.Separator) {
 		return false, fmt.Errorf("%s is the file system root; refusing to give it away", p)
 	}
+	if sys := systemPath(real); sys != "" {
+		return false, fmt.Errorf("%s is %s, a system folder; refusing to give it away", p, sys)
+	}
 	if mode == ownTop {
 		return false, os.Lchown(real, uid, gid)
 	}
@@ -143,6 +148,12 @@ func takeOwnership(p string, mode ownMode, uid, gid int, owner func(os.FileInfo)
 	if u, g, known := owner(fi); mode == ownTree && known && u == uid && g == gid {
 		return false, nil
 	}
+	skippedLinks := false
+	defer func() {
+		if skippedLinks {
+			slog.Warn("left files with more than one name as they are; give them to the PUID user by hand if the server needs them", "dir", p)
+		}
+	}()
 	// Only entries with another owner are changed, and reported.
 	foreign := func(fi os.FileInfo) bool {
 		u, g, known := owner(fi)
@@ -162,6 +173,12 @@ func takeOwnership(p string, mode ownMode, uid, gid int, owner func(os.FileInfo)
 		if !foreign(fi) {
 			return nil
 		}
+		// A file with another name elsewhere may be a link to a file outside
+		// the folder (a root file linked in), which this would give away.
+		if !fi.IsDir() && linkCount(fi) > 1 {
+			skippedLinks = true
+			return nil
+		}
 		walked = true
 		return os.Lchown(q, uid, gid)
 	})
@@ -173,4 +190,36 @@ func takeOwnership(p string, mode ownMode, uid, gid int, owner func(os.FileInfo)
 		return walked, os.Lchown(real, uid, gid)
 	}
 	return walked, nil
+}
+
+// systemPath names the system folder p is or lies in, or "". A setting such
+// as tiering.cold_data_dir can point anywhere, and the server, still root,
+// would give that folder to the PUID user: pointing it at /usr/local/bin, by
+// whoever can edit the config, gave that user the server's own binary and the
+// next start ran their code as root.
+func systemPath(p string) string {
+	clean := filepath.Clean(p)
+	for _, sys := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/boot", "/dev", "/proc", "/sys", "/root", "/run", "/var/run", "/var/lib/dpkg", "/var/lib/apk", "/var/spool"} {
+		// A folder above one is refused too: given whole, /var would hand
+		// over /var/lib/dpkg with it.
+		if clean == sys || strings.HasPrefix(clean, sys+"/") || strings.HasPrefix(sys, clean+"/") {
+			return sys
+		}
+	}
+	// Folders that hold other software or other users' files, refused as
+	// they are (a folder inside one, such as /opt/vaults3, is fine).
+	for _, shared := range []string{"/opt", "/home", "/srv", "/mnt", "/media", "/tmp", "/var/tmp", "/var/lib", "/var/log"} {
+		if clean == shared {
+			return shared
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			dir := filepath.Dir(real)
+			if clean == dir || strings.HasPrefix(dir, clean+"/") || strings.HasPrefix(clean, dir+"/") {
+				return "the server's own folder"
+			}
+		}
+	}
+	return ""
 }

@@ -255,7 +255,9 @@ func (p *peekWriter) WriteHeader(code int) {
 	if code >= 100 && code < 200 {
 		return
 	}
-	if code == http.StatusNotFound && p.discardNotFound {
+	// A peer whose own copy is behind answers 503 (it cannot hop on), and
+	// another holder may have the current bytes: try it too.
+	if (code == http.StatusNotFound || code == http.StatusServiceUnavailable) && p.discardNotFound {
 		p.discarded = true
 		return
 	}

@@ -63,7 +63,7 @@ func parseCopySourceHeader(header string) (copySource, error) {
 			return copySource{}, errBadCopySource
 		}
 		if vs, ok := q["versionId"]; ok {
-			if len(vs) != 1 || vs[0] == "" {
+			if len(vs) != 1 || storage.VersionIDProblem(vs[0]) != "" {
 				return copySource{}, errBadCopySource
 			}
 			src.versionID = vs[0]

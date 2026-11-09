@@ -136,6 +136,16 @@ func (v *conditionValues) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// ConditionValuesFromJSON reads one condition key's values the way policies
+// are read here: a string, boolean or number, or an array of them.
+func ConditionValuesFromJSON(b []byte) ([]string, error) {
+	var v conditionValues
+	if err := v.UnmarshalJSON(b); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
 func conditionScalar(b json.RawMessage) (string, error) {
 	b = bytes.TrimSpace(b)
 	if len(b) > 0 && b[0] == '"' {
@@ -208,13 +218,11 @@ func matchWildcard(pattern, value string) bool {
 // wildcardMatch implements full wildcard matching with * and ? at any position.
 // Special case: "prefix/*" also matches "prefix" itself (for resource ARN matching).
 func wildcardMatch(pattern, value string) bool {
-	// Special case: arn:aws:s3:::bucket/* should match arn:aws:s3:::bucket
-	if strings.HasSuffix(pattern, "/*") {
-		base := strings.TrimSuffix(pattern, "/*")
-		if value == base {
-			return true
-		}
-	}
+	// "arn:aws:s3:::bucket/*" is the bucket's objects, not the bucket, as on
+	// AWS. It used to match the bucket too, so a grant written for objects
+	// (s3:Put* on bucket/*) also allowed bucket configuration: an object-only
+	// user could make the bucket public through its policy, lift its quota,
+	// turn versioning off or set a lifecycle rule that expires everything.
 	// By character, not byte: a '?' stands for one character, so "b/?"
 	// matches the key "é" (two bytes in UTF-8), as on AWS. The strings are
 	// walked in place, not converted to runes, which allocated four times the

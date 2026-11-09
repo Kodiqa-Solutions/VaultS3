@@ -27,3 +27,20 @@ func TestPeekWriterIgnoresInformationalStatus(t *testing.T) {
 		}
 	}
 }
+
+// A holder whose own copy is behind answers 503; the next holder may have
+// the current bytes, so the answer is held back like a 404 (5.0.14 soak).
+func TestPeekWriterTriesTheNextHolderAfterA503(t *testing.T) {
+	rec := httptest.NewRecorder()
+	pw := &peekWriter{ResponseWriter: rec, discardNotFound: true}
+	pw.WriteHeader(http.StatusServiceUnavailable)
+	if !pw.discarded || pw.committed {
+		t.Errorf("a 503 was sent on while another holder was left (discarded %v, committed %v)", pw.discarded, pw.committed)
+	}
+	rec = httptest.NewRecorder()
+	pw = &peekWriter{ResponseWriter: rec, discardNotFound: false}
+	pw.WriteHeader(http.StatusServiceUnavailable)
+	if !pw.committed || rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("the last holder's 503 was not sent: %d", rec.Code)
+	}
+}

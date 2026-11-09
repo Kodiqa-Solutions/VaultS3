@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -66,7 +67,7 @@ type VectorConfig struct {
 	AutoIndex      bool     `yaml:"auto_index"`       // embed text objects automatically on upload
 	IndexPrefixes  []string `yaml:"index_prefixes"`   // if set, only auto-index keys under these prefixes
 	MaxObjectBytes int64    `yaml:"max_object_bytes"` // skip auto-indexing objects larger than this
-	PersistPath    string   `yaml:"persist_path"`     // file to persist the index across restarts
+	PersistPath    string   `yaml:"persist_path"`     // file to persist the index across restarts; empty: vectors.gob in the metadata directory
 	TimeoutSecs    int      `yaml:"timeout_secs"`     // embedding HTTP timeout
 }
 
@@ -891,4 +892,15 @@ func warnUnknownKeys(data []byte) {
 	if err := dec.Decode(&probe); err != nil && !errors.Is(err, io.EOF) {
 		slog.Warn("config: a key matches no setting and is ignored", "detail", err.Error())
 	}
+}
+
+// IndexPath is where the vector index is kept: persist_path, or by default
+// vectors.gob in the metadata directory. The sample config named
+// ./data/vectors.gob, inside the data directory where every name is a
+// bucket's: a bucket called vectors.gob kept the index from being saved.
+func (v VectorConfig) IndexPath(metadataDir string) string {
+	if v.PersistPath != "" {
+		return v.PersistPath
+	}
+	return filepath.Join(metadataDir, "vectors.gob")
 }

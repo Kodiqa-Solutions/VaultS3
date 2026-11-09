@@ -10,6 +10,7 @@ import (
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/middleware"
 )
 
 // Per-bucket authorization for the console API (security assessment finding 14).
@@ -35,6 +36,8 @@ type consoleAction struct {
 	action string
 	bucket string
 	key    string
+	// adminOnly is a route no IAM grant opens to a non-admin session.
+	adminOnly bool
 }
 
 // resource renders the ARN the IAM evaluator matches against.
@@ -106,11 +109,28 @@ func consoleActionFor(method, rest string) (consoleAction, bool) {
 			return consoleAction{action: "s3:GetBucketPolicy", bucket: bucket}, true
 		}
 		return consoleAction{action: "s3:PutBucketPolicy", bucket: bucket}, true
-	case "lifecycle", "cors", "encryption", "quota", "snapshots":
-		if method == http.MethodGet {
-			return consoleAction{action: "s3:GetBucketPolicy", bucket: bucket}, true
+	// Each setting takes the action its S3 operation takes. They all used to
+	// take s3:PutBucketPolicy, so a session allowed to change any setting
+	// could crypto-shred the bucket or restore a snapshot over it.
+	case "lifecycle":
+		return byMethod(method, "s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration", bucket), true
+	case "cors":
+		return byMethod(method, "s3:GetBucketCORS", "s3:PutBucketCORS", bucket), true
+	case "quota":
+		return byMethod(method, "s3:GetBucketQuota", "s3:PutBucketQuota", bucket), true
+	case "encryption":
+		if method != http.MethodGet && key == "shred" {
+			// Destroys every object for good: the admin's alone.
+			return consoleAction{action: "vaults3:ShredBucket", bucket: bucket, adminOnly: true}, true
 		}
-		return consoleAction{action: "s3:PutBucketPolicy", bucket: bucket}, true
+		return byMethod(method, "s3:GetEncryptionConfiguration", "s3:PutEncryptionConfiguration", bucket), true
+	case "snapshots":
+		if method == http.MethodGet {
+			return consoleAction{action: "s3:ListBucket", bucket: bucket}, true
+		}
+		// Creating, deleting or restoring snapshots (a restore deletes and
+		// replaces objects) is the admin's.
+		return consoleAction{action: "vaults3:ManageSnapshots", bucket: bucket, adminOnly: true}, true
 	}
 	return consoleAction{action: "s3:PutBucketPolicy", bucket: bucket}, true
 }
@@ -141,6 +161,9 @@ func (h *APIHandler) authorizeConsoleBucket(r *http.Request, rest string) error 
 func (h *APIHandler) authorizeConsoleAction(r *http.Request, user string, act consoleAction) error {
 	if user == "admin" {
 		return nil
+	}
+	if act.adminOnly {
+		return fmt.Errorf("access denied: %s is for the admin only", act.action)
 	}
 	allowed := h.allowsConsoleCtx(user, act, consoleConditionContext(r, user))
 	ext := h.s3Auth.ExternalAuth()
@@ -177,11 +200,12 @@ func (h *APIHandler) authorizeConsoleAction(r *http.Request, user string, act co
 func consoleConditionContext(r *http.Request, user string) map[string]string {
 	ctx := map[string]string{
 		"aws:SourceIp":        iam.SourceIPOf(r.RemoteAddr),
-		"aws:SecureTransport": strconv.FormatBool(r.TLS != nil),
+		"aws:SecureTransport": strconv.FormatBool(middleware.SecureTransport(r)),
 		"aws:CurrentTime":     time.Now().UTC().Format(time.RFC3339),
 	}
 	if user != "" {
 		ctx["aws:username"] = user
+		ctx["aws:userid"] = user
 	}
 	if ua := r.UserAgent(); ua != "" {
 		ctx["aws:UserAgent"] = ua
@@ -255,6 +279,9 @@ func (h *APIHandler) allowsConsoleCtx(user string, act consoleAction, ctx map[st
 		}
 		converted = append(converted, pol)
 	}
+	if act.bucket != "" && act.key != "*" && h.store.BucketPolicyDenies(act.bucket, act.key, act.action, user, ctx) {
+		return false
+	}
 	return iam.EvaluateWithContext(converted, act.action, act.resource(), ctx)
 }
 
@@ -301,4 +328,12 @@ func (h *APIHandler) visibleBuckets(r *http.Request, names []string) []string {
 		}
 	}
 	return out
+}
+
+// byMethod is the read action for GET and the write action otherwise.
+func byMethod(method, read, write, bucket string) consoleAction {
+	if method == http.MethodGet {
+		return consoleAction{action: read, bucket: bucket}
+	}
+	return consoleAction{action: write, bucket: bucket}
 }

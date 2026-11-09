@@ -69,6 +69,18 @@ func SecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// ObjectSandboxCSP is the policy for an object served by the S3 API: it is
+// displayed, but runs no script and is its own origin. Objects are served
+// from the same origin as the dashboard, so an HTML page a user uploaded ran
+// as the dashboard: one link opened by the admin handed it the admin's
+// session token.
+const ObjectSandboxCSP = "sandbox"
+
+// WebsiteSandboxCSP is the policy for a website bucket's pages: their scripts
+// run, but in an origin of their own (no allow-same-origin), so they cannot
+// read the dashboard's storage or call its API as the user.
+const WebsiteSandboxCSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads allow-popups-to-escape-sandbox"
+
 // PanicRecovery catches panics, logs the stack trace, and returns 500.
 func PanicRecovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

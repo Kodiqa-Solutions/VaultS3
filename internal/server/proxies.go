@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/Kodiqa-Solutions/VaultS3/internal/middleware"
 )
 
 // trustedProxies restores the client's address on requests that arrive through
@@ -16,7 +18,8 @@ import (
 // any address in it. Behind nginx that made every client the proxy. A proxy the
 // operator trusts is believed: X-Forwarded-For is read from the right, skipping
 // trusted proxies, and the first address that is not one of them is the client.
-// From anywhere else the header is ignored.
+// From anywhere else the header is ignored. X-Forwarded-Proto from a trusted
+// proxy decides aws:SecureTransport the same way.
 func trustedProxies(cidrs []string, next http.Handler) http.Handler {
 	var nets []*net.IPNet
 	for _, c := range cidrs {
@@ -59,7 +62,13 @@ func trustedProxies(cidrs []string, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		if middleware.ForwardedProtoHTTPS(r) {
+			r = middleware.WithForwardedTLS(r, true)
+		}
+		// Every header line, joined in order: a proxy that adds its own line
+		// (HAProxy's option forwardfor) leaves the client's forged line first,
+		// and reading only that line believed the client.
+		hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
 		for i := len(hops) - 1; i >= 0; i-- {
 			ip := net.ParseIP(strings.TrimSpace(hops[i]))
 			if ip == nil {

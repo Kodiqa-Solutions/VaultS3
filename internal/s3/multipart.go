@@ -38,6 +38,10 @@ func (h *ObjectHandler) CreateMultipartUpload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	if re := h.lockHeadersProblem(r, bucket, key, true); re != nil {
+		writeReqError(w, re)
+		return
+	}
 	uploadID := generateUploadID()
 
 	ct := r.Header.Get("Content-Type")

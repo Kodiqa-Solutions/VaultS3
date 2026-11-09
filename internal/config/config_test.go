@@ -304,3 +304,14 @@ func TestAllowPrivateMigrationSourcesYAMLKey(t *testing.T) {
 		t.Fatal("migration.allow_private_sources: true in the config file was not applied")
 	}
 }
+
+// The vector index lives in the metadata directory by default, out of the
+// data directory where every name is a bucket's.
+func TestVectorIndexPathDefaultsToTheMetadataDir(t *testing.T) {
+	if got := (VectorConfig{}).IndexPath("/metadata"); got != "/metadata/vectors.gob" {
+		t.Errorf("default %q", got)
+	}
+	if got := (VectorConfig{PersistPath: "/x/v.gob"}).IndexPath("/metadata"); got != "/x/v.gob" {
+		t.Errorf("explicit %q", got)
+	}
+}

@@ -696,15 +696,7 @@ func (s *Store) policyAllowsAnonymous(target policyTarget, action string, ctx ma
 	if err != nil {
 		return false
 	}
-	var policy struct {
-		Statement []struct {
-			Effect    string                                `json:"Effect"`
-			Principal interface{}                           `json:"Principal"`
-			Action    interface{}                           `json:"Action"`
-			Resource  interface{}                           `json:"Resource"`
-			Condition map[string]map[string]conditionValues `json:"Condition"`
-		} `json:"Statement"`
-	}
+	var policy bucketPolicyDoc
 	if err := json.Unmarshal(policyJSON, &policy); err != nil {
 		return false
 	}
@@ -748,6 +740,117 @@ func (s *Store) policyAllowsAnonymous(target policyTarget, action string, ctx ma
 		}
 	}
 	return allowed
+}
+
+// BucketPolicyDenies reports whether the bucket policy denies a signed
+// request: a Deny statement whose Principal is everyone ("*") or names this
+// user covers the action and the object (key "" for the bucket itself), and
+// its conditions hold or cannot be decided.
+//
+// Bucket policies used to be read for anonymous requests only, so a Deny in
+// one (deny without TLS, outside an address range, deny delete) did nothing
+// for any user with a key, although policies copied from AWS rely on it.
+func (s *Store) BucketPolicyDenies(bucket, key, action, user string, ctx map[string]string) bool {
+	policyJSON, err := s.GetBucketPolicy(bucket)
+	if err != nil || len(policyJSON) == 0 {
+		return false
+	}
+	var policy bucketPolicyDoc
+	if err := json.Unmarshal(policyJSON, &policy); err != nil {
+		// Refused when it was stored (ValidateBucketPolicy); one stored by an
+		// earlier version is reported, since none of its Denies apply.
+		warnUnreadablePolicy(bucket, err)
+		return false
+	}
+	target := policyTarget{bucket: bucket, key: key}
+	for _, stmt := range policy.Statement {
+		if !strings.EqualFold(stmt.Effect, "Deny") {
+			continue
+		}
+		// Who: Principal names everyone or this user, or NotPrincipal names
+		// everyone except this user.
+		switch {
+		case stmt.NotPrincipal != nil:
+			if isAnonymousPrincipal(stmt.NotPrincipal) || principalNamesUser(stmt.NotPrincipal, user) {
+				continue
+			}
+		case !isAnonymousPrincipal(stmt.Principal) && !principalNamesUser(stmt.Principal, user):
+			continue
+		}
+		switch {
+		case stmt.NotAction != nil:
+			if matchesPolicyAction(stmt.NotAction, action) {
+				continue
+			}
+		case !matchesPolicyAction(stmt.Action, action):
+			continue
+		}
+		switch {
+		case stmt.NotResource != nil:
+			if policyResourceCovers(stmt.NotResource, target) {
+				continue
+			}
+		case !policyResourceCovers(stmt.Resource, target):
+			continue
+		}
+		if len(stmt.Condition) > 0 {
+			conds := make(map[string]map[string][]string, len(stmt.Condition))
+			for op, kvs := range stmt.Condition {
+				conds[op] = make(map[string][]string, len(kvs))
+				for k, v := range kvs {
+					conds[op][k] = v
+				}
+			}
+			holds, supported := iam.ConditionsHoldMissingFalse(conds, ctx)
+			if !supported {
+				warnUnsupportedPolicyCondition(bucket)
+				continue
+			}
+			if !holds {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+var unsupportedConditionWarned sync.Map
+
+// warnUnsupportedPolicyCondition logs, once per bucket, that a Deny in its
+// policy uses a condition operator VaultS3 does not implement and is ignored
+// for signed requests.
+func warnUnsupportedPolicyCondition(bucket string) {
+	if _, seen := unsupportedConditionWarned.LoadOrStore(bucket, true); !seen {
+		slog.Warn("a Deny in this bucket's policy uses a condition operator VaultS3 does not support; it does not apply to signed requests", "bucket", bucket)
+	}
+}
+
+// principalNamesUser reports whether a statement's Principal names this IAM
+// user: its name, or an IAM user ARN ending in user/<name>.
+func principalNamesUser(principal interface{}, user string) bool {
+	if user == "" {
+		return false
+	}
+	var names []string
+	switch p := principal.(type) {
+	case string:
+		names = []string{p}
+	case map[string]interface{}:
+		for k, v := range p {
+			if strings.EqualFold(k, "AWS") {
+				names = append(names, policyStringList(v)...)
+			}
+		}
+	default:
+		names = policyStringList(p)
+	}
+	for _, n := range names {
+		if n == user || strings.HasSuffix(n, ":user/"+user) {
+			return true
+		}
+	}
+	return false
 }
 
 // isAnonymousPrincipal reports whether a statement's Principal is the "everyone"
@@ -823,8 +926,8 @@ func (t policyTarget) arn() string {
 
 // coveredBy reports whether one Resource pattern refers to this target. The full
 // ARN is compared, key included, so "arn:aws:s3:::b/public/*" covers b/public/x
-// and not b/secret/x. MatchWildcard also treats a trailing "/*" as covering the
-// bare bucket ARN, so the common "arn:aws:s3:::b/*" still covers s3:ListBucket.
+// and not b/secret/x. "arn:aws:s3:::b/*" covers the objects only, as on AWS: a
+// bucket-level action such as s3:ListBucket needs "arn:aws:s3:::b" as well.
 func (t policyTarget) coveredBy(pattern string) bool {
 	if pattern == "*" {
 		return true
@@ -3375,20 +3478,73 @@ func (s *Store) SetJWTSigningKey(key []byte) error {
 // conditionValues is a condition's value list. AWS accepts a single string as
 // well as an array ("aws:SourceIp": "203.0.113.0/24"), and both must parse:
 // failing here would drop the whole policy and with it every Deny.
+// conditionValues is one condition key's values: a string, a bare boolean or
+// number ("aws:SecureTransport": false, as Terraform's jsonencode writes it),
+// or an array of them, read as IAM policies read them. Only strings were
+// accepted, and a policy with a boolean failed to parse as a whole, so none of
+// its Denies applied.
 type conditionValues []string
 
 func (c *conditionValues) UnmarshalJSON(b []byte) error {
-	var one string
-	if err := json.Unmarshal(b, &one); err == nil {
-		*c = conditionValues{one}
+	v, err := iam.ConditionValuesFromJSON(b)
+	if err != nil {
+		return err
+	}
+	*c = v
+	return nil
+}
+
+// bucketPolicyDoc is a bucket policy as stored.
+type bucketPolicyDoc struct {
+	Statement policyStatements `json:"Statement"`
+}
+
+type policyStatement struct {
+	Effect       string                                `json:"Effect"`
+	Principal    interface{}                           `json:"Principal"`
+	NotPrincipal interface{}                           `json:"NotPrincipal"`
+	Action       interface{}                           `json:"Action"`
+	NotAction    interface{}                           `json:"NotAction"`
+	Resource     interface{}                           `json:"Resource"`
+	NotResource  interface{}                           `json:"NotResource"`
+	Condition    map[string]map[string]conditionValues `json:"Condition"`
+}
+
+// policyStatements accepts a single statement object as well as an array,
+// as AWS does.
+type policyStatements []policyStatement
+
+func (s *policyStatements) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) > 0 && b[0] == '{' {
+		var one policyStatement
+		if err := json.Unmarshal(b, &one); err != nil {
+			return err
+		}
+		*s = policyStatements{one}
 		return nil
 	}
-	var many []string
+	var many []policyStatement
 	if err := json.Unmarshal(b, &many); err != nil {
 		return err
 	}
-	*c = many
+	*s = many
 	return nil
+}
+
+// ValidateBucketPolicy reports a policy this server could not read. It was
+// stored if it was JSON at all, and then none of its Denies applied.
+func ValidateBucketPolicy(policyJSON []byte) error {
+	var policy bucketPolicyDoc
+	return json.Unmarshal(policyJSON, &policy)
+}
+
+var unreadablePolicyWarned sync.Map
+
+func warnUnreadablePolicy(bucket string, err error) {
+	if _, seen := unreadablePolicyWarned.LoadOrStore(bucket, true); !seen {
+		slog.Warn("this bucket's policy cannot be read, so its Deny statements do not apply; store it again", "bucket", bucket, "error", err)
+	}
 }
 
 // versionOrdering switches on the rule that the highest version ID is

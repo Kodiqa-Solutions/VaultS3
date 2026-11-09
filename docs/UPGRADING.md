@@ -64,6 +64,67 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.14
+
+A security release. Some fixes change what existing policies allow:
+
+- **`arn:aws:s3:::bucket/*` no longer covers the bucket itself**, as on AWS. A
+  policy that grants bucket-level actions (`s3:ListBucket`, bucket settings,
+  deleting the bucket) with only `bucket/*` needs `arn:aws:s3:::bucket` added.
+  Keys limited to a bucket from the dashboard already name both.
+- **A bucket policy's `Deny` now applies to users with keys**, not only to
+  anonymous requests. Check bucket policies with `"Principal": "*"` Deny
+  statements: they now bind every user except the admin. Conditions follow
+  AWS: a key the request does not carry makes a positive operator false and
+  a negated one true. A Deny with a condition operator VaultS3 does not
+  implement is ignored for signed requests (logged once per bucket). A
+  bucket policy VaultS3 cannot read is now refused with `MalformedPolicy`;
+  one stored by an earlier version is logged once, and its Denies do not
+  apply until it is stored again.
+  **Behind nginx or another proxy terminating TLS**, list it in
+  `server.trusted_proxies` and have it send `X-Forwarded-Proto`, or a Deny on
+  `"aws:SecureTransport": "false"` refuses every request.
+- **`${aws:username}` and `${aws:userid}` in policies are substituted.**
+  Policies that used them now do what they say.
+- **`x-amz-object-lock-*` headers on an upload need `s3:PutObjectRetention`
+  (or `s3:PutObjectLegalHold` for a hold)** and a valid mode and future date.
+- **In the dashboard**, a non-admin (SSO) user's bucket settings take the
+  action of the matching S3 operation instead of `s3:PutBucketPolicy`;
+  shredding keys and creating, deleting or restoring snapshots are the
+  admin's.
+- **S3 responses that a browser could run as a page** (HTML, SVG, XML,
+  JavaScript, or a type VaultS3 does not know as passive) carry
+  `Content-Security-Policy: sandbox`: such an object opened in a browser is
+  shown without running its scripts. Images, video, audio, PDFs and plain
+  text are unaffected. Website buckets run their scripts, in an origin of
+  their own.
+- **S3 Select** reads at most 64 MiB of uncompressed input, 4 million fields
+  and 128 MiB of values per request, records up to 1 MiB (as on AWS), two
+  requests at a time (`SlowDown` past that).
+- **Past 20 failed signatures in a row** for one key from one address (an
+  IPv6 /64), each further failure is answered after one second. A correct
+  signature is never delayed.
+- **Keys over 1,024 bytes, or with a segment over 255 bytes**, are refused
+  with `KeyTooLongError` when a new object would be created under them.
+  Objects already stored under such a key keep working.
+- **The vector index** (`vector.persist_path` empty) is kept as
+  `vectors.gob` in `metadata_dir`. If you had set it inside `data_dir`, move
+  it out: a bucket of the same name blocked saving it.
+- **With `PUID`/`PGID`**, a configured folder that is `/`, a system folder, a
+  folder containing one (such as `/var`), or a shared one (`/opt`, `/home`,
+  `/mnt`, `/tmp`) stops the start; use a folder inside it.
+- **On a cluster, replica copies name the object they are**, and a node
+  refuses a copy of an object its metadata no longer names. A rolling upgrade
+  is safe: copies from a node still on 5.0.13 are stored as before, and a
+  5.0.13 node ignores the new header. Overwrites already lost on an earlier
+  version are not repaired by upgrading: overwrite the object again.
+- **On a cluster**, a GET or HEAD on a node that is not the leader first asks
+  the leader how far it has applied (one round trip, shared by concurrent
+  reads), so it never serves an object older than an acknowledged write. A
+  node that cannot reach the leader (just restarted, or cut off) answers such
+  a read with `503 ServiceUnavailable` and `Retry-After: 1`, which S3 SDKs
+  retry, instead of its own possibly older copy.
+
 ## Upgrading to 5.0.13
 
 - **On a cluster, bucket quotas count the whole cluster**, from the

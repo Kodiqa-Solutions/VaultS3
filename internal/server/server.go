@@ -787,7 +787,7 @@ func New(cfg *config.Config) (*Server, error) {
 			repScheme := reapScheme
 			localEngine := engine
 			ring := clusterProxy.Ring()
-			s3h.SetPlacementReplicator(func(bucket, key string) {
+			s3h.SetPlacementReplicator(func(bucket, key, etag string, size int64) {
 				repCount := replicasFor(bucket)
 				if repCount <= 1 {
 					return // this bucket keeps a single copy
@@ -802,18 +802,28 @@ func New(cfg *config.Config) (*Server, error) {
 						continue
 					}
 					go func(addr string) {
-						reader, size, err := localEngine.GetObject(bucket, key)
+						// The copy says which object it is (the write's ETag),
+						// and the receiver stores it only while that is the
+						// object its metadata names. A copy whose size is not
+						// the write's (a newer write has replaced the file
+						// here) is not sent: that write sends its own. An
+						// SSE-C object is stored larger than its size.
+						reader, stored, err := localEngine.GetObject(bucket, key)
 						if err != nil {
 							return
 						}
 						defer reader.Close()
+						if stored != size && !ssecStored(metaStore, bucket, key) {
+							return
+						}
 						u := repScheme + "://" + addr + "/cluster/replica-put?bucket=" +
 							url.QueryEscape(bucket) + "&key=" + url.QueryEscape(key)
 						req, err := http.NewRequest(http.MethodPost, u, reader)
 						if err != nil {
 							return
 						}
-						req.ContentLength = size
+						req.ContentLength = stored
+						req.Header.Set(api.ReplicaETagHeader, etag)
 						if repSecret != "" {
 							req.Header.Set("X-Cluster-Secret", repSecret)
 						}
@@ -1083,7 +1093,7 @@ func New(cfg *config.Config) (*Server, error) {
 	var vectorMgr *vector.Manager
 	if cfg.Vector.Enabled && cfg.Vector.EmbeddingURL != "" {
 		emb := vector.NewOpenAICompatEmbedder(cfg.Vector.EmbeddingURL, cfg.Vector.APIKey, cfg.Vector.Model, cfg.Vector.TimeoutSecs)
-		vectorMgr = vector.NewManager(emb, vector.NewIndex(cfg.Vector.Dimensions, cfg.Vector.MaxVectors), cfg.Vector.PersistPath)
+		vectorMgr = vector.NewManager(emb, vector.NewIndex(cfg.Vector.Dimensions, cfg.Vector.MaxVectors), cfg.Vector.IndexPath(cfg.Storage.MetadataDir))
 		slog.Info("vector search enabled", "model", cfg.Vector.Model, "auto_index", cfg.Vector.AutoIndex, "vectors", vectorMgr.Count())
 	}
 
@@ -2114,4 +2124,11 @@ func recordVersionChange(store metadata.StoreAPI, changeLog *replication.ChangeL
 func versionOrderingFor(cfg *config.Config) bool {
 	return cfg.Replication.Enabled && len(cfg.Replication.Peers) > 0 &&
 		cfg.Replication.Mode == "active-active" && !cfg.Cluster.Enabled
+}
+
+// ssecStored reports whether the current object is sealed with a customer
+// key, so its stored size is not its size.
+func ssecStored(store metadata.StoreAPI, bucket, key string) bool {
+	m, err := store.GetObjectMeta(bucket, key)
+	return err == nil && m != nil && m.SSECustomerKeyMD5 != ""
 }

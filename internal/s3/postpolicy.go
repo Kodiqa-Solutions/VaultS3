@@ -693,6 +693,11 @@ func (h *ObjectHandler) storePolicyUpload(w http.ResponseWriter, r *http.Request
 		writeS3Error(w, "InvalidArgument", msg, http.StatusBadRequest)
 		return
 	}
+	// The key is in the form, past the router's length check.
+	if keyTooLong(up.key) && !objectStored(h.store, bucket, up.key) {
+		writeS3Error(w, "KeyTooLongError", "Your key is too long", http.StatusBadRequest)
+		return
+	}
 	if !h.checkQuotaFor(w, bucket, up.key, -1) {
 		return
 	}

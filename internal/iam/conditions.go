@@ -35,12 +35,27 @@ func EvaluateDetailed(policies []Policy, action, resource string, ctx map[string
 				continue
 			}
 
-			// NotResource: matches if resource is NOT in the list
+			// Resource and NotResource may name policy variables
+			// (${aws:username}), resolved from ctx. One that cannot be
+			// resolved leaves the statement undetermined: a Deny still
+			// applies, an Allow does not grant. Variables were never
+			// substituted, so a Deny written with one never applied and a
+			// home-folder Allow granted the literal "${aws:username}" folder
+			// to every user holding it.
+			deny := stmt.Effect == "Deny"
 			if len(stmt.NotResource) > 0 {
-				if matchesAny(stmt.NotResource, resource) {
+				if m, known := matchesAnyVars(stmt.NotResource, resource, ctx); !known {
+					if !deny {
+						continue
+					}
+				} else if m {
 					continue
 				}
-			} else if !matchesAny(stmt.Resource, resource) {
+			} else if m, known := matchesAnyVars(stmt.Resource, resource, ctx); !known {
+				if !deny {
+					continue
+				}
+			} else if !m {
 				continue
 			}
 
@@ -89,8 +104,12 @@ func evaluateConditions(conditions map[string]map[string][]string, ctx map[strin
 			return false, false
 		}
 		for key, values := range kvs {
-			ctxVal, present := ctx[key]
+			ctxVal, present := contextValue(ctx, key)
 			if !present {
+				return false, false
+			}
+			values, resolved := substituteValues(values, ctx)
+			if !resolved {
 				return false, false
 			}
 			if !evaluateOperator(operator, ctxVal, values) {
@@ -108,6 +127,78 @@ func evaluateConditions(conditions map[string]map[string][]string, ctx map[strin
 // shared so that bucket policies cannot decide conditions differently.
 func ConditionsHold(conditions map[string]map[string][]string, ctx map[string]string) (ok, determined bool) {
 	return evaluateConditions(conditions, ctx)
+}
+
+// ConditionsHoldMissingFalse evaluates a Condition block the way AWS does
+// for a bucket policy: a key the request has no value for makes a positive
+// operator false and a negated one (StringNotEquals, StringNotLike,
+// NotIpAddress) true, an ...IfExists operator holds, and Null tests whether
+// the key is missing. supported is false for an operator this evaluator does
+// not implement; the caller then ignores the statement.
+//
+// It is for a bucket policy Deny on a signed request. Treating a missing key
+// as "cannot tell, so deny", as an IAM user policy Deny is treated, refused
+// every request to a bucket whose policy denied "aws:SecureTransport": "false"
+// with a condition on a key some requests lack (aws:Referer, s3:prefix), and
+// an unknown operator locked the bucket for everyone.
+func ConditionsHoldMissingFalse(conditions map[string]map[string][]string, ctx map[string]string) (holds, supported bool) {
+	for operator, kvs := range conditions {
+		base, ifExists := strings.CutSuffix(operator, "IfExists")
+		if base != "Null" && !knownOperator(base) {
+			return false, false
+		}
+		for key, values := range kvs {
+			ctxVal, present := contextValue(ctx, key)
+			if base == "Null" {
+				want := len(values) > 0 && strings.EqualFold(values[0], "true")
+				if want == present {
+					return false, true
+				}
+				continue
+			}
+			if !present {
+				if ifExists || negatedOperator(base) {
+					continue
+				}
+				return false, true
+			}
+			resolved, ok := substituteValues(values, ctx)
+			if !ok {
+				// A variable with no value matches nothing.
+				if negatedOperator(base) {
+					continue
+				}
+				return false, true
+			}
+			if !evaluateOperator(base, ctxVal, resolved) {
+				return false, true
+			}
+		}
+	}
+	return true, true
+}
+
+// contextValue looks a condition key up in the request context. AWS
+// condition keys are not case-sensitive: "aws:securetransport" is
+// aws:SecureTransport. Looked up exactly, a Deny on it never matched.
+func contextValue(ctx map[string]string, key string) (string, bool) {
+	if v, ok := ctx[key]; ok {
+		return v, true
+	}
+	for k, v := range ctx {
+		if strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func negatedOperator(operator string) bool {
+	switch operator {
+	case "StringNotEquals", "StringNotLike", "NotIpAddress":
+		return true
+	}
+	return false
 }
 
 func knownOperator(operator string) bool {
@@ -231,6 +322,79 @@ func dateGreaterThan(actual string, expected []string) bool {
 }
 
 // SubstitutePolicyVariables replaces ${aws:*} variables in policy strings.
+// expandVars substitutes the policy variables in pattern from ctx. ok is false
+// when one has no value, when a value holds a wildcard character (this
+// matcher has no escape, so "*" from a user name would match anything), or
+// for the escape variables ${*}, ${?} and ${$}, which it cannot express.
+func expandVars(pattern string, ctx map[string]string) (string, bool) {
+	var b strings.Builder
+	for {
+		i := strings.Index(pattern, "${")
+		if i < 0 {
+			b.WriteString(pattern)
+			return b.String(), true
+		}
+		j := strings.IndexByte(pattern[i:], '}')
+		if j < 0 {
+			return "", false
+		}
+		name := pattern[i+2 : i+j]
+		v, present := ctx[name]
+		if !present || v == "" || strings.ContainsAny(v, "*?") {
+			return "", false
+		}
+		b.WriteString(pattern[:i])
+		b.WriteString(v)
+		pattern = pattern[i+j+1:]
+	}
+}
+
+// matchesAnyVars is matchesAny for patterns that may name policy variables.
+// known is false when a pattern that could decide the answer has a variable
+// that cannot be resolved.
+func matchesAnyVars(patterns []string, value string, ctx map[string]string) (matched, known bool) {
+	known = true
+	for _, p := range patterns {
+		if !strings.Contains(p, "${") {
+			if MatchWildcard(p, value) {
+				return true, true
+			}
+			continue
+		}
+		exp, ok := expandVars(p, ctx)
+		if !ok {
+			known = false
+			continue
+		}
+		if MatchWildcard(exp, value) {
+			return true, true
+		}
+	}
+	return false, known
+}
+
+// substituteValues resolves policy variables in condition values.
+func substituteValues(values []string, ctx map[string]string) ([]string, bool) {
+	var out []string
+	for i, v := range values {
+		if !strings.Contains(v, "${") {
+			continue
+		}
+		if out == nil {
+			out = append([]string(nil), values...)
+		}
+		exp, ok := expandVars(v, ctx)
+		if !ok {
+			return nil, false
+		}
+		out[i] = exp
+	}
+	if out == nil {
+		return values, true
+	}
+	return out, true
+}
+
 func SubstitutePolicyVariables(s string, ctx map[string]string) string {
 	result := s
 	for k, v := range ctx {

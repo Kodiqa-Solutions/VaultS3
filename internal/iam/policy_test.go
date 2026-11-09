@@ -91,7 +91,9 @@ func TestMatchWildcard(t *testing.T) {
 		{"s3:Get*", "s3:GetObject", true},
 		{"s3:Get*", "s3:PutObject", false},
 		{"arn:aws:s3:::bucket/*", "arn:aws:s3:::bucket/key", true},
-		{"arn:aws:s3:::bucket/*", "arn:aws:s3:::bucket", true},
+		// The bucket's objects, not the bucket itself (as on AWS): a grant
+		// on bucket/* used to reach bucket configuration.
+		{"arn:aws:s3:::bucket/*", "arn:aws:s3:::bucket", false},
 		{"arn:aws:s3:::bucket", "arn:aws:s3:::bucket", true},
 		{"arn:aws:s3:::bucket", "arn:aws:s3:::other", false},
 		// A '*' in the value (S3 keys may hold one) where the pattern has
@@ -197,9 +199,6 @@ func TestMatchWildcardAgreesWithARegexp(t *testing.T) {
 		}
 		re.WriteString("$")
 		want := regexp.MustCompile(re.String()).MatchString(value)
-		if base, ok := strings.CutSuffix(pattern, "/*"); ok && value == base {
-			want = true
-		}
 		if got := matchWildcard(pattern, value); got != want {
 			t.Fatalf("matchWildcard(%q, %q) = %v, the regexp says %v", pattern, value, got, want)
 		}

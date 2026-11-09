@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -33,6 +34,8 @@ type Authenticator struct {
 	basePath        string // reverse-proxy subpath the client signed but a path-stripping proxy removed (issue #36)
 	trustForwarded  bool   // honor the client-supplied X-Forwarded-Prefix when basePath is unset
 	external        *iam.ExternalAuth
+	// sigFails counts failed signatures per address and key.
+	sigFails sigThrottle
 }
 
 // SetExternalAuth attaches an external authorizer consulted on every non-admin
@@ -341,7 +344,50 @@ const maxClockSkew = 15 * time.Minute
 
 // Authenticate validates the Authorization header using AWS Signature V4.
 // Returns the identity of the caller. A refusal is an *authError.
+// Authenticate verifies a request's signature, with failed signatures
+// counted per client address and access key (see sigThrottle).
 func (a *Authenticator) Authenticate(r *http.Request) (*iam.Identity, error) {
+	key := requestAccessKey(r)
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(ip); err == nil {
+		ip = host
+	}
+	id, err := a.authenticate(r)
+	if key != "" {
+		var ae *authError
+		switch {
+		case err == nil:
+			a.sigFails.reset(ip, key)
+		case errors.As(err, &ae) && ae.code == "SignatureDoesNotMatch":
+			if d := a.sigFails.fail(ip, key); d > 0 {
+				select {
+				case <-time.After(d):
+				case <-r.Context().Done():
+				}
+			}
+		}
+	}
+	return id, err
+}
+
+// requestAccessKey is the access key a request names, from its Authorization
+// header or a presigned URL's credential, or "".
+// It reads the header exactly as the verifier does: counting the first of
+// two Credential= fields while the second was verified let every guess be
+// counted against a new made-up key.
+func requestAccessKey(r *http.Request) string {
+	cred := r.URL.Query().Get("X-Amz-Credential")
+	if h := r.Header.Get("Authorization"); h != "" {
+		cred = ""
+		if parts := strings.SplitN(h, " ", 2); len(parts) == 2 {
+			cred = parseAuthParams(parts[1])["Credential"]
+		}
+	}
+	key, _, _ := strings.Cut(cred, "/")
+	return key
+}
+
+func (a *Authenticator) authenticate(r *http.Request) (*iam.Identity, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		if r.URL.Query().Get("X-Amz-Signature") != "" {
@@ -674,6 +720,9 @@ func (a *Authenticator) AuthorizeWithContext(identity *iam.Identity, action, res
 	if _, ok := ctx["aws:username"]; !ok && identity.UserID != "" {
 		ctx["aws:username"] = identity.UserID
 	}
+	if _, ok := ctx["aws:userid"]; !ok && identity.UserID != "" {
+		ctx["aws:userid"] = identity.UserID
+	}
 	if identity.PolicyLoadFailed {
 		return fmt.Errorf("access denied: %s on %s (a policy attached to this identity could not be parsed)", action, resource)
 	}
@@ -684,7 +733,7 @@ func (a *Authenticator) AuthorizeWithContext(identity *iam.Identity, action, res
 	// An explicit Deny written by the operator is final. It is not put to the
 	// external authorizer even in authoritative mode, so turning that mode on
 	// cannot quietly reopen access a policy closed (issue #41).
-	if explicitDeny {
+	if explicitDeny || a.bucketPolicyDenies(identity, action, resource, ctx) {
 		return fmt.Errorf("access denied: %s on %s", action, resource)
 	}
 	if a.external == nil {
@@ -881,4 +930,23 @@ func hmacSHA256(key, data []byte) []byte {
 func (a *Authenticator) GetAccessKey() string {
 	ak, _ := a.adminPair()
 	return ak
+}
+
+// bucketPolicyDenies applies a bucket-policy Deny to a signed request, as an
+// explicit Deny: final, and never put to an external authorizer.
+func (a *Authenticator) bucketPolicyDenies(identity *iam.Identity, action, resource string, ctx map[string]string) bool {
+	if a.store == nil {
+		return false
+	}
+	rest, ok := strings.CutPrefix(resource, "arn:aws:s3:::")
+	if !ok || rest == "" || rest == "*" {
+		return false
+	}
+	bucket, key, _ := strings.Cut(rest, "/")
+	return a.store.BucketPolicyDenies(bucket, key, action, identity.UserID, ctx)
+}
+
+// BucketPolicyDenies is bucketPolicyDenies for callers outside this package.
+func (a *Authenticator) BucketPolicyDenies(identity *iam.Identity, action, resource string, ctx map[string]string) bool {
+	return a.bucketPolicyDenies(identity, action, resource, ctx)
 }

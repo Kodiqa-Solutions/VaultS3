@@ -258,6 +258,12 @@ func (h *BucketHandler) PutBucketPolicy(w http.ResponseWriter, r *http.Request, 
 		writeS3Error(w, "MalformedPolicy", "Policy is not valid JSON", http.StatusBadRequest)
 		return
 	}
+	// A policy that is JSON but not one this server can read was stored,
+	// and then none of its Deny statements applied.
+	if err := metadata.ValidateBucketPolicy(body); err != nil {
+		writeS3Error(w, "MalformedPolicy", "Policy has invalid elements: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	if err := h.store.PutBucketPolicy(bucket, body); err != nil {
 		slog.Error("internal error", "error", err)

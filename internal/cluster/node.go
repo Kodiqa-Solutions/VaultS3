@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -26,6 +27,12 @@ type Node struct {
 	// mux owns the Raft port and hands connections to the group they name. Nil
 	// in tests that inject an in-memory transport.
 	mux *TransportMux
+	// riMu and riCur share questions to the leader between read barriers.
+	riMu   sync.Mutex
+	riCur  *readIndexCall // the question running now
+	riNext *readIndexCall // the one to send after it, shared by its waiters
+	// askLeader replaces leaderAppliedIndex in a test.
+	askLeader func(timeout time.Duration) (uint64, error)
 }
 
 // TransportMux is the demultiplexer serving this node's Raft port, or nil when
@@ -220,11 +227,86 @@ func (n *Node) ReadBarrier(timeout time.Duration) error {
 	if n.IsLeader() {
 		return nil
 	}
-	idx, err := n.leaderAppliedIndex(timeout)
+	idx, err := n.leaderAppliedIndexSince(time.Now(), timeout)
 	if err != nil {
 		return err
 	}
 	return n.WaitForApply(idx, timeout)
+}
+
+// readIndexCall is one question to the leader for its applied index, which
+// barriers that arrive while it is running can share.
+type readIndexCall struct {
+	start time.Time
+	once  sync.Once
+	done  chan struct{}
+	idx   uint64
+	err   error
+}
+
+// leaderAppliedIndexSince asks the leader for its applied index with a
+// question sent no earlier than t0, so the answer covers every write the
+// leader had acknowledged by then. Under load, concurrent reads share
+// questions instead of sending one each: a question already running that
+// started at or after t0 is joined, and a reader that came after the running
+// one started waits for it to end and then shares the next one with every
+// other reader that came meanwhile. The leader answers at most two questions
+// per round trip from a node, however many reads are waiting.
+func (n *Node) leaderAppliedIndexSince(t0 time.Time, timeout time.Duration) (uint64, error) {
+	n.riMu.Lock()
+	cur := n.riCur
+	if cur == nil {
+		c := &readIndexCall{done: make(chan struct{})}
+		n.startReadIndexLocked(c)
+		n.riMu.Unlock()
+		return n.runReadIndex(c, timeout)
+	}
+	if !cur.start.Before(t0) {
+		n.riMu.Unlock()
+		<-cur.done
+		return cur.idx, cur.err
+	}
+	next := n.riNext
+	if next == nil {
+		next = &readIndexCall{done: make(chan struct{})}
+		n.riNext = next
+	}
+	n.riMu.Unlock()
+	<-cur.done
+	// The first waiter to get here sends it; it starts after every waiter's
+	// t0, since they all joined before the running one ended.
+	next.once.Do(func() {
+		n.riMu.Lock()
+		if n.riNext == next {
+			n.riNext = nil
+		}
+		n.startReadIndexLocked(next)
+		n.riMu.Unlock()
+		go func() { _, _ = n.runReadIndex(next, timeout) }()
+	})
+	<-next.done
+	return next.idx, next.err
+}
+
+// startReadIndexLocked makes c the running question. riMu is held.
+func (n *Node) startReadIndexLocked(c *readIndexCall) {
+	c.start = time.Now()
+	n.riCur = c
+}
+
+func (n *Node) runReadIndex(c *readIndexCall, timeout time.Duration) (uint64, error) {
+	ask := n.leaderAppliedIndex
+	if n.askLeader != nil {
+		ask = n.askLeader
+	}
+	c.idx, c.err = ask(timeout)
+	n.riMu.Lock()
+	if n.riCur == c {
+		n.riCur = nil
+	}
+	n.riMu.Unlock()
+	close(c.done)
+	return c.idx, c.err
 }
 
 // leaderAppliedIndex asks the leader for its current FSM applied index over the
@@ -268,8 +350,15 @@ func (n *Node) ReadIndexHandler() http.HandlerFunc {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		// A node that has lost the leadership answers from a log that may
+		// be behind the new leader's: a reader would then serve a stale
+		// object. The caller retries against the current leader.
+		if !n.IsLeader() {
+			http.Error(w, "not the leader", http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]uint64{"index": n.fsm.AppliedIndex()})
+		_ = json.NewEncoder(w).Encode(map[string]uint64{"index": n.fsm.AppliedIndex()})
 	}
 }
 

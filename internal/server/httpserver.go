@@ -45,6 +45,9 @@ func setIdleTimeout(cfg config.ServerConfig) {
 	idleTimeout = time.Duration(cfg.EffectiveIdleTimeoutSecs()) * time.Second
 }
 
+// maxHeaderBytes bounds a request's line and headers.
+const maxHeaderBytes = 256 << 10
+
 // newHTTPServer builds an http.Server with the limits above.
 //
 // ReadTimeout and WriteTimeout stay unset on purpose. They cover the whole
@@ -57,6 +60,11 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 		Handler:           boundBodyDrain(handler),
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
+		// Go's default is 1 MB of headers per request, held until the
+		// header timeout: a few hundred slow requests held hundreds of
+		// megabytes. S3 allows 8 KB of headers; this leaves ample room for
+		// long presigned URLs and metadata.
+		MaxHeaderBytes: maxHeaderBytes,
 	}
 }
 

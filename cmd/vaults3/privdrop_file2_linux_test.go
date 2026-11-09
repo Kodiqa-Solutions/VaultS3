@@ -145,3 +145,59 @@ func TestTheLogOpenDoesNotBlockOnAFIFO(t *testing.T) {
 		}
 	}
 }
+
+// Regression (5.0.14 security review): the walk of the metadata folder
+// (every start) followed a hard link to a root file planted in it, and gave
+// that file away. A file with more than one name is left as it is.
+func TestAHardLinkInAWalkedFolderIsNotGiven(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root")
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, "rootsecret")
+	_ = os.WriteFile(root, []byte("x"), 0o600)
+	meta := filepath.Join(base, "metadata")
+	_ = os.MkdirAll(meta, 0o755)
+	_ = os.WriteFile(filepath.Join(meta, "vaults3.db"), []byte("db"), 0o600)
+	if err := os.Link(root, filepath.Join(meta, "planted")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := takeOwnership(meta, ownTreeAlways, 99, 100, fileOwner); err != nil {
+		t.Fatal(err)
+	}
+	if u, _, _ := fileOwner(mustLstat(t, root)); u == 99 {
+		t.Error("a root file was given away through a hard link in the metadata folder")
+	}
+	if u, _, _ := fileOwner(mustLstat(t, filepath.Join(meta, "vaults3.db"))); u != 99 {
+		t.Error("the folder's own file was not given")
+	}
+}
+
+// Regression (5.0.14 review): the access log path skipped the system-folder
+// check, so logging.file_path naming the server's binary or /etc/shadow gave
+// that file to the PUID user.
+func TestALogFileInASystemFolderIsNotGivenAway(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root")
+	}
+	p := "/usr/local/bin/vaults3-logtest"
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(p) }()
+	_, err := takeOwnership(p, ownFile, 4242, 4242, fileOwner)
+	if err == nil {
+		t.Error("a log path in /usr/local/bin was accepted")
+	}
+	if u, _, _ := fileOwner(mustLstat(t, p)); u == 4242 {
+		t.Fatal("a file in /usr/local/bin was given to the PUID user")
+	}
+	// Through a link to a system folder.
+	link := filepath.Join(t.TempDir(), "logs")
+	if err := os.Symlink("/etc", link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := takeOwnership(filepath.Join(link, "shadow"), ownFile, 4242, 4242, fileOwner); err == nil {
+		t.Error("a log path through a link into /etc was accepted")
+	}
+}
