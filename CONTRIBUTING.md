@@ -9,7 +9,7 @@ VaultS3 is a Go server with a React (Vite) dashboard, shipped as a single binary
 
 **Prerequisites**
 
-- Go **1.25+**
+- Go **1.26+**
 - Node.js **20.19+** (the dashboard builds with Vite 8 / Rolldown)
 - `make`
 

@@ -87,7 +87,7 @@ docker build -t vaults3 .
 docker run -p 9000:9000 -v vaults3-data:/data -v vaults3-meta:/metadata vaults3
 ```
 
-Images are automatically published to [Docker Hub](https://hub.docker.com/r/eniz1806/vaults3) on every push to `main`.
+Images are automatically published to [Docker Hub](https://hub.docker.com/r/eniz1806/vaults3) on every push to `main`, and from 5.0.12 the same images, with the same tags, to GitHub Container Registry as `ghcr.io/kodiqa-solutions/vaults3`, for networks that pull only from GHCR or to avoid Docker Hub's pull limits.
 
 ### Storage layout in production
 
