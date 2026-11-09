@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
@@ -25,7 +27,40 @@ type Manager struct {
 	// beforeRestoreLink runs just before a restore puts the data in place,
 	// so a test can land a PUT there.
 	beforeRestoreLink func()
+	// beforeColdRemove runs just before a move to cold removes the hot file.
+	beforeColdRemove func()
+
+	// coldMovesOff, when set, says why objects are not moved to the cold
+	// tier on this server. Restores still run.
+	coldMovesOff string
+
+	// keyLocks serializes moves and restores of one key. Two of them
+	// overlapping (the scan and a manual move, or a RestoreObject arriving
+	// during a move) each judged the files by the state before the other's
+	// change, and between them removed both copies.
+	keyLocks [64]sync.Mutex
 }
+
+func (m *Manager) lockKey(bucket, key string) func() {
+	h := fnv.New32a()
+	h.Write([]byte(bucket))
+	h.Write([]byte{0})
+	h.Write([]byte(key))
+	l := &m.keyLocks[h.Sum32()%uint32(len(m.keyLocks))]
+	l.Lock()
+	return l.Unlock
+}
+
+// ErrColdMovesUnsupported refuses a move to cold on a server whose storage
+// layout the move cannot handle.
+var ErrColdMovesUnsupported = errors.New("moving objects to the cold tier is not supported with this storage configuration")
+
+// DisableColdMoves stops the scan and refuses manual moves to cold, for a
+// storage layout in which an object is not one file at its object path:
+// erasure coding keeps shards, and packing keeps small objects inside volume
+// files, so the move would find nothing to copy or copy stale bytes. Objects
+// already cold can still be restored.
+func (m *Manager) DisableColdMoves(reason string) { m.coldMovesOff = reason }
 
 func NewManager(store metadata.StoreAPI, hotEngine, coldEngine storage.Engine, migrateAfterDays, scanIntervalSecs int) *Manager {
 	return &Manager{
@@ -38,6 +73,10 @@ func NewManager(store metadata.StoreAPI, hotEngine, coldEngine storage.Engine, m
 }
 
 func (m *Manager) Run(ctx context.Context) {
+	if m.coldMovesOff != "" {
+		slog.Warn("tiering does not move objects to the cold tier", "reason", m.coldMovesOff)
+		return
+	}
 	ticker := time.NewTicker(time.Duration(m.scanIntervalSecs) * time.Second)
 	defer ticker.Stop()
 
@@ -59,7 +98,7 @@ func (m *Manager) scan() {
 	// transaction), and bbolt deadlocks if a write txn is opened while the read
 	// txn from IterateAllObjects is still in progress on the same goroutine.
 	type objRef struct{ bucket, key string }
-	var candidates []objRef
+	var candidates, stale []objRef
 
 	m.store.IterateAllObjects(func(bucket, key string, meta metadata.ObjectMeta) bool {
 		if meta.DeleteMarker {
@@ -68,6 +107,10 @@ func (m *Manager) scan() {
 		tier := meta.Tier
 		if tier == "" {
 			tier = "hot"
+		}
+		if tier == "cold" && meta.VersionID == "" {
+			stale = append(stale, objRef{bucket, key}) // checked below
+			return true
 		}
 		if tier != "hot" || meta.VersionID != "" {
 			return true
@@ -84,6 +127,13 @@ func (m *Manager) scan() {
 		candidates = append(candidates, objRef{bucket: bucket, key: key})
 		return true
 	})
+
+	// A record still marked cold whose data a rewrite put back in the hot
+	// tier (an engine-level rewrite of a cold object writes hot and drops the
+	// cold copy) would never be moved again. It is hot.
+	for _, s := range stale {
+		m.repairColdRecord(s.bucket, s.key)
+	}
 
 	migrated := 0
 	for _, c := range candidates {
@@ -113,6 +163,8 @@ func sameObject(snap, cur *metadata.ObjectMeta) bool {
 var errChanged = errors.New("object changed during tier migration, left in place")
 
 func (m *Manager) migrateToCol(bucket, key string) error {
+	defer m.lockKey(bucket, key)()
+	defer m.invalidateSizes(bucket)
 	snap, err := m.store.GetObjectMeta(bucket, key)
 	if err != nil {
 		return err
@@ -132,6 +184,12 @@ func (m *Manager) migrateToCol(bucket, key string) error {
 		return err
 	}
 	defer reader.Close()
+	// The file being copied, to tell it apart from one a PUT renames into
+	// place while the copy runs.
+	var copied os.FileInfo
+	if f, ok := reader.(*os.File); ok {
+		copied, _ = f.Stat()
+	}
 
 	m.coldEngine.CreateBucketDir(bucket)
 	if _, _, err := m.coldEngine.PutObject(bucket, key, reader, size); err != nil {
@@ -161,14 +219,125 @@ func (m *Manager) migrateToCol(bucket, key string) error {
 		return errChanged
 	}
 
-	// Reads now go to the cold copy. A PUT landing between the check above and
-	// this delete can still lose its data, because the engine cannot delete
-	// conditionally. Closing that needs a per-key lock shared with the S3
-	// write path.
-	if err := m.hotEngine.DeleteObject(bucket, key); err != nil {
-		slog.Warn("tiering could not remove the hot copy after moving it", "bucket", bucket, "key", key, "error", err)
+	// Reads now go to the cold copy. The hot file is removed only while it is
+	// still the one that was copied: a PUT renames its new file into place, so
+	// a different file there is newer data, which stays, and the record goes
+	// back to hot. Removing whatever was at the path deleted a PUT that landed
+	// in this window.
+	//
+	// The file is first moved aside, atomically, and only then compared, so a
+	// PUT cannot land between the comparison and the removal. A file that is
+	// not the copied one is put back, unless a newer one has appeared since.
+	hotPath := m.hotEngine.ObjectPath(bucket, key)
+	if m.beforeColdRemove != nil {
+		m.beforeColdRemove()
 	}
-	return nil
+	aside := filepath.Join(filepath.Dir(hotPath), ".vaults3-tmp-tier-"+filepath.Base(hotPath))
+	// Only a regular file is this key's copy. A folder there belongs to other
+	// keys ("a" deleted and "a/x" written meanwhile): moving it aside, it
+	// could not be linked back, and those objects were lost.
+	if fi, lerr := os.Lstat(hotPath); lerr == nil && !fi.Mode().IsRegular() {
+		m.revertToHot(bucket, key)
+		return errChanged
+	}
+	if err := os.Rename(hotPath, aside); err != nil {
+		// No hot file to remove. If the record still names the object that
+		// was copied, the copy in the cold tier is now its only copy: keep it,
+		// and the record says cold. Dropping it here lost the object when
+		// something else had already removed the hot file.
+		if cur, gerr := m.store.GetObjectMeta(bucket, key); gerr == nil && cur != nil && sameObject(snap, cur) && os.IsNotExist(err) {
+			return nil
+		}
+		m.revertToHot(bucket, key)
+		return errChanged
+	}
+	moved, err := os.Lstat(aside)
+	if err == nil && copied != nil && os.SameFile(copied, moved) {
+		if err := os.Remove(aside); err != nil {
+			slog.Warn("tiering could not remove the hot copy after moving it", "bucket", bucket, "key", key, "error", err)
+		}
+		// As the engine's own delete does: folders the key leaves empty go,
+		// or a later object named after one ("a" once "a/b" moved) cannot be
+		// written.
+		removeEmptyParents(filepath.Dir(hotPath), filepath.Dir(m.hotEngine.ObjectPath(bucket, "x")))
+		return nil
+	}
+	// What was moved aside is not the copied file. Anything but a regular
+	// file (the path became another key's folder after the check above) goes
+	// back whole, by rename, which a folder allows and a link does not.
+	if err == nil && !moved.Mode().IsRegular() {
+		if rerr := os.Rename(aside, hotPath); rerr != nil {
+			slog.Error("tiering could not put back a folder it moved aside", "bucket", bucket, "path", hotPath, "error", rerr)
+			return rerr
+		}
+		m.revertToHot(bucket, key)
+		return errChanged
+	}
+	// A PUT replaced the file while it was copied: its data is the object.
+	if lerr := os.Link(aside, hotPath); lerr != nil && !os.IsExist(lerr) {
+		slog.Error("tiering could not put back a file a PUT wrote during the move", "bucket", bucket, "key", key, "error", lerr)
+		return lerr
+	}
+	if err := os.Remove(aside); err != nil {
+		slog.Warn("tiering could not remove the name it moved a file aside to", "path", aside, "error", err)
+	}
+	m.revertToHot(bucket, key)
+	return errChanged
+}
+
+// repairColdRecord marks a cold record hot when only the hot tier holds its
+// data.
+func (m *Manager) repairColdRecord(bucket, key string) {
+	defer m.lockKey(bucket, key)()
+	cur, err := m.store.GetObjectMeta(bucket, key)
+	if err != nil || cur == nil || cur.Tier != "cold" || cur.VersionID != "" {
+		return
+	}
+	hp := m.hotEngine.ObjectPath(bucket, key)
+	if fi, err := os.Lstat(hp); err != nil || !fi.Mode().IsRegular() {
+		return
+	}
+	if err := m.store.SetObjectTier(bucket, key, "hot"); err == nil {
+		slog.Info("tiering: a record marked cold had its data in the hot tier, marked hot", "bucket", bucket, "key", key)
+		m.dropColdCopy(bucket, key)
+	}
+}
+
+// invalidateSizes has both tiers measure the bucket again: a move renames,
+// links and removes files directly, which the engines' cached bucket sizes do
+// not see.
+func (m *Manager) invalidateSizes(bucket string) {
+	for _, e := range []storage.Engine{m.hotEngine, m.coldEngine} {
+		if i, ok := e.(interface{ InvalidateBucketSize(string) }); ok {
+			i.InvalidateBucketSize(bucket)
+		}
+	}
+}
+
+// removeEmptyParents removes dir and its parents while they are empty, up to
+// but not including stop (the bucket directory).
+func removeEmptyParents(dir, stop string) {
+	for dir != stop && strings.HasPrefix(dir, stop+string(filepath.Separator)) {
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
+}
+
+// revertToHot undoes a move whose hot file turned out to be newer data: the
+// record goes back to hot, where that data is, and the cold copy goes.
+func (m *Manager) revertToHot(bucket, key string) {
+	if c, err := m.store.GetObjectMeta(bucket, key); err == nil && c != nil && c.Tier == "cold" {
+		if err := m.store.SetObjectTier(bucket, key, "hot"); err != nil {
+			// The cold copy is kept: the record still says cold, and the
+			// scan's repair (repairColdRecord) marks it hot and drops the
+			// cold copy, since reads take the hot file first.
+			slog.Error("tiering could not mark an object hot again, keeping its cold copy", "bucket", bucket, "key", key, "error", err)
+			return
+		}
+	}
+	m.dropColdCopy(bucket, key)
 }
 
 func (m *Manager) dropColdCopy(bucket, key string) {
@@ -191,6 +360,8 @@ var ErrNothingToRestore = errors.New("the object has no data in the cold tier to
 // which copying the old cold bytes over it would destroy. The cold copy is
 // then stale and is dropped.
 func (m *Manager) MigrateToHot(bucket, key string) error {
+	defer m.lockKey(bucket, key)()
+	defer m.invalidateSizes(bucket)
 	meta, err := m.store.GetObjectMeta(bucket, key)
 	if err != nil || meta == nil || meta.DeleteMarker {
 		return ErrNothingToRestore
@@ -417,17 +588,18 @@ func (m *Manager) Status() map[string]interface{} {
 // ManualMigrate allows manual migration of a specific object.
 func (m *Manager) ManualMigrate(bucket, key, direction string) error {
 	if direction == "cold" {
-		return ErrColdWritesDisabled
+		if m.coldMovesOff != "" {
+			return fmt.Errorf("%w: %s", ErrColdMovesUnsupported, m.coldMovesOff)
+		}
+		return m.migrateToCol(bucket, key)
 	}
 	return m.MigrateToHot(bucket, key)
 }
 
-// ErrColdWritesDisabled refuses moving an object to the cold tier. Neither the
-// S3 API nor the dashboard reads from it, and the files are moved below the
-// encryption and compression layers, so every object moved there became
-// unreadable (NoSuchKey) until it was moved back. Until reads go through the
-// tier, objects are only moved back: MigrateToHot and RestoreObject.
-var ErrColdWritesDisabled = errors.New("moving objects to the cold tier is disabled in this version: objects there cannot be read; move existing ones back with RestoreObject or the hot direction")
+// ColdObjectPath is where key's file is in the cold tier.
+func (m *Manager) ColdObjectPath(bucket, key string) string {
+	return m.coldEngine.ObjectPath(bucket, key)
+}
 
 // ColdReader returns a reader for a cold-tier object without promoting it.
 func (m *Manager) ColdReader(bucket, key string) (io.ReadCloser, int64, error) {

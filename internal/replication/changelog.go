@@ -50,6 +50,40 @@ func (cl *ChangeLog) Record(bucket, key, eventType, etag string, size int64, vc 
 	return cl.store.AppendChangeLog(data)
 }
 
+// RecordVersion appends the creation of a version or delete marker in a bucket
+// with versioning. Versions are never rewritten, so they need no vector clock:
+// a site that already holds the version ID has the change.
+func (cl *ChangeLog) RecordVersion(meta metadata.ObjectMeta) error {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+
+	// Not "delete": a site older than 5.0.12 deletes the object outright on
+	// a "delete", where this is only a marker. It treats any other type as a
+	// put and fetches the key, whose current version is the marker, gets 404
+	// and skips the change.
+	eventType := "put"
+	if meta.DeleteMarker {
+		eventType = "delete-marker"
+	}
+	entry := ChangeEntry{
+		Bucket:       meta.Bucket,
+		Key:          meta.Key,
+		EventType:    eventType,
+		SiteID:       cl.siteID,
+		ETag:         meta.ETag,
+		Size:         meta.Size,
+		Timestamp:    NowNanos(),
+		VersionID:    meta.VersionID,
+		DeleteMarker: meta.DeleteMarker,
+		LastModified: meta.LastModified,
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("marshal change entry: %w", err)
+	}
+	return cl.store.AppendChangeLog(data)
+}
+
 // ChangesSince returns all change entries with a sequence number greater than `sinceSeq`.
 // Returns the entries and the latest sequence number seen.
 func (cl *ChangeLog) ChangesSince(sinceSeq uint64, limit int) ([]ChangeEntry, uint64, error) {

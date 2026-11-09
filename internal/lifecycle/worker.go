@@ -2,9 +2,6 @@ package lifecycle
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -341,7 +338,7 @@ func (w *Worker) expireCurrent(snap metadata.ObjectMeta, versioning string, now 
 
 	switch versioning {
 	case "Enabled", "Suspended":
-		markerID := newVersionID()
+		markerID := metadata.NewVersionID(cur.VersionID)
 		var demote *metadata.ObjectMeta
 		if versioning == "Suspended" && (cur.VersionID == "" || cur.VersionID == "null") {
 			// The null version is replaced, data included.
@@ -454,14 +451,6 @@ func (w *Worker) expireVersion(v metadata.ObjectMeta, now int64) bool {
 	}
 	w.reapElsewhere(v.Bucket, v.Key, v.VersionID)
 	return true
-}
-
-// newVersionID matches the S3 handler's version ids: a nanosecond timestamp then
-// random bytes, so ids sort by creation time.
-func newVersionID() string {
-	b := make([]byte, 4)
-	rand.Read(b)
-	return fmt.Sprintf("%016x%s", time.Now().UnixNano(), hex.EncodeToString(b))
 }
 
 func (w *Worker) pruneAndClean() {

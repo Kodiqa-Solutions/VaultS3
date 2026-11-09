@@ -8,7 +8,7 @@ import (
 type ChangeEntry struct {
 	Bucket      string      `json:"bucket"`
 	Key         string      `json:"key"`
-	EventType   string      `json:"event_type"` // "put" or "delete"
+	EventType   string      `json:"event_type"` // "put" or "delete"; "delete-marker" for a versioned delete
 	SiteID      string      `json:"site_id"`
 	VectorClock VectorClock `json:"vector_clock"`
 	ETag        string      `json:"etag,omitempty"`
@@ -18,6 +18,18 @@ type ChangeEntry struct {
 	// when the log is read for a sync, so the puller can resume right after
 	// the last change it applied. A peer older than this field sends 0.
 	Seq uint64 `json:"seq,omitempty"`
+
+	// VersionID is set for a change in a bucket with versioning: the version
+	// a put created, or the delete marker a delete created, which the other
+	// sites store under the same ID. LastModified (unix seconds) is when it
+	// was created there. A site older than 5.0.12 sends neither. It ignores
+	// these fields on a change it receives, and applies it as a plain write
+	// of the key's current object in a bucket without versioning (a delete
+	// marker comes as event type "delete-marker", which it fetches as a put,
+	// finds missing and skips); in a bucket with versioning it skips it.
+	VersionID    string `json:"version_id,omitempty"`
+	DeleteMarker bool   `json:"delete_marker,omitempty"`
+	LastModified int64  `json:"last_modified,omitempty"`
 }
 
 // ConflictStrategy names the available conflict resolution strategies.

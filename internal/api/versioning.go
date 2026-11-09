@@ -215,7 +215,7 @@ func (h *APIHandler) handleRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newVersionID := genVersionID()
+	newVersionID := h.nextVersionID(req.Bucket, req.Key)
 	written, etag, err := h.engine.PutObjectVersion(req.Bucket, req.Key, newVersionID, reader, size)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not write the new version: "+err.Error())

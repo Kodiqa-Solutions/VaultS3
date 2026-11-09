@@ -63,6 +63,37 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.12
+
+- **Tiering moves objects to the cold tier again**, and they are read from
+  there. With `tiering.enabled: true`, objects not read or written for
+  `migrate_after_days` start moving to `cold_data_dir` at the first scan after
+  the upgrade. Objects 5.0.10 or earlier moved there, which answered NoSuchKey,
+  are read again. Check that `cold_data_dir` is writable by the server's user
+  (uid 1000 in the Docker image): a root-owned volume makes every move fail.
+  On a cluster, and with erasure coding or small-file packing, moves stay off.
+- **Rolling back to 5.0.11** is safe for data, but 5.0.11 does not read the
+  cold tier: restore every cold object first (`aws s3api restore-object`, or
+  the tiering API's `hot` direction), or they answer NoSuchKey until you do.
+- **A Snowball archive in signed chunks is extracted as it arrives**, no
+  longer staged in `.snowball/` first. A tampered chunk ends the import with
+  403 and keeps the entries before it (only bytes the client signed are
+  stored), where a staged archive stored none. One signed with a single
+  SHA-256 or with a trailing checksum is still staged.
+- **Active-active replication starts replicating buckets with versioning**,
+  for changes made after both sites run 5.0.12 (earlier changes were skipped
+  and are not sent again). Enable versioning on the bucket on every site;
+  copy existing versions across once by hand if the sites must match. The
+  peer key needs `s3:GetObjectVersion` on the other site as well as
+  `s3:GetObject` (an admin key has both): a version it cannot read holds
+  the sync until it can.
+- **With active-active replication (not on a Raft cluster), of two
+  concurrent uploads to a key with versioning, the one that started later is
+  current**, even when it
+  finishes first, so every site agrees. Before, the last to finish was
+  current, which is still the rule without active-active. Both are kept, as
+  on S3.
+
 ## Upgrading to 5.0.11
 
 Nothing to migrate, and rolling back to 5.0.10 is safe. What behaves

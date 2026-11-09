@@ -50,6 +50,9 @@ type ObjectHandler struct {
 	// coldRestorer moves an object back from the cold tier (RestoreObject),
 	// or nil when tiering is not configured.
 	coldRestorer func(bucket, key string) error
+	// coldPath is where an object's file is in the cold tier, or nil when
+	// tiering is not configured.
+	coldPath func(bucket, key string) string
 
 	// auth authorizes individual entries of a multi-object request, which the
 	// router cannot do because it decides before the body is parsed.
@@ -434,9 +437,19 @@ func (h *ObjectHandler) replacesObject(bucket, key string) (bool, int64) {
 		if meta.VersionID == "null" {
 			return true, regularFileSize(h.engine.ObjectPath(bucket, ".vs/"+key+"/null"))
 		}
-		return true, regularFileSize(h.engine.ObjectPath(bucket, key))
+		return true, h.plainFileSize(bucket, key)
 	}
-	return true, regularFileSize(h.engine.ObjectPath(bucket, key))
+	return true, h.plainFileSize(bucket, key)
+}
+
+// plainFileSize is the size on disk of key's file, in the hot tier or, when
+// it was moved there, the cold one. A write drops the cold copy, so its size
+// is given back as the hot file's would be.
+func (h *ObjectHandler) plainFileSize(bucket, key string) int64 {
+	if n := regularFileSize(h.engine.ObjectPath(bucket, key)); n > 0 || h.coldPath == nil {
+		return n
+	}
+	return regularFileSize(h.coldPath(bucket, key))
 }
 
 // regularFileSize is the size on disk of a regular file at path, or 0. A
@@ -447,6 +460,16 @@ func regularFileSize(path string) int64 {
 		return fi.Size()
 	}
 	return 0
+}
+
+// nextVersionID is the ID of a new version of key, above its current one
+// (see metadata.NewVersionID).
+func (h *ObjectHandler) nextVersionID(bucket, key string) string {
+	cur := ""
+	if m, err := h.store.GetObjectMeta(bucket, key); err == nil && m != nil {
+		cur = m.VersionID
+	}
+	return metadata.NewVersionID(cur)
 }
 
 // generateVersionID creates a unique version ID using timestamp + random bytes.
@@ -1000,7 +1023,7 @@ func (h *ObjectHandler) deleteOneObject(bucket, key, versionID, versioning strin
 	}
 	switch versioning {
 	case "Enabled":
-		return h.writeDeleteMarker(bucket, key, generateVersionID())
+		return h.writeDeleteMarker(bucket, key, h.nextVersionID(bucket, key))
 	case "Suspended":
 		// Suspended versioning replaces the null version with a null delete
 		// marker, so the previous null version's data does go. That destroys it,

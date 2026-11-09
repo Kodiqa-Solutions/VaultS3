@@ -7,7 +7,6 @@
 package snapshot
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -249,7 +248,7 @@ func (m *Manager) hideBehindDeleteMarker(bucket string, o metadata.ObjectMeta) e
 		return fmt.Errorf("demote current version: %w", err)
 	}
 	dm := metadata.ObjectMeta{
-		Bucket: bucket, Key: o.Key, VersionID: newVersionID(),
+		Bucket: bucket, Key: o.Key, VersionID: metadata.NewVersionID(o.VersionID),
 		DeleteMarker: true, IsLatest: true, LastModified: time.Now().UTC().Unix(),
 	}
 	if err := m.store.PutObjectVersion(dm); err != nil {
@@ -259,14 +258,6 @@ func (m *Manager) hideBehindDeleteMarker(bucket string, o metadata.ObjectMeta) e
 		return fmt.Errorf("write delete marker: %w", err)
 	}
 	return nil
-}
-
-// newVersionID produces a sortable, unique version id in the format the S3
-// layer uses: nanosecond timestamp then a random suffix.
-func newVersionID() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%016x%s", time.Now().UnixNano(), hex.EncodeToString(b))
 }
 
 func snapshotID(bucket string, tsNanos int64, msg string) string {

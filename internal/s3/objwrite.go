@@ -123,7 +123,7 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 	var err error
 	switch versioning {
 	case "Enabled":
-		versionID = generateVersionID()
+		versionID = h.nextVersionID(o.bucket, o.key)
 		written, etag, err = h.engine.PutObjectVersion(o.bucket, o.key, versionID, o.body, o.size)
 	case "Suspended":
 		versionID = nullVersionID

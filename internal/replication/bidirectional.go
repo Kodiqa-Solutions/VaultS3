@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -257,8 +258,14 @@ func (w *BiDirectionalWorker) applyRemoteChange(ctx context.Context, peer config
 		slog.Warn("bidirectional: skipping a change to a key this server cannot store", "bucket", change.Bucket, "key", change.Key, "reason", msg)
 		return nil
 	}
-	if v, _ := w.store.GetBucketVersioning(change.Bucket); v != "" {
-		slog.Warn("bidirectional: skipping a change to a bucket with versioning, which active-active does not replicate yet",
+	v, _ := w.store.GetBucketVersioning(change.Bucket)
+	if change.VersionID != "" {
+		return w.applyRemoteVersion(ctx, peer, change, v)
+	}
+	if v != "" {
+		// A plain change comes from a site where the bucket has no
+		// versioning. Writing it here would replace a version in place.
+		slog.Warn("bidirectional: skipping a change from a site where the bucket has no versioning, while it has versioning here",
 			"bucket", change.Bucket, "key", change.Key, "versioning", v)
 		return nil
 	}
@@ -343,30 +350,14 @@ func (w *BiDirectionalWorker) applyRemoteChange(ctx context.Context, peer config
 	}
 
 	// Fetch the actual object data from the remote peer
-	objURL, err := peerURL(peer.URL, change.Bucket, change.Key)
+	getResp, err := w.fetchObject(ctx, peer, change.Bucket, change.Key, "")
 	if err != nil {
 		return err
 	}
-	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, objURL, nil)
-	if err != nil {
-		return fmt.Errorf("create GET request: %w", err)
-	}
-	getReq.Header.Set("X-VaultS3-Replication", "active-active")
-	getReq.Header.Set("X-Amz-Content-Sha256", emptyPayloadSHA256)
-	signV4(getReq, peer.AccessKey, peer.SecretKey, "us-east-1")
-
-	getResp, err := w.client.Do(getReq)
-	if err != nil {
-		return fmt.Errorf("GET object: %w", err)
-	}
-	defer getResp.Body.Close()
-
-	if getResp.StatusCode == http.StatusNotFound {
+	if getResp == nil {
 		return nil // object was deleted between sync and fetch
 	}
-	if getResp.StatusCode >= 400 {
-		return fmt.Errorf("GET returned HTTP %d", getResp.StatusCode)
-	}
+	defer func() { _ = getResp.Body.Close() }()
 
 	// Ensure bucket exists locally
 	if !w.store.BucketExists(change.Bucket) {
@@ -380,6 +371,9 @@ func (w *BiDirectionalWorker) applyRemoteChange(ctx context.Context, peer config
 	if err != nil {
 		return fmt.Errorf("put object locally: %w", err)
 	}
+	if getResp.ContentLength >= 0 && written != getResp.ContentLength {
+		return fmt.Errorf("fetched %d of %d bytes", written, getResp.ContentLength)
+	}
 
 	// Merge vector clocks and store metadata
 	mergedVC := change.VectorClock.Clone()
@@ -391,12 +385,12 @@ func (w *BiDirectionalWorker) applyRemoteChange(ctx context.Context, peer config
 	meta := metadata.ObjectMeta{
 		Bucket:       change.Bucket,
 		Key:          change.Key,
-		ContentType:  "", // will be detected by engine
 		ETag:         etag,
 		Size:         written,
 		LastModified: time.Now().Unix(),
 		VectorClock:  mergedVC.Bytes(),
 	}
+	headersToMeta(getResp.Header, &meta, false)
 	// The data is on disk but nothing lists it until this succeeds, so a
 	// failure here is a failed apply and is retried, not a success.
 	if err := w.store.PutObjectMeta(meta); err != nil {
@@ -404,6 +398,209 @@ func (w *BiDirectionalWorker) applyRemoteChange(ctx context.Context, peer config
 	}
 
 	return nil
+}
+
+// fetchObject GETs an object, or one version of it, from a peer. A nil
+// response with no error means the peer no longer has it.
+func (w *BiDirectionalWorker) fetchObject(ctx context.Context, peer config.ReplicationPeer, bucket, key, versionID string) (*http.Response, error) {
+	objURL, err := peerURL(peer.URL, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	if versionID != "" {
+		objURL += "?versionId=" + url.QueryEscape(versionID)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create GET request: %w", err)
+	}
+	req.Header.Set("X-VaultS3-Replication", "active-active")
+	req.Header.Set("X-Amz-Content-Sha256", emptyPayloadSHA256)
+	// The stored bytes, as they are. Without this the client asks for gzip
+	// and decodes the answer, which turned an object stored with
+	// Content-Encoding: gzip into its decompressed bytes on the other site.
+	req.Header.Set("Accept-Encoding", "identity")
+	signV4(req, peer.AccessKey, peer.SecretKey, "us-east-1")
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET object: %w", err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		_ = resp.Body.Close()
+		return nil, nil
+	}
+	if resp.StatusCode >= 400 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("GET returned HTTP %d", resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// headersToMeta copies an object's metadata from the peer's GET answer, so
+// the copy here is served with the same headers. withLock also takes its
+// object lock, for a version (a plain copy keeps this site's own lock rules).
+func headersToMeta(h http.Header, m *metadata.ObjectMeta, withLock bool) {
+	m.ContentType = h.Get("Content-Type")
+	if m.ContentType == "" {
+		m.ContentType = "application/octet-stream"
+	}
+	m.ContentEncoding = h.Get("Content-Encoding")
+	m.ContentDisposition = h.Get("Content-Disposition")
+	m.CacheControl = h.Get("Cache-Control")
+	m.ContentLanguage = h.Get("Content-Language")
+	for name, vals := range h {
+		if len(vals) == 0 {
+			continue
+		}
+		if k, ok := strings.CutPrefix(strings.ToLower(name), "x-amz-meta-"); ok && k != "" {
+			if m.UserMetadata == nil {
+				m.UserMetadata = map[string]string{}
+			}
+			m.UserMetadata[k] = vals[0]
+		}
+	}
+	if !withLock {
+		return
+	}
+	if mode := h.Get("X-Amz-Object-Lock-Mode"); mode == "GOVERNANCE" || mode == "COMPLIANCE" {
+		if until, err := time.Parse(time.RFC3339, h.Get("X-Amz-Object-Lock-Retain-Until-Date")); err == nil {
+			m.RetentionMode = mode
+			m.RetentionUntil = until.Unix()
+		}
+	}
+	m.LegalHold = strings.EqualFold(h.Get("X-Amz-Object-Lock-Legal-Hold"), "ON")
+}
+
+// applyRemoteVersion stores a version or delete marker another site created,
+// under the same version ID, in a bucket with versioning.
+//
+// Versions are never rewritten, so there is nothing to resolve: a site that
+// already has the ID has the change, which makes applying it again harmless.
+// Which version is current does not depend on the order changes arrive in:
+// the highest ID is current on every site. IDs start with their creation
+// time, and a local write takes an ID above the key's current version
+// (metadata.NewVersionID), so it is current everywhere, even on a site whose
+// clock runs behind.
+//
+// Versions are added even to a key under object lock, as a local write may:
+// a new version replaces nothing.
+func (w *BiDirectionalWorker) applyRemoteVersion(ctx context.Context, peer config.ReplicationPeer, change ChangeEntry, versioning string) error {
+	if change.VersionID == "null" || !validVersionID(change.VersionID) {
+		slog.Warn("bidirectional: skipping a change with a version ID this server does not use",
+			"bucket", change.Bucket, "key", change.Key, "version", change.VersionID)
+		return nil
+	}
+	// Every new version takes an ID above the key's current one, so a
+	// version dated far ahead would push every later ID there with it. A
+	// day covers any clock that is merely wrong.
+	if ts, ok := metadata.VersionIDTime(change.VersionID); !ok || ts > time.Now().Add(24*time.Hour).UnixNano() {
+		slog.Warn("bidirectional: skipping a version whose ID is not a time this server could have made, or is dated more than a day ahead; check the sending site's clock",
+			"bucket", change.Bucket, "key", change.Key, "version", change.VersionID)
+		return nil
+	}
+	if versioning != "Enabled" {
+		slog.Warn("bidirectional: skipping a versioned change to a bucket without versioning enabled here; enable versioning on every site",
+			"bucket", change.Bucket, "key", change.Key, "versioning", versioning)
+		return nil
+	}
+	if existing, err := w.store.GetObjectVersion(change.Bucket, change.Key, change.VersionID); err == nil && existing != nil {
+		return nil
+	}
+
+	meta := metadata.ObjectMeta{
+		Bucket:       change.Bucket,
+		Key:          change.Key,
+		VersionID:    change.VersionID,
+		DeleteMarker: change.DeleteMarker,
+		LastModified: change.LastModified,
+	}
+	if meta.LastModified == 0 {
+		meta.LastModified = time.Now().Unix()
+	}
+	if !change.DeleteMarker {
+		resp, err := w.fetchObject(ctx, peer, change.Bucket, change.Key, change.VersionID)
+		if err != nil {
+			return err
+		}
+		if resp == nil {
+			return nil // the version was deleted there since
+		}
+		defer func() { _ = resp.Body.Close() }()
+		written, etag, err := w.engine.PutObjectVersion(change.Bucket, change.Key, change.VersionID, resp.Body, resp.ContentLength)
+		if err != nil {
+			return fmt.Errorf("put version locally: %w", err)
+		}
+		if (resp.ContentLength >= 0 && written != resp.ContentLength) || (change.Size > 0 && written != change.Size) {
+			if derr := w.engine.DeleteObjectVersion(change.Bucket, change.Key, change.VersionID); derr != nil {
+				slog.Warn("bidirectional: could not remove a short version's data", "bucket", change.Bucket, "key", change.Key, "version", change.VersionID, "error", derr)
+			}
+			return fmt.Errorf("fetched %d bytes of a %d byte version", written, change.Size)
+		}
+		meta.Size = written
+		// The ETag the version has on its own site, which for an object
+		// uploaded in parts is not the digest of its bytes.
+		meta.ETag = change.ETag
+		if meta.ETag == "" {
+			meta.ETag = etag
+		}
+		headersToMeta(resp.Header, &meta, true)
+		// A version that arrives with no retention gets this bucket's
+		// default, as a write here would.
+		if meta.RetentionMode == "" {
+			if bi, err := w.store.GetBucket(change.Bucket); err == nil && bi.DefaultRetentionMode != "" && bi.DefaultRetentionDays > 0 {
+				meta.RetentionMode = bi.DefaultRetentionMode
+				meta.RetentionUntil = time.Now().UTC().Unix() + int64(bi.DefaultRetentionDays*86400)
+			}
+		}
+	}
+
+	cur, _ := w.store.GetObjectMeta(change.Bucket, change.Key)
+	meta.IsLatest = newerThanCurrent(meta, cur)
+	if meta.IsLatest && cur != nil && cur.VersionID == "" && !cur.DeleteMarker {
+		// An object written before versioning was enabled is the null
+		// version, kept as a local write keeps it.
+		cur.VersionID = "null"
+		cur.IsLatest = false
+		if err := w.store.PutObjectVersion(*cur); err != nil {
+			return fmt.Errorf("keep the pre-versioning object as the null version: %w", err)
+		}
+	}
+	if err := w.store.PutObjectVersion(meta); err != nil {
+		return fmt.Errorf("put version metadata: %w", err)
+	}
+	if meta.IsLatest {
+		if err := w.store.PutObjectMeta(meta); err != nil {
+			return fmt.Errorf("point the key at the new version: %w", err)
+		}
+	}
+	return nil
+}
+
+// newerThanCurrent reports whether version m becomes the key's current one.
+func newerThanCurrent(m metadata.ObjectMeta, cur *metadata.ObjectMeta) bool {
+	if cur == nil {
+		return true
+	}
+	// A pre-versioning object or a null version has no time in its ID.
+	if cur.VersionID == "" || cur.VersionID == "null" {
+		return m.LastModified >= cur.LastModified
+	}
+	return m.VersionID > cur.VersionID
+}
+
+// validVersionID reports an ID in the form this server generates: the
+// creation time in nanoseconds as 16 hex digits, then random hex.
+func validVersionID(id string) bool {
+	if len(id) < 17 || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // HandleSyncRequest processes an incoming sync request from a remote site.

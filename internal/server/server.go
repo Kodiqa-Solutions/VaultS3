@@ -194,6 +194,10 @@ type Server struct {
 }
 
 func New(cfg *config.Config) (*Server, error) {
+	// Set before any store opens: a cluster node re-applies its Raft log as
+	// soon as it starts, and must apply it under the rule every node uses.
+	metadata.SetVersionOrdering(versionOrderingFor(cfg))
+
 	// Initialize storage engine
 	fs, err := storage.NewFileSystem(cfg.Storage.DataDir)
 	if err != nil {
@@ -207,6 +211,22 @@ func New(cfg *config.Config) (*Server, error) {
 
 	var engine storage.Engine = fs
 	var perBucketEngine *storage.PerBucketEngine
+
+	// The cold tier goes directly under the hot filesystem, below every other
+	// layer, because the tiering manager moves an object's file as it is on
+	// disk (encrypted, compressed). Reads that find no hot file read the cold
+	// one, so a moved object stays readable through the same stack.
+	var coldFS *storage.FileSystem
+	if cfg.Tiering.Enabled && cfg.Tiering.ColdDataDir != "" {
+		if err := checkColdDirSeparate(cfg.Storage.DataDir, cfg.Tiering.ColdDataDir); err != nil {
+			return nil, err
+		}
+		coldFS, err = storage.NewFileSystem(cfg.Tiering.ColdDataDir)
+		if err != nil {
+			return nil, fmt.Errorf("init cold storage: %w", err)
+		}
+		engine = storage.NewColdTier(fs, coldFS)
+	}
 
 	// Wrap with encryption if enabled (SSE-S3 or SSE-KMS)
 	if cfg.Encryption.Enabled {
@@ -973,10 +993,17 @@ func New(cfg *config.Config) (*Server, error) {
 
 		if cfg.Replication.Mode == "active-active" {
 			// Active-active bidirectional replication
+			if cfg.Cluster.Enabled {
+				slog.Warn("active-active on a cluster: of two concurrent writes to a key with versioning, sites may disagree on which is current until the next write; the highest-version-ID rule is off on clusters, where a lagging node could break it")
+			}
 			biDirWorker = replication.NewBiDirectionalWorker(metaStore, engine, cfg.Replication)
 			changeLog := biDirWorker.ChangeLog()
 			siteID := biDirWorker.SiteID()
 			replicationFunc = func(eventType, bucket, key string, size int64, etag, versionID string) {
+				if versionID != "" {
+					recordVersionChange(metaStore, changeLog, bucket, key, versionID)
+					return
+				}
 				evtType := "put"
 				if eventType == "s3:ObjectRemoved:Delete" {
 					evtType = "delete"
@@ -1091,14 +1118,20 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// Initialize tiering if enabled
 	var tieringMgr *tiering.Manager
-	if cfg.Tiering.Enabled && cfg.Tiering.ColdDataDir != "" {
-		coldFS, err := storage.NewFileSystem(cfg.Tiering.ColdDataDir)
-		if err != nil {
-			store.Close()
-			return nil, fmt.Errorf("init cold storage: %w", err)
-		}
+	if coldFS != nil {
 		tieringMgr = tiering.NewManager(metaStore, fs, coldFS, cfg.Tiering.MigrateAfterDays, cfg.Tiering.ScanIntervalSecs)
 		s3h.SetColdRestorer(tieringMgr.MigrateToHot)
+		s3h.SetColdPath(tieringMgr.ColdObjectPath)
+		switch {
+		case cfg.Cluster.Enabled:
+			// Each node holds its own copies under records the nodes share, so
+			// one node's move would mark the object cold for all of them.
+			tieringMgr.DisableColdMoves("a cluster node cannot move an object's copies on the other nodes")
+		case cfg.Erasure.Enabled:
+			tieringMgr.DisableColdMoves("erasure coding stores objects as shards")
+		case cfg.Packing.Enabled && !cfg.Encryption.Enabled: // packing is on (it is off with encryption or erasure)
+			tieringMgr.DisableColdMoves("small-file packing stores objects inside volume files")
+		}
 		slog.Info("tiering enabled", "cold_dir", cfg.Tiering.ColdDataDir, "migrate_after_days", cfg.Tiering.MigrateAfterDays)
 	}
 
@@ -1635,12 +1668,13 @@ func (s *Server) Run() error {
 		s.scanWorker.Start(scanCtx, s.cfg.Scanner.Workers)
 	}
 
-	// The tiering manager's scan moves objects to the cold tier, which nothing
-	// reads from, so every object it moved became unreadable. It does not run:
-	// objects already there are moved back with RestoreObject or the
-	// dashboard's hot direction (tiering.ErrColdWritesDisabled).
+	// Start tiering manager if enabled. Its scan moves objects not read for
+	// migrate_after_days to the cold tier, which the engine stack reads through
+	// (storage.ColdTier).
 	if s.tieringMgr != nil {
-		slog.Warn("tiering: moving objects to the cold tier is disabled in this version, because objects there cannot be read; objects already there can be restored with RestoreObject")
+		tierCtx, tierCancel := context.WithCancel(context.Background())
+		defer tierCancel()
+		go s.tieringMgr.Run(tierCtx)
 	}
 
 	// Start lambda trigger manager if enabled
@@ -1996,4 +2030,84 @@ func newMigrator(cfg *config.Config, store metadata.StoreAPI, engine storage.Eng
 		slog.Info("migration: sources at loopback and private addresses are allowed (migration.allow_private_sources)")
 	}
 	return m
+}
+
+// checkColdDirSeparate refuses a cold directory inside the data directory, or
+// the other way round. The data directory is read as buckets of objects, so
+// cold files under it would be seen as objects of a bucket named after the
+// cold directory, with no metadata, and the reclaim scan deletes such files.
+func checkColdDirSeparate(dataDir, coldDir string) error {
+	d, err := resolvedPath(dataDir)
+	if err != nil {
+		return fmt.Errorf("tiering: data dir: %w", err)
+	}
+	c, err := resolvedPath(coldDir)
+	if err != nil {
+		return fmt.Errorf("tiering: cold_data_dir: %w", err)
+	}
+	if d == c || pathWithin(c, d) || pathWithin(d, c) {
+		return fmt.Errorf("tiering: cold_data_dir %q must not be the data directory %q, inside it or contain it", coldDir, dataDir)
+	}
+	return nil
+}
+
+// resolvedPath is p made absolute with its symbolic links resolved, as far
+// as it exists: a cold directory reached through a link into the data
+// directory is inside it.
+func resolvedPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	rest := ""
+	for cur := abs; ; {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(r, rest), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
+func pathWithin(p, dir string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// recordVersionChange puts a change in a bucket with versioning into the
+// active-active change log: the version or delete marker it created, sent
+// with its ID. A delete that names a version removes it for good and leaves
+// no record: like S3 replication, that is not sent to the other sites, so a
+// delete on one site cannot destroy another's versions. A null version
+// (versioning suspended) has the same ID on every site, so it cannot be told
+// apart and is not sent either.
+func recordVersionChange(store metadata.StoreAPI, changeLog *replication.ChangeLog, bucket, key, versionID string) {
+	if versionID == "null" {
+		slog.Warn("active-active: a write with versioning suspended is not replicated", "bucket", bucket, "key", key)
+		return
+	}
+	vm, err := store.GetObjectVersion(bucket, key, versionID)
+	if err != nil || vm == nil {
+		slog.Debug("active-active: a version delete is not replicated", "bucket", bucket, "key", key, "version", versionID)
+		return
+	}
+	if err := changeLog.RecordVersion(*vm); err != nil {
+		slog.Error("active-active: could not record a change", "bucket", bucket, "key", key, "version", versionID, "error", err)
+	}
+}
+
+// versionOrderingFor reports whether the highest version ID is a key's
+// current version (metadata.SetVersionOrdering): with active-active
+// replication, so every site agrees whatever order versions arrive in, but
+// not on a Raft cluster. There a node whose applied state lags takes a new
+// write's ID from its own clock and a stale view of the key, so a later,
+// acknowledged write could get the lower ID and stay noncurrent, and a node
+// replaying its log under a different rule would end on another version.
+func versionOrderingFor(cfg *config.Config) bool {
+	return cfg.Replication.Enabled && len(cfg.Replication.Peers) > 0 &&
+		cfg.Replication.Mode == "active-active" && !cfg.Cluster.Enabled
 }

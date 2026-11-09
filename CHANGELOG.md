@@ -6,6 +6,69 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.12] - 2026-11-09
+### Changed
+- **A bucket's size is cached instead of measured on every request.** A
+  quota check measured the whole bucket on disk before every write, and the
+  metrics endpoint measured every bucket on every scrape; with versioning a
+  bucket holds every version, so 200 uploads into a bucket with a quota and
+  20,000 versions took 6.2 s. They now take 0.13 s. The server's own writes
+  and deletes keep the figure exact; it is measured again once a minute, or
+  within seconds when files changed during a measurement, which catches
+  anything else that changed files on disk.
+- **A Snowball archive sent in signed chunks is extracted as it arrives.**
+  It was staged on the data volume in full first, so a 5 GiB import needed
+  5 GiB of free space and stored nothing until the upload ended. Each chunk
+  is now handed to extraction once its signature checks, so only bytes the
+  client signed are stored; a tampered chunk ends the import with 403,
+  keeping the entries before it. Archives signed with one SHA-256, with a
+  trailing checksum, or in chunks over 16 MiB are staged as before.
+
+### Fixed
+- **Tiering moves objects to the cold tier again, and they are read from
+  there.** Before, nothing read the cold directory, so an object moved there
+  answered NoSuchKey until it was moved back, and 5.0.11 stopped moving them.
+  The cold directory now sits under the encryption and compression layers, so
+  GET, Range and HEAD read a cold object as before, a PUT writes the new data
+  and drops the cold copy, a delete removes both, and bucket sizes and quotas
+  count both directories. Objects an earlier version moved there are read
+  again. A PUT that lands while an object is being moved keeps its data: the
+  move removes the hot file only if it is still the one it copied. Moves are
+  off on a cluster and with erasure coding or small-file packing, where an
+  object is not one file at its path (the manual `cold` direction answers 409
+  there); restores still work. Moves and restores of one key never overlap,
+  and a cold object stays readable when another key's file or folder takes
+  its path in the hot directory (a cold `a` with a new `a/b`). The server refuses to start with
+  `cold_data_dir` inside `data_dir` (or containing it), where the reclaim scan
+  would take cold files for data without metadata and delete them.
+- **Active-active replication replicates buckets with versioning.** 5.0.11
+  skipped them, because a change was applied as a plain write and corrupted
+  the bucket's history. Each version and delete marker is now sent with its
+  version ID and stored under the same ID on every site, with its ETag,
+  content type, user metadata and object lock. Concurrent writes on two sites
+  become two versions on both, and the newest is current everywhere, whatever
+  order the changes arrive in. A delete of a specific version is not
+  replicated, as with S3 replication, and writes while versioning is
+  suspended are not either. Both sites need 5.0.12 and versioning enabled on
+  the bucket. A new version's ID is now always above the key's current one,
+  so sites agree on the current version even when their clocks differ; a
+  replicated ID dated more than a day ahead is refused. With active-active
+  on (and no Raft cluster, where a lagging node could break the rule), the
+  metadata store keeps the highest ID current when a version is committed, so of two concurrent uploads to a key the one that took the
+  later ID is current on every site, even when the other finishes last; the
+  other is kept as a noncurrent version, as on S3. A replicated version
+  with no retention of its own gets the receiving bucket's default
+  retention.
+- **The Docker healthcheck passes with `VAULTS3_BASE_PATH` set.** It probed
+  `<base path>/health`, but the base path is the prefix a reverse proxy
+  strips, and the server answers `/health` at its root; the probe got 403 and
+  every such container was reported unhealthy.
+- **Active-active replication keeps an object's metadata and stored bytes.**
+  A replicated object lost its content type and user metadata, and an object
+  stored with `Content-Encoding: gzip` was fetched through the HTTP client's
+  own decompression, so the other site stored the decompressed bytes. A
+  fetch that comes up short is now an error and is retried.
+
 ## [5.0.11] - 2026-11-08
 ### Security
 - **A Deny in an IAM or bucket policy now covers keys that contain a `*`.**
@@ -3896,7 +3959,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.11...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.12...HEAD
+[5.0.12]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.11...v5.0.12
 [5.0.11]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.10...v5.0.11
 [5.0.10]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.9...v5.0.10
 [5.0.9]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.8...v5.0.9

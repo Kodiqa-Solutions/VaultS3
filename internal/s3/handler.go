@@ -212,6 +212,12 @@ func (h *Handler) SetColdRestorer(fn func(bucket, key string) error) {
 	h.objects.coldRestorer = fn
 }
 
+// SetColdPath sets where an object's file is in the cold tier, so an
+// overwrite of a cold object gives its size back to the bucket quota.
+func (h *Handler) SetColdPath(fn func(bucket, key string) string) {
+	h.objects.coldPath = fn
+}
+
 // SetScanFunc sets the callback for virus scanning after uploads.
 func (h *Handler) SetScanFunc(fn ScanFunc) {
 	h.onScan = fn

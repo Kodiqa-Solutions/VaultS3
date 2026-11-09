@@ -4,8 +4,8 @@ description: Lightweight S3-compatible object storage with a built-in dashboard,
 type: application
 # version  = the chart version (bump on chart changes)
 # appVersion = the VaultS3 image tag this chart defaults to
-version: 0.2.11
-appVersion: "5.0.11"
+version: 0.2.12
+appVersion: "5.0.12"
 home: https://github.com/Kodiqa-Solutions/VaultS3
 sources:
   - https://github.com/Kodiqa-Solutions/VaultS3
@@ -27,19 +27,19 @@ annotations:
   artifacthub.io/changes: |
     - kind: added
       description: values.schema.json, so helm install and upgrade refuse a mistyped value (a string for a number, an unknown controller kind, an invalid size) before anything is deployed
-    - kind: security
-      description: "VaultS3 5.0.11: a Deny in IAM and bucket policies now covers keys containing *"
+    - kind: fixed
+      description: "VaultS3 5.0.12: tiering moves objects to the cold tier again and reads them from there, with encryption and compression on"
       links:
         - name: Changelog
           url: https://github.com/Kodiqa-Solutions/VaultS3/blob/main/CHANGELOG.md
-    - kind: security
-      description: "VaultS3 5.0.11: public buckets no longer expose object tags and older versions, and keys with ./ or // no longer reach another object past object lock and IAM Deny"
     - kind: added
-      description: "VaultS3 5.0.11: presigned POST (browser form uploads signed with a POST policy)"
-    - kind: fixed
-      description: "VaultS3 5.0.11: active-active replication syncs, and quotas hold on every write path, versioned buckets included"
+      description: "VaultS3 5.0.12: active-active replication of buckets with versioning, every version and delete marker under its own ID"
     - kind: changed
-      description: "VaultS3 5.0.11: moving objects to the cold tier is paused; RestoreObject brings back objects already there"
+      description: "VaultS3 5.0.12: bucket sizes are cached, so quota checks and metrics scrapes no longer walk every file of a bucket"
+    - kind: fixed
+      description: "VaultS3 5.0.12: the Docker healthcheck passes with VAULTS3_BASE_PATH set"
+    - kind: changed
+      description: "VaultS3 5.0.12: Snowball archives sent in signed chunks are extracted as they arrive"
   artifacthub.io/license: AGPL-3.0
   artifacthub.io/category: storage
   artifacthub.io/links: |
@@ -51,4 +51,4 @@ annotations:
       url: https://vaults3.com/migrate-from-minio
   artifacthub.io/images: |
     - name: vaults3
-      image: eniz1806/vaults3:5.0.11
+      image: eniz1806/vaults3:5.0.12

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,13 +11,22 @@ import (
 	"strings"
 )
 
+// errIsDirectory is a read of a key whose path is a folder of other keys.
+var errIsDirectory = errors.New("object is a directory")
+
 // FileSystem implements Engine using the local filesystem.
 type FileSystem struct {
 	dataDir string
 	// noDirSync skips the directory fsync after a rename. It is stored inverted
 	// so the zero value is the safe default.
 	noDirSync bool
+	// sizes caches BucketSize (see sizecache.go).
+	sizes sizeCache
 }
+
+// InvalidateBucketSize makes the next BucketSize of bucket measure it again,
+// for code that changed its files without going through the FileSystem.
+func (fs *FileSystem) InvalidateBucketSize(bucket string) { fs.sizes.invalidate(bucket) }
 
 func NewFileSystem(dataDir string) (*FileSystem, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -38,7 +48,7 @@ func (fs *FileSystem) SetSyncDirs(on bool) { fs.noDirSync = !on }
 // object already there. The metadata store fsyncs its commit, so the bytes
 // have to be durable first: otherwise a power loss right after a 200 could
 // leave committed metadata pointing at an empty or missing file.
-func (fs *FileSystem) writeFileAtomic(dst string, reader io.Reader) (int64, string, error) {
+func (fs *FileSystem) writeFileAtomic(bucket, dst string, reader io.Reader) (int64, string, error) {
 	dir := filepath.Dir(dst)
 	tmpFile, err := os.CreateTemp(dir, ".vaults3-tmp-*")
 	if err != nil {
@@ -63,10 +73,17 @@ func (fs *FileSystem) writeFileAtomic(dst string, reader io.Reader) (int64, stri
 		return 0, "", fmt.Errorf("close temp file: %w", err)
 	}
 
-	// Atomic rename
+	// Atomic rename. The file it replaces, if any, is measured just before,
+	// so the cached bucket size moves by the difference.
+	oldSize, existed := regularSize(dst)
 	if err := os.Rename(tmpPath, dst); err != nil {
 		os.Remove(tmpPath)
 		return 0, "", fmt.Errorf("rename object: %w", err)
+	}
+	if existed {
+		fs.sizes.adjust(bucket, written-oldSize, 0)
+	} else {
+		fs.sizes.adjust(bucket, written, 1)
 	}
 	if !fs.noDirSync {
 		if err := syncDirFn(dir); err != nil {
@@ -251,7 +268,9 @@ func (fs *FileSystem) DeleteBucketDir(bucket string) error {
 	if !ok {
 		return fmt.Errorf("storage: refusing to delete bucket %q: it resolves outside the data directory", bucket)
 	}
-	return os.RemoveAll(p)
+	err := os.RemoveAll(p)
+	fs.sizes.drop(bucket)
+	return err
 }
 
 func (fs *FileSystem) PutObject(bucket, key string, reader io.Reader, size int64) (int64, string, error) {
@@ -273,7 +292,7 @@ func (fs *FileSystem) PutObject(bucket, key string, reader io.Reader, size int64
 	}
 
 	// Write to temp file first, then atomic rename to prevent corruption
-	return fs.writeFileAtomic(objPath, reader)
+	return fs.writeFileAtomic(bucket, objPath, reader)
 }
 
 func (fs *FileSystem) GetObject(bucket, key string) (ReadSeekCloser, int64, error) {
@@ -288,7 +307,7 @@ func (fs *FileSystem) GetObject(bucket, key string) (ReadSeekCloser, int64, erro
 		return nil, 0, fmt.Errorf("stat object: %w", err)
 	}
 	if info.IsDir() {
-		return nil, 0, fmt.Errorf("object is a directory")
+		return nil, 0, errIsDirectory
 	}
 
 	f, err := os.Open(objPath)
@@ -313,9 +332,13 @@ func (fs *FileSystem) DeleteObject(bucket, key string) error {
 	}
 
 	objPath := fs.objectPath(bucket, key)
+	oldSize, existed := regularSize(objPath)
 	err := os.Remove(objPath)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete object: %w", err)
+	}
+	if err == nil && existed {
+		fs.sizes.adjust(bucket, -oldSize, -1)
 	}
 
 	// Clean up empty parent directories
@@ -409,7 +432,13 @@ func (fs *FileSystem) ListObjects(bucket, prefix, startAfter string, maxKeys int
 	return objects, truncated, nil
 }
 
+// BucketSize is the bucket's size on disk and its file count, from the cache
+// when it holds a fresh figure.
 func (fs *FileSystem) BucketSize(bucket string) (int64, int64, error) {
+	return fs.sizes.get(bucket, func() (int64, int64, error) { return fs.walkBucketSize(bucket) })
+}
+
+func (fs *FileSystem) walkBucketSize(bucket string) (int64, int64, error) {
 	var totalSize int64
 	var count int64
 
@@ -450,7 +479,7 @@ func (fs *FileSystem) PutObjectVersion(bucket, key, versionID string, reader io.
 	// same as PutObject. Writing it in place truncated an existing version
 	// (the null version is rewritten on every PUT to a suspended bucket) the
 	// moment the write began, and the error path then removed it outright.
-	written, etag, err := fs.writeFileAtomic(vPath, reader)
+	written, etag, err := fs.writeFileAtomic(bucket, vPath, reader)
 	if err != nil {
 		return 0, "", fmt.Errorf("write version: %w", err)
 	}
@@ -475,9 +504,13 @@ func (fs *FileSystem) GetObjectVersion(bucket, key, versionID string) (ReadSeekC
 
 func (fs *FileSystem) DeleteObjectVersion(bucket, key, versionID string) error {
 	vPath := fs.versionPath(bucket, key, versionID)
+	oldSize, existed := regularSize(vPath)
 	err := os.Remove(vPath)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete version: %w", err)
+	}
+	if err == nil && existed {
+		fs.sizes.adjust(bucket, -oldSize, -1)
 	}
 
 	// Clean up empty parent directories up to .vs/

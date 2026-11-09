@@ -48,7 +48,7 @@ VaultS3 is designed with security in mind:
 - **Replication queue limit cap**: Queue listing capped at 1000 entries to prevent memory exhaustion
 - **Backup path traversal protection**: Backup target validates resolved paths stay within base directory
 - **LIKE pattern O(n*m) matching**, Iterative DP algorithm replaces recursive backtracking, preventing ReDoS
-- **Tiering restore safety**: moving objects to the cold tier is disabled from 5.0.11 (nothing read from it). A restore puts the data back only where no hot file exists, never over data a PUT wrote meanwhile, and drops the stale cold copy
+- **Tiering safety**: an object moved to the cold tier is still read from there (5.0.12). A move removes the hot file only if it is still the one copied, so a PUT that lands during the move keeps its data. A restore puts the data back only where no hot file exists, never over data a PUT wrote meanwhile, and drops the stale cold copy
 - **Lambda output key validation**: Output key template expansion validated against path traversal
 - **S3 Select record cap**: JSON/CSV parsing capped at 1M records to prevent memory exhaustion
 - **FUSE cache size caps**: Signature cache, HEAD cache, and LIST cache bounded to prevent unbounded memory growth

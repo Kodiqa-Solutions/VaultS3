@@ -21,7 +21,7 @@ import (
 // possible, where there is no shell to run a probe from at all.
 //
 // It reads the same config the server does, so it follows a changed port, a
-// reverse-proxy base path and TLS rather than assuming the defaults.
+// bind address and TLS rather than assuming the defaults.
 func runHealthcheck(args []string) int {
 	configPath := defaultConfigPath
 	for i := 0; i < len(args); i++ {
@@ -64,7 +64,6 @@ func runHealthcheck(args []string) int {
 		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
-	base := strings.TrimSuffix(cfg.Server.BasePath, "/")
 	// The loopback address only answers when the server listens on every
 	// interface. Bound to one address, the probe has to go there.
 	host := "127.0.0.1"
@@ -74,7 +73,13 @@ func runHealthcheck(args []string) int {
 			host = "[" + a + "]"
 		}
 	}
-	url := fmt.Sprintf("%s://%s:%d%s/health", scheme, host, cfg.Server.Port, base)
+	// server.base_path is the prefix a reverse proxy strips before a request
+	// reaches the server, which serves /health at its root either way. The
+	// probe talks to the server directly, so the prefix is not added: with
+	// it, the probe asked for /vaults3/health, the server read that as an
+	// object in a bucket named "vaults3" and answered 403, and Docker marked
+	// every container with VAULTS3_BASE_PATH set unhealthy.
+	url := fmt.Sprintf("%s://%s:%d/health", scheme, host, cfg.Server.Port)
 
 	resp, err := client.Get(url)
 	if err != nil {

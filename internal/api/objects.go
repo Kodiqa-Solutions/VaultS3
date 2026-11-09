@@ -339,7 +339,7 @@ func (h *APIHandler) writeConsoleDeleteMarker(bucket, key string, current *metad
 		return &deleteNotRecordedError{op: "demote previous version", err: err}
 	}
 	dm := metadata.ObjectMeta{
-		Bucket: bucket, Key: key, VersionID: genVersionID(),
+		Bucket: bucket, Key: key, VersionID: h.nextVersionID(bucket, key),
 		DeleteMarker: true, IsLatest: true, LastModified: time.Now().UTC().Unix(),
 	}
 	if err := h.store.PutObjectVersion(dm); err != nil {
@@ -631,7 +631,7 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 			// A suspended bucket writes the null version in place, as S3
 			// does; it used to take the plain path, which left the null
 			// version's bytes behind and listed a second null version.
-			versionID := genVersionID()
+			versionID := h.nextVersionID(bucket, key)
 			if versioning == "Suspended" {
 				versionID = nullVersionID
 			}
@@ -738,10 +738,16 @@ func (h *APIHandler) recordNewLatestVersion(meta metadata.ObjectMeta) error {
 		return fmt.Errorf("record version: %w", err)
 	}
 	if err := h.store.PutObjectMeta(meta); err != nil {
-		restore()
-		if derr := h.store.DeleteObjectVersion(meta.Bucket, meta.Key, meta.VersionID); derr != nil {
+		// The new record goes first: while it is there, flagged latest with
+		// the higher ID, the store would keep the restored one noncurrent
+		// and leave no version flagged latest.
+		if current != nil && current.VersionID == meta.VersionID {
+			// The null version was replaced in place: its record is the one
+			// the pointer names, and restore() rewrites it.
+		} else if derr := h.store.DeleteObjectVersion(meta.Bucket, meta.Key, meta.VersionID); derr != nil {
 			slog.Warn("could not remove the record of a version whose latest pointer failed", "bucket", meta.Bucket, "key", meta.Key, "error", derr)
 		}
+		restore()
 		return fmt.Errorf("record latest pointer: %w", err)
 	}
 	return nil
@@ -1045,13 +1051,13 @@ func (h *APIHandler) uploadQuota(bucket, key, versioning string) (int64, error) 
 			switch {
 			case versioning == "":
 				count--
-				size -= regularFileSize(h.engine.ObjectPath(bucket, key))
+				size -= h.plainFileSize(bucket, key)
 			case meta.VersionID == "null":
 				count--
 				size -= regularFileSize(h.engine.ObjectPath(bucket, ".vs/"+key+"/null"))
 			case meta.VersionID == "":
 				count--
-				size -= regularFileSize(h.engine.ObjectPath(bucket, key))
+				size -= h.plainFileSize(bucket, key)
 			}
 		}
 	}
@@ -1082,6 +1088,15 @@ func (q *quotaReader) Read(p []byte) (int, error) {
 
 // regularFileSize is the size on disk of a regular file at path, or 0, without
 // following a symbolic link (the bucket's disk walk counts the link itself).
+// plainFileSize is the size on disk of key's file, in the hot tier or, when
+// it was moved there, the cold one, which a write drops.
+func (h *APIHandler) plainFileSize(bucket, key string) int64 {
+	if n := regularFileSize(h.engine.ObjectPath(bucket, key)); n > 0 || h.tieringMgr == nil {
+		return n
+	}
+	return regularFileSize(h.tieringMgr.ColdObjectPath(bucket, key))
+}
+
 func regularFileSize(path string) int64 {
 	if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() {
 		return fi.Size()

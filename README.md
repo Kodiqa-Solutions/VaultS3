@@ -125,9 +125,9 @@ Windows, a `checksums.txt` signed with the project's release key, an SPDX SBOM
 per platform, and a Sigstore provenance bundle you can verify offline:
 
 ```bash
-sudo apt install ./vaults3_5.0.11_amd64.deb
+sudo apt install ./vaults3_5.0.12_amd64.deb
 sudo systemctl enable --now vaults3
-gh attestation verify vaults3_5.0.11_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_5.0.12_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 Building from source is `make build`. Kubernetes is a Helm chart
@@ -148,8 +148,8 @@ The short version. Each row links to the guide that covers it, and the
 | **Encryption** | AES-256-GCM at rest, SSE-S3, SSE-KMS, SSE-C, and per-bucket keys with rotation and crypto-shredding. [Guide](docs/CONFIGURATION.md#encryption-at-rest) |
 | **Durability** | Reed-Solomon erasure coding with a background healer, per-bucket replica counts with automatic repair after a node is lost, orphan reclaim. [Guide](docs/SCALING.md) |
 | **Clustering** | Raft-replicated metadata, consistent-hash placement, failover routing, optional metadata sharding. [Guide](docs/SCALING.md) |
-| **Replication** | One-way async and bidirectional active-active with vector-clock conflict resolution. [Guide](docs/INTEGRATIONS.md#async-replication) |
-| **Data management** | Versioning with diff and rollback, object lock, lifecycle, compression, scheduled backups (cold tiering is paused in 5.0.11). [Guide](docs/DATA-MANAGEMENT.md) |
+| **Replication** | One-way async and bidirectional active-active with vector-clock conflict resolution, including buckets with versioning. [Guide](docs/INTEGRATIONS.md#async-replication) |
+| **Data management** | Versioning with diff and rollback, object lock, lifecycle, compression, cold tiering, scheduled backups. [Guide](docs/DATA-MANAGEMENT.md) |
 | **Integrations** | Webhook, Kafka, NATS, Redis, AMQP, PostgreSQL and Elasticsearch notifications, lambda triggers, virus scanning. [Guide](docs/INTEGRATIONS.md) |
 | **Search** | Full-text over metadata and tags, plus optional semantic search and RAG retrieval with no external vector database. [Guide](docs/INTEGRATIONS.md#full-text-search) |
 | **Migrate in** | Import buckets from MinIO, SeaweedFS, Garage, Ceph, AWS, R2, Wasabi or B2, preserving dates, metadata, policies and tags |
@@ -163,10 +163,10 @@ VaultS3 is honest about what's battle-tested versus still maturing. Pick the lan
 |---|---|---|
 | **Single-node** (S3 API, versioning, IAM, dashboard) | ✅ Stable | The default deployment. Broad test coverage. Runs in production today. |
 | **Erasure coding** (single-node, multi-disk) | ✅ Stable | Reed-Solomon encode/reconstruct and the background healer have fault-injection tests (lose disks → reconstruct → heal). Reads and writes both stream as of 4.4.60, so neither holds an object in memory: a PUT costs a fixed number of stripe buffers rather than the object plus its parity, and a degraded read rebuilds one aligned stripe at a time instead of the whole object up front. That is what makes large objects at high concurrency safe here. |
-| **Tiering & backup** | 🟡 Backup stable, tiering paused | Full/incremental backup is tested; restore is a manual file copy. Moving objects to the cold tier is disabled from 5.0.11 because they could not be read there; objects already there are restored with RestoreObject. |
+| **Tiering & backup** | 🟡 Beta | Full/incremental backup is tested; restore is a manual file copy. Tiering moves objects to a cold directory and reads them from there (from 5.0.12); single node only, not with erasure coding or packing, and not for versioned objects. |
 | **Multi-node Raft clustering** | 🟡 Beta | Metadata writes replicate via Raft consensus (writes accepted on any node via leader-forwarding), object data is placed/served by a live-membership hash ring, inter-node calls are authenticated, and on Kubernetes the cluster auto-forms (leader bootstrap + auto-join + self-heal). Validated end-to-end on a real 3-node cluster: leader election & failover, node recovery with catch-up, cross-node reads, and concurrent load, including a 10,000-write list-then-write-then-read workload behind a gateway with a node restarted mid-run. Overwriting a key and reading it straight back used to be able to return the *previous* bytes under the *new* object's `ETag`, because a data file already present on the serving node was handed back without checking that it was still current. A node now compares what it holds against the authoritative metadata and routes the read to a holder that has the current bytes, answering `503 SlowDown` only if none can be reached yet, which every S3 SDK retries. Measured on a real three-node cluster: 24 of 40 immediate cross-node reads returned stale bytes before, 0 of 40 after, converging in a median of 2 ms. Still operationally newer, not yet stress/scale/multi-region hardened, so validate against your workload before trusting it as the only copy of critical data. |
 | **Sharded metadata** (`cluster.metadata_shards > 1`) | 🟠 Opt-in, since 4.4.54 | Splits object metadata across independent Raft groups so metadata capacity grows with the cluster instead of every node holding the whole index. Validated on real three-node clusters, local and in containers: shard assignment, group membership reconciliation, routed reads and writes from a node holding no copy of a shard, and an unreachable shard reporting `503` rather than a phantom `404`. Newer than everything above it, and the shard count is fixed when the cluster first commits its assignment, so treat it as opt-in for new clusters you can validate. Off by default. |
-| **Active-active replication** | 🟡 Beta | Vector-clock conflict resolution is unit-tested. The cross-site sync was refused on every version from 4.4.56 to 5.0.10; since 5.0.11 the endpoint and the worker are tested, and two sites were checked syncing in Docker before release. |
+| **Active-active replication** | 🟡 Beta | Vector-clock conflict resolution is unit-tested. The cross-site sync was refused on every version from 4.4.56 to 5.0.10; since 5.0.11 the endpoint and the worker are tested, and two sites were checked syncing in Docker before release. Buckets with versioning replicate from 5.0.12. |
 
 **Security:** VaultS3 was reviewed by an external white-box security assessment in August 2026, which reported 14 findings. All are fixed in 4.4.56. See [SECURITY.md](SECURITY.md) for the summary and [CHANGELOG.md](CHANGELOG.md) for each finding. If you run an earlier version, upgrade and read the [upgrade notes](docs/UPGRADING.md#upgrading-to-4456-security-release). Container images for versions before 4.4.56 have been withdrawn from Docker Hub, so those tags no longer pull.
 

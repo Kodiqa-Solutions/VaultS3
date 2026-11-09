@@ -2,7 +2,6 @@ package tiering
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"path/filepath"
 	"testing"
@@ -198,13 +197,7 @@ func TestMigrateToHotRoundTrip(t *testing.T) {
 	data := []byte("round trip data")
 	r.putHot(t, "obj", data, time.Now().Unix())
 
-	// Moving to cold is refused from outside (nothing reads the cold tier
-	// yet, 5.0.11); an object already there, as an earlier version left it,
-	// still comes back.
-	if err := r.mgr.ManualMigrate("b", "obj", "cold"); !errors.Is(err, ErrColdWritesDisabled) {
-		t.Fatalf("manual move to cold: %v, want ErrColdWritesDisabled", err)
-	}
-	if err := r.mgr.migrateToCol("b", "obj"); err != nil {
+	if err := r.mgr.ManualMigrate("b", "obj", "cold"); err != nil {
 		t.Fatalf("to cold: %v", err)
 	}
 	if err := r.mgr.MigrateToHot("b", "obj"); err != nil {

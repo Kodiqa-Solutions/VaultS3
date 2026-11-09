@@ -55,8 +55,12 @@ type streamOpts struct {
 	dropSigOnChunk int    // 1-based chunk sent without its chunk-signature
 	trailerName    string // e.g. x-amz-checksum-crc32; empty for no trailer
 	trailerValue   string
-	trailerSig     string // "" signs honestly, "-" omits it, anything else is sent as is
-	minioLayout    bool   // lay the trailer out as minio-go does
+	trailerSig     string            // "" signs honestly, "-" omits it, anything else is sent as is
+	minioLayout    bool              // lay the trailer out as minio-go does
+	headers        map[string]string // extra headers, signed with the rest
+	// bodyFrom, when set, sends the framed body through it instead of all
+	// at once, so a test can hold part of it back.
+	bodyFrom func(framed []byte) io.Reader
 }
 
 // signedStreamPut sends body as STREAMING-AWS4-HMAC-SHA256-PAYLOAD (or the
@@ -73,6 +77,9 @@ func signedStreamPut(t *testing.T, ts *httptest.Server, path string, body []byte
 	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(body)))
 	if o.trailerName != "" {
 		req.Header.Set("X-Amz-Trailer", o.trailerName)
+	}
+	for k, v := range o.headers {
+		req.Header.Set(k, v)
 	}
 	now := time.Now().UTC()
 	dateStr, amzDate := now.Format("20060102"), now.Format("20060102T150405Z")
@@ -135,6 +142,9 @@ func signedStreamPut(t *testing.T, ts *httptest.Server, path string, body []byte
 	}
 	framed := strings.Join(chunks, "") + final + tail + "\r\n"
 	req.Body = io.NopCloser(strings.NewReader(framed))
+	if o.bodyFrom != nil {
+		req.Body = io.NopCloser(o.bodyFrom([]byte(framed)))
+	}
 	req.ContentLength = int64(len(framed))
 	return send(t, req)
 }

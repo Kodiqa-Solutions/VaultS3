@@ -173,13 +173,28 @@ tiering:
   scan_interval_secs: 3600
 ```
 
-> **Moving objects to the cold tier is disabled from 5.0.11.** Neither the S3 API
-> nor the dashboard reads from the cold directory, and objects are moved there
-> below the encryption and compression layers, so every object moved there could
-> not be read (NoSuchKey) until it was moved back. Until reads go through the
-> tier, the background scan does not run and the `cold` direction is refused.
-> Objects an earlier version moved there are brought back with RestoreObject or
-> the `hot` direction below.
+The scan moves an object that has not been read or written for
+`migrate_after_days` to `cold_data_dir`, as the file it is on disk, so an
+encrypted or compressed object stays encrypted or compressed there. It is still
+read from there: GET, Range and HEAD work as before, a PUT writes the new data
+to the hot directory and drops the cold copy, and a delete removes it from both.
+Bucket sizes and quotas count both directories. RestoreObject, or the `hot`
+direction below, moves an object back.
+
+- `cold_data_dir` must be writable by the server's user (uid 1000 in the Docker
+  image). A volume mounted there owned by root makes every move fail with
+  `permission denied`.
+- `cold_data_dir` must be outside `data_dir` (and not contain it). The server
+  refuses to start otherwise: files under the data directory without metadata
+  are what the reclaim scan deletes.
+- Only the current object of an unversioned key moves. Versioned objects stay
+  in the hot directory.
+- Moves are off on a cluster and with erasure coding or small-file packing,
+  where an object is not one file at its path: the scan does not run and the
+  `cold` direction answers 409. Restores still work.
+- Before 5.0.12 nothing read the cold directory, so 5.0.11 stopped moving
+  objects there. Objects an earlier version moved there are read again after
+  the upgrade.
 
 ```bash
 # Check tiering status (hot/cold counts and sizes)

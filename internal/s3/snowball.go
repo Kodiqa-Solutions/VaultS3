@@ -29,7 +29,13 @@ func (h *ObjectHandler) SnowballUpload(w http.ResponseWriter, r *http.Request, b
 	// its end first, which runs those checks, and only then extracted.
 	// Otherwise a tampered archive's entries were stored.
 	var body io.Reader = r.Body
-	if bodyIsSigned(r) {
+	if vc := streamableChunks(r); vc != nil {
+		// Signed chunks are handed on one whole chunk at a time, after its
+		// signature checks, so the archive is extracted as it arrives and
+		// only bytes the client signed are stored. A tampered chunk stops the
+		// import there, with the entries before it stored.
+		body = vc
+	} else if bodyIsSigned(r) {
 		staged, status, code, msg := h.stageSignedArchive(r, bucket)
 		if staged == nil {
 			writeS3Error(w, code, msg, status)
@@ -51,6 +57,11 @@ func (h *ObjectHandler) SnowballUpload(w http.ResponseWriter, r *http.Request, b
 			break
 		}
 		if err != nil {
+			if re := bodyFailure(err); re != nil {
+				snowballCounts(w, count, refused)
+				writeS3Error(w, re.code, re.msg, re.status)
+				return
+			}
 			writeS3Error(w, "InvalidArgument", fmt.Sprintf("TAR read error: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -81,6 +92,13 @@ func (h *ObjectHandler) SnowballUpload(w http.ResponseWriter, r *http.Request, b
 			lockFrom: nil,
 		})
 		if err != nil {
+			// A body that failed its checks while streaming ends the import:
+			// nothing after it can be trusted.
+			if re := bodyFailure(err); re != nil {
+				snowballCounts(w, count, refused)
+				writeS3Error(w, re.code, re.msg, re.status)
+				return
+			}
 			// One entry of a batch import: record it and keep going, but never
 			// count it as imported.
 			slog.Error("snowball: entry not imported", "bucket", bucket, "key", key, "error", err)
@@ -101,9 +119,99 @@ func (h *ObjectHandler) SnowballUpload(w http.ResponseWriter, r *http.Request, b
 		count++
 	}
 
+	snowballCounts(w, count, refused)
+	w.WriteHeader(http.StatusOK)
+}
+
+func snowballCounts(w http.ResponseWriter, count, refused int) {
 	w.Header().Set("X-Amz-Snowball-Extracted-Count", fmt.Sprintf("%d", count))
 	w.Header().Set("X-Amz-Snowball-Refused-Count", fmt.Sprintf("%d", refused))
-	w.WriteHeader(http.StatusOK)
+}
+
+// maxHeldChunk is the largest signed chunk held in memory until its
+// signature checks. SDKs send chunks of 64 KiB to a few MiB; an archive sent
+// in larger chunks is staged instead. A variable so a test can shrink it.
+var maxHeldChunk int64 = 16 << 20
+
+// streamableChunks returns a reader that gives out r's signed chunks only
+// once each has been verified, or nil when the archive has to be staged:
+// a body signed with one SHA-256 is checked only at its end, a trailing
+// checksum covers the whole archive and is checked only at its end too, and
+// a first chunk over maxHeldChunk is too large to hold.
+func streamableChunks(r *http.Request) *verifiedChunks {
+	b, ok := r.Body.(*awsChunkedBody)
+	if !ok || b.signer == nil || b.trailing || r.Header.Get("X-Amz-Trailer") != "" {
+		return nil
+	}
+	// Read the first chunk's header to learn the client's chunk size. The
+	// staging path reads on from here just the same.
+	if b.err == nil && b.remaining == 0 {
+		if err := b.nextChunk(); err != nil {
+			b.err = err
+		}
+	}
+	if b.remaining > maxHeldChunk {
+		return nil
+	}
+	return &verifiedChunks{b: b}
+}
+
+// verifiedChunks reads a signed aws-chunked body one chunk at a time,
+// releasing a chunk's bytes only after its signature has checked. The plain
+// reader releases them as they arrive and checks at the chunk's end, which
+// is fine for an object (nothing is committed until the body has been read
+// to its end) but not for an archive whose entries are stored as it goes.
+type verifiedChunks struct {
+	b   *awsChunkedBody
+	buf []byte
+	off int
+}
+
+func (v *verifiedChunks) Read(p []byte) (int, error) {
+	if v.off == len(v.buf) {
+		if err := v.fill(); err != nil {
+			return 0, err
+		}
+	}
+	n := copy(p, v.buf[v.off:])
+	v.off += n
+	return n, nil
+}
+
+// fill reads the next whole chunk into buf. Its last Read checks the chunk's
+// signature, so a chunk that fails is never handed out.
+func (v *verifiedChunks) fill() error {
+	b := v.b
+	if b.err != nil {
+		return b.err
+	}
+	if b.remaining == 0 {
+		if err := b.nextChunk(); err != nil {
+			b.err = err
+			return err
+		}
+		if b.err != nil { // the zero-length chunk: the body's end
+			return b.err
+		}
+	}
+	size := b.remaining
+	if size > maxHeldChunk {
+		b.err = &reqError{"InvalidArgument", fmt.Sprintf("A chunk of %d bytes is larger than the %d a streamed archive may use", size, maxHeldChunk), http.StatusBadRequest}
+		return b.err
+	}
+	if int64(cap(v.buf)) < size {
+		v.buf = make([]byte, size)
+	}
+	v.buf, v.off = v.buf[:size], 0
+	for got := 0; got < int(size); {
+		n, err := b.Read(v.buf[got:])
+		got += n
+		if err != nil && (err != io.EOF || got != int(size)) {
+			v.buf = v.buf[:0]
+			return err
+		}
+	}
+	return nil
 }
 
 // snowballEntryKey is the key an archive entry is stored under, or "" when it

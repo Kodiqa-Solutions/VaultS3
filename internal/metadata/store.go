@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kodiqa-Solutions/VaultS3/internal/iam"
@@ -987,7 +988,27 @@ func putObjectMetaTx(tx *bolt.Tx, meta ObjectMeta) error {
 	key := objectMetaKey(meta.Bucket, meta.Key)
 	// Read the prior meta (if any) so we can adjust the cached bucket
 	// counters by the delta rather than re-walking the filesystem.
-	oSize, oCount := metaWeight(getObjectMetaTx(b, key))
+	prior := getObjectMetaTx(b, key)
+	if prior != nil && versionIsOlder(meta.VersionID, prior.VersionID) {
+		// A version older than the current one never takes the key: the
+		// highest ID is current (see versionIsOlder).
+		return nil
+	}
+	if versionOrdering.Load() && meta.VersionID != prior.versionIDOr("") {
+		if _, timed := VersionIDTime(meta.VersionID); timed {
+			// The pointer follows the decision PutObjectVersion made: a
+			// version it stored as noncurrent (a higher one is flagged
+			// latest) does not take the key either, or GET served one
+			// version while the listing called another current.
+			if data := tx.Bucket(objectVersionsBucket).Get(versionKey(meta.Bucket, meta.Key, meta.VersionID)); data != nil {
+				var rec ObjectMeta
+				if json.Unmarshal(data, &rec) == nil && !rec.IsLatest {
+					return nil
+				}
+			}
+		}
+	}
+	oSize, oCount := metaWeight(prior)
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err
@@ -1640,6 +1661,42 @@ func versionPrefix(bucket, key string) []byte {
 func (s *Store) PutObjectVersion(meta ObjectMeta) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectVersionsBucket)
+		if meta.IsLatest && versionOrdering.Load() {
+			// A version already marked latest with a higher ID, whose writer
+			// has not yet pointed the key at it, wins too: deciding by the
+			// pointer alone let two interleaved writers leave the pointer on
+			// one version and the latest flag on the other, and a later lock
+			// or tag call on the flagged one made the older version current.
+			prefix := versionPrefix(meta.Bucket, meta.Key)
+			c := b.Cursor()
+			for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+				var other ObjectMeta
+				if json.Unmarshal(v, &other) == nil && other.IsLatest && versionIsOlder(meta.VersionID, other.VersionID) {
+					meta.IsLatest = false
+					break
+				}
+			}
+		}
+		if meta.IsLatest && versionOrdering.Load() {
+			if cur := getObjectMetaTx(tx.Bucket(objectsBucket), objectMetaKey(meta.Bucket, meta.Key)); cur != nil && versionIsOlder(meta.VersionID, cur.VersionID) {
+				// The current version stays current. A writer may already
+				// have marked its record noncurrent, expecting this one to
+				// take over: mark it latest again.
+				meta.IsLatest = false
+				ck := versionKey(meta.Bucket, meta.Key, cur.VersionID)
+				if data := b.Get(ck); data != nil {
+					var cv ObjectMeta
+					if json.Unmarshal(data, &cv) == nil && !cv.IsLatest {
+						cv.IsLatest = true
+						if d, err := json.Marshal(cv); err == nil {
+							if err := b.Put(ck, d); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
+		}
 		data, err := json.Marshal(meta)
 		if err != nil {
 			return err
@@ -3223,4 +3280,45 @@ func (c *conditionValues) UnmarshalJSON(b []byte) error {
 	}
 	*c = many
 	return nil
+}
+
+// versionOrdering switches on the rule that the highest version ID is
+// current (versionIsOlder). It is for active-active replication, where every
+// site must reach the same current version whatever order versions arrive
+// in. Without it, the last version committed is current, as before 5.0.12:
+// on a Raft cluster a node whose applied state lags the leader takes the ID
+// of a new write from its own clock and its stale view of the key, so under
+// clock skew a later write could take a lower ID, and the rule would keep
+// the earlier write current after the later one had been acknowledged.
+var versionOrdering atomic.Bool
+
+// SetVersionOrdering turns the highest-ID-is-current rule on (active-active
+// replication) or off. Set once at startup, the same on every node.
+func SetVersionOrdering(on bool) { versionOrdering.Store(on) }
+
+// versionIsOlder reports whether version id was created before cur, both
+// being IDs that start with their creation time (see NewVersionID).
+//
+// The highest such ID is a key's current version. That is enforced here,
+// where the version is committed, and not only where the ID is chosen: an
+// upload takes its ID before its body arrives, so a slow upload that began
+// first finished last and became current with the lower ID, while another
+// site that applied both made the higher one current, and the sites
+// disagreed. A version that loses is kept, as a noncurrent version, as S3
+// keeps the earlier of two concurrent writes. The null version and an
+// object from before versioning carry no time, and are not compared.
+func versionIsOlder(id, cur string) bool {
+	if id == cur || !versionOrdering.Load() {
+		return false
+	}
+	a, okA := VersionIDTime(id)
+	b, okB := VersionIDTime(cur)
+	return okA && okB && (a < b || (a == b && id < cur))
+}
+
+func (m *ObjectMeta) versionIDOr(def string) string {
+	if m == nil {
+		return def
+	}
+	return m.VersionID
 }

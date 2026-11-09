@@ -43,7 +43,7 @@ func (h *APIHandler) handleTieringMigrate(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := h.tieringMgr.ManualMigrate(req.Bucket, req.Key, req.Direction); err != nil {
-		if errors.Is(err, tiering.ErrColdWritesDisabled) || errors.Is(err, tiering.ErrNothingToRestore) || errors.Is(err, tiering.ErrHotPathBlocked) {
+		if errors.Is(err, tiering.ErrNothingToRestore) || errors.Is(err, tiering.ErrHotPathBlocked) || errors.Is(err, tiering.ErrColdMovesUnsupported) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}

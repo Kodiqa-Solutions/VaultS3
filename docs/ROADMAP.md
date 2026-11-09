@@ -10,13 +10,13 @@ What is planned, and what has already shipped.
 
 Planned for the next releases, most of it lifting limits 5.0.11 had to put in place:
 
-- [ ] Data tiering that reads through the cold tier, so moving objects there can be turned back on (paused in 5.0.11 because nothing read from it)
-- [ ] Active-active replication of buckets with versioning (5.0.11 skips them rather than corrupt their history)
-- [ ] A cached bucket size, so a quota on a large versioned bucket does not walk every version on each write
+- [x] Data tiering that reads through the cold tier, so moving objects there can be turned back on (paused in 5.0.11 because nothing read from it), in 5.0.12
+- [x] Active-active replication of buckets with versioning (5.0.11 skips them rather than corrupt their history), in 5.0.12
+- [x] A cached bucket size, so a quota on a large versioned bucket does not walk every version on each write, in 5.0.12
 - [ ] Bucket quotas counted across a cluster instead of per node
 - [ ] Form uploads signed with an Authorization header routed by key in a cluster
-- [ ] Snowball archives extracted while they stream, instead of after the whole archive arrived
-- [ ] Docker healthcheck that works with `VAULTS3_BASE_PATH`
+- [x] Snowball archives extracted while they stream, instead of after the whole archive arrived (signed chunks), in 5.0.12
+- [x] Docker healthcheck that works with `VAULTS3_BASE_PATH`, in 5.0.12
 
 ## Shipped and in progress
 

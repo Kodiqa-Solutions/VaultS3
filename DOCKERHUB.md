@@ -33,14 +33,14 @@ S3 API: `http://localhost:9000`
 - **External authorization webhook** -- delegate each access decision to an endpoint you run
 - **Lifecycle rules** -- expiration by prefix, abort incomplete multipart
 - **Event notifications** -- Kafka, NATS, Redis, AMQP/RabbitMQ, PostgreSQL, Elasticsearch, webhooks
-- **Replication** -- async push and active-active bidirectional with vector clocks
+- **Replication** -- async push and active-active bidirectional with vector clocks, versioned buckets included
 - **Raft clustering** -- multi-node with consistent hashing and automatic failover, replica repair that restores copies after a node is lost for good, and optional sharded metadata so the index grows with the cluster
 - **Erasure coding** -- Reed-Solomon with background healer
 - **Compression** -- transparent zstd on write (gzip still read) with exclusions for already-compressed types
 - **FUSE mount** -- mount buckets as local filesystem directories
 - **Full-text search** -- search objects by key, content type, and tags
 - **Virus scanning** -- webhook integration (ClamAV, VirusTotal) with quarantine
-- **Data tiering** -- cold tier restore (moving objects to cold is paused in 5.0.11)
+- **Data tiering** -- objects not read for a while move to a cold directory and are still read from there, RestoreObject brings them back
 - **Backup scheduler** -- cron-based full/incremental backups
 - **Lambda triggers** -- webhook functions on S3 events
 - **Orphan reclaim** -- `vaults3-cli storage reclaim` frees data files that no metadata refers to, across every node
