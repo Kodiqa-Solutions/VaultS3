@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>VaultS3</Name>
+  <Repository>eniz1806/vaults3:latest</Repository>
+  <Registry>https://hub.docker.com/r/eniz1806/vaults3</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Kodiqa-Solutions/VaultS3/issues</Support>
+  <Project>https://vaults3.com</Project>
+  <Overview>S3-compatible object storage in one small binary, with a built-in web dashboard. Works with the AWS CLI, boto3, rclone, restic, Velero and any other S3 client.[br][br]Versioning and object lock, per-bucket encryption, quotas, lifecycle, IAM users and policies, replication to another site, scheduled backups and Prometheus metrics. Uses about 12 MiB of memory at idle. AGPL-3.0, no paid tier and no telemetry.[br][br]On the first start without a secret key, the server generates an admin secret and prints it once to the container log. The dashboard is at /dashboard/ on port 9000, which is also the S3 endpoint.</Overview>
+  <Category>Cloud: Backup: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:9000]/dashboard/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Kodiqa-Solutions/VaultS3/main/deploy/unraid/vaults3.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Kodiqa-Solutions/VaultS3/main/assets/icon-256.png</Icon>
+  <ExtraParams>--user 0:0 --stop-timeout 35</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>VaultS3 5.0.13 or later. The container starts as root only to take ownership of its folders, then runs as PUID:PGID.</Requires>
+  <Config Name="S3 API and dashboard" Target="9000" Default="9000" Mode="tcp" Description="S3 endpoint, and the dashboard at /dashboard/." Type="Port" Display="always" Required="true" Mask="false">9000</Config>
+  <Config Name="Object data" Target="/data" Default="/mnt/user/appdata/vaults3/data" Mode="rw" Description="Where the objects are stored. Put it on the share that should hold the data." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/vaults3/data</Config>
+  <Config Name="Metadata" Target="/metadata" Default="/mnt/user/appdata/vaults3/metadata" Mode="rw" Description="The index of buckets, objects, users and keys. Small; keep it on a cache pool (SSD). Back it up together with the data." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/vaults3/metadata</Config>
+  <Config Name="Admin access key" Target="VAULTS3_ACCESS_KEY" Default="vaults3-admin" Mode="" Description="The admin's access key." Type="Variable" Display="always" Required="false" Mask="false">vaults3-admin</Config>
+  <Config Name="Admin secret key" Target="VAULTS3_SECRET_KEY" Default="" Mode="" Description="The admin's secret key; use a long random one. Leave empty to have one generated on the first start and printed once in the log. Once saved, change it from the dashboard; this field is then ignored." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User the server runs as, and who owns the data and metadata folders. 99 is Unraid's nobody." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group the server runs as. 100 is Unraid's users." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="Buckets on first start" Target="VAULTS3_DEFAULT_BUCKETS" Default="" Mode="" Description="Comma-separated buckets to create if missing, e.g. backups,photos. Existing buckets are left alone." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Domain" Target="VAULTS3_DOMAIN" Default="" Mode="" Description="Set for virtual-hosted bucket URLs (bucket.s3.example.com). Path-style URLs work without it." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

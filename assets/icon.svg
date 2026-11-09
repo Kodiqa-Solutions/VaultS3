@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="2 0 100 104" fill="none">
+  <!-- The shield from logo-dark.svg, square, for app icons (Unraid, Artifact Hub). -->
+    <!-- Shield shape -->
+    <path d="M50 5 L90 20 L90 55 C90 78 72 95 50 100 C28 95 10 78 10 55 L10 20 Z"
+          fill="#6366F1" stroke="#818CF8" stroke-width="2"/>
+    <!-- Lock body -->
+    <rect x="33" y="45" width="34" height="28" rx="4" fill="#1E1B4B" stroke="#818CF8" stroke-width="1.5"/>
+    <!-- Lock shackle -->
+    <path d="M38 45 L38 35 C38 27 43 22 50 22 C57 22 62 27 62 35 L62 45"
+          fill="none" stroke="#1E1B4B" stroke-width="4" stroke-linecap="round"/>
+    <!-- Keyhole -->
+    <circle cx="50" cy="56" r="4" fill="#A5B4FC"/>
+    <rect x="48.5" y="57" width="3" height="8" rx="1.5" fill="#A5B4FC"/>
+    <!-- S3 badge -->
+    <circle cx="78" cy="80" r="14" fill="#10B981" stroke="#34D399" stroke-width="1.5"/>
+    <text x="78" y="85" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="700" fill="white">S3</text>
+</svg>

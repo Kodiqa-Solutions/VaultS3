@@ -18,6 +18,7 @@ services:
   vaults3:
     image: eniz1806/vaults3:latest
     volumes: [vaults3-data:/data, vaults3-meta:/metadata]
+    stop_grace_period: 35s   # let running requests finish when it is recreated
   watchtower:
     image: containrrr/watchtower
     volumes: [/var/run/docker.sock:/var/run/docker.sock]
@@ -62,6 +63,22 @@ ignores, so an older server reads those objects from the front correctly.
 
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
+
+## Upgrading to 5.0.13
+
+- **On a cluster, bucket quotas count the whole cluster**, from the
+  replicated metadata, by the size objects were written with (every
+  version included), not each node's disk. A bucket that already holds more
+  than its quota across the cluster refuses new writes until it is under it.
+  Each bucket is measured once, at its first write or quota check after the
+  upgrade, by reading its records (about 0.7 s per 500,000 objects and
+  versions, during which that node's metadata writes wait); upgrade every
+  node before relying on it. A single server is unchanged.
+- **`PUID`/`PGID`** are new and do nothing unless set. See
+  [INSTALL](INSTALL.md#unraid-synology-truenas-puid-and-pgid).
+- **Helm:** pods get `terminationGracePeriodSeconds: 35`, so running
+  requests finish when a pod stops. Set the value lower only if you also
+  lower `server.shutdown_timeout_secs`.
 
 ## Upgrading to 5.0.12
 

@@ -119,6 +119,9 @@ spec:
       labels:
         app.kubernetes.io/name: vaults3
     spec:
+      # Longer than server.shutdown_timeout_secs (30): the pod is killed when
+      # this runs out, and the default of 30 cut the last requests short.
+      terminationGracePeriodSeconds: 35
       securityContext:
         fsGroup: 1000
       containers:

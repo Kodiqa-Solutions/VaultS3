@@ -1041,7 +1041,16 @@ func (h *APIHandler) uploadQuota(bucket, key, versioning string) (int64, error) 
 	if err != nil || (info.MaxSizeBytes == 0 && info.MaxObjects == 0) {
 		return -1, nil
 	}
-	size, count, _ := h.engine.BucketSize(bucket)
+	var size, count int64
+	stored := false
+	if h.storedUsage {
+		if st, err := h.store.BucketStoredUsage(bucket); err == nil {
+			size, count, stored = st.Size, st.Count, true
+		}
+	}
+	if !stored {
+		size, count, _ = h.engine.BucketSize(bucket)
+	}
 	// An overwrite is not one more object, and gives back the replaced
 	// file's size on disk (the quota counts bytes on disk, which a compressed
 	// object's recorded size is not). A suspended bucket rewrites the null
@@ -1049,6 +1058,10 @@ func (h *APIHandler) uploadQuota(bucket, key, versioning string) (int64, error) 
 	if versioning != "Enabled" {
 		if meta, merr := h.store.GetObjectMeta(bucket, key); merr == nil && meta != nil && !meta.DeleteMarker {
 			switch {
+			case h.storedUsage && (versioning == "" || meta.VersionID == "null" || meta.VersionID == ""):
+				// A cluster's quota counts recorded sizes.
+				count--
+				size -= meta.Size
 			case versioning == "":
 				count--
 				size -= h.plainFileSize(bucket, key)

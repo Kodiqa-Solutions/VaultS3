@@ -212,6 +212,14 @@ func (h *Handler) SetColdRestorer(fn func(bucket, key string) error) {
 	h.objects.coldRestorer = fn
 }
 
+// SetStoredUsageQuota holds bucket quotas to the stored usage the metadata
+// records, the same on every node, instead of this node's disk. For a
+// cluster.
+func (h *Handler) SetStoredUsageQuota(on bool) {
+	h.buckets.storedUsage = on
+	h.objects.storedUsage = on
+}
+
 // SetColdPath sets where an object's file is in the cold tier, so an
 // overwrite of a cold object gives its size back to the bucket quota.
 func (h *Handler) SetColdPath(fn func(bucket, key string) string) {

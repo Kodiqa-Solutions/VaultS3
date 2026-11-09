@@ -47,6 +47,10 @@ func traceRead404(r *http.Request, method, bucket, key, cause string) {
 }
 
 type ObjectHandler struct {
+	// storedUsage holds quotas to the bucket's stored usage in the metadata,
+	// the same on every node, instead of this node's disk (a cluster).
+	storedUsage bool
+
 	// coldRestorer moves an object back from the cold tier (RestoreObject),
 	// or nil when tiering is not configured.
 	coldRestorer func(bucket, key string) error
@@ -392,7 +396,7 @@ func (h *ObjectHandler) checkQuotaFor(w http.ResponseWriter, bucket, key string,
 		return true // no limits
 	}
 
-	currentSize, currentCount, _ := h.engine.BucketSize(bucket)
+	currentSize, currentCount := bucketUsage(h.store, h.engine, h.storedUsage, bucket)
 	if replaces, onDisk := h.replacesObject(bucket, key); replaces {
 		currentCount--
 		currentSize -= onDisk
@@ -428,10 +432,14 @@ func (h *ObjectHandler) replacesObject(bucket, key string) (bool, int64) {
 	if err != nil || meta == nil || meta.DeleteMarker {
 		return false, 0
 	}
+	if v == "Suspended" && meta.VersionID != "" && meta.VersionID != "null" {
+		return false, 0
+	}
+	if h.storedUsage {
+		// A cluster's quota counts recorded sizes (bucketUsage).
+		return true, meta.Size
+	}
 	if v == "Suspended" {
-		if meta.VersionID != "" && meta.VersionID != "null" {
-			return false, 0
-		}
 		// A null version written while suspended lives in the version store,
 		// .vs/<key>/null; one from before versioning is the plain file.
 		if meta.VersionID == "null" {
@@ -2408,4 +2416,21 @@ func (h *ObjectHandler) GetObjectACL(w http.ResponseWriter, r *http.Request, buc
 			Permission: "FULL_CONTROL",
 		}},
 	})
+}
+
+// bucketUsage is the size and count a bucket quota is held to: on one server
+// the bytes on disk, on a cluster the stored usage the metadata records,
+// which every node shares. Each node of a cluster only sees its own disk, so
+// each held the quota on its own share and a bucket grew to several times
+// its quota.
+func bucketUsage(store metadata.StoreAPI, engine storage.Engine, stored bool, bucket string) (int64, int64) {
+	if stored {
+		if st, err := store.BucketStoredUsage(bucket); err == nil {
+			return st.Size, st.Count
+		} else {
+			slog.Warn("could not read a bucket's stored usage, using this node's disk", "bucket", bucket, "error", err)
+		}
+	}
+	size, count, _ := engine.BucketSize(bucket)
+	return size, count
 }

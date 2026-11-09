@@ -57,6 +57,7 @@ The chart ships a `values.schema.json`, so `helm install` and `helm upgrade` ref
 | `ingress.enabled` | `false` | Enable + set `hosts` to expose via Ingress. For large uploads set `nginx.ingress.kubernetes.io/proxy-body-size: "0"`. |
 | `serviceMonitor.enabled` | `false` | Prometheus-Operator scraping of `/metrics`. |
 | `resources` | 100m/128Mi → 1/512Mi | VaultS3 is light (<80MB RAM typical). |
+| `terminationGracePeriodSeconds` | `35` | Time the pod gets to stop. Keep it above `server.shutdown_timeout_secs` in `config` (30), the time running requests get to finish. |
 | `extraEnv` | `[]` | Extra env vars (`VAULTS3_LOG_LEVEL`, `VAULTS3_DOMAIN`, `VAULTS3_ENCRYPTION_KEY`, …). |
 
 See [`values.yaml`](./values.yaml) for the full list.

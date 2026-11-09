@@ -693,9 +693,11 @@ backup:
   combine both layers for full disk-*and*-node protection.
 - **Backup:** local target only. Restore is a manual file copy.
 - **Replication:** VaultS3↔VaultS3 only. Not to AWS S3 or other providers.
-- **Bucket quotas are counted per node.** Each node holds a bucket to its quota
-  with the objects and parts it stores itself, so with fewer replicas than nodes
-  a bucket can hold more than its quota across the cluster.
+- **Bucket quotas count the whole cluster** (from 5.0.13): every object and
+  version the replicated metadata records, by the size it was written with,
+  once however many nodes hold a copy (a single server counts bytes on its disk
+  instead). Parts of multipart uploads still in progress live on the node that
+  received them, so each node counts only its own until the upload completes.
 - **Form uploads signed with an Authorization header** (not a POST policy) are routed by
   their bucket, since the key is inside the form and the signature covers the body as sent,
   so the form cannot be rebuilt for the key's own node. In a cluster where a bucket has fewer

@@ -76,7 +76,7 @@ together with `VAULTS3_ADMIN_CREDENTIALS_OVERRIDE=true` for one start.
 ```bash
 # From Docker Hub
 docker pull eniz1806/vaults3
-docker run -p 9000:9000 \
+docker run -p 9000:9000 --stop-timeout 35 \
   -e VAULTS3_ACCESS_KEY=myadmin \
   -e VAULTS3_SECRET_KEY=mysupersecret \
   -v vaults3-data:/data -v vaults3-meta:/metadata \
@@ -84,10 +84,46 @@ docker run -p 9000:9000 \
 
 # Or build locally
 docker build -t vaults3 .
-docker run -p 9000:9000 -v vaults3-data:/data -v vaults3-meta:/metadata vaults3
+docker run -p 9000:9000 --stop-timeout 35 -v vaults3-data:/data -v vaults3-meta:/metadata vaults3
 ```
 
+On a stop, VaultS3 lets requests that are still running finish, for up to
+`server.shutdown_timeout_secs` (30 by default). Docker kills a container 10
+seconds after asking it to stop, so `--stop-timeout 35` (in Compose,
+`stop_grace_period: 35s`) is what lets an upload or a download in progress
+complete. Keep it a few seconds above the shutdown timeout if you change it.
+
 Images are automatically published to [Docker Hub](https://hub.docker.com/r/eniz1806/vaults3) on every push to `main`, and from 5.0.12 the same images, with the same tags, to GitHub Container Registry as `ghcr.io/kodiqa-solutions/vaults3`, for networks that pull only from GHCR or to avoid Docker Hub's pull limits.
+
+### Unraid, Synology, TrueNAS: PUID and PGID
+
+The image runs as uid 1000. When the folders mounted at `/data` and
+`/metadata` are owned by root, as Docker creates a host folder that does not
+exist yet, the server cannot open its metadata and stops with
+`permission denied`. Either give the folders to uid 1000
+(`chown -R 1000:1000`), or let the container take them over: start it as
+root with `PUID` and `PGID` set, and the server gives its folders to that
+user and group, then switches to them for good before opening anything
+else. The data, metadata and Raft folders, which hold only VaultS3's files,
+are given with everything in them. A cold tier, erasure disk, local backup
+target or vector index folder can be pointed anywhere, so only the folder
+itself is given, and for the access log only the file; the file system root
+is never given away.
+
+```bash
+docker run -d --name vaults3 -p 9000:9000 --stop-timeout 35 \
+  --user 0:0 -e PUID=99 -e PGID=100 \
+  -v /mnt/user/appdata/vaults3/data:/data \
+  -v /mnt/user/appdata/vaults3/metadata:/metadata \
+  eniz1806/vaults3
+```
+
+The data folder is walked only when its owner is not `PUID:PGID`, so a
+large one is walked once, on the first start; the small metadata folder is
+walked on every start, so a database restored into it as root (a
+`docker exec` in a container started as root runs as root) is given back. Without `PUID` and
+`PGID` nothing changes: a container started as root stays root. Unraid has
+a ready template: [`deploy/unraid`](../deploy/unraid/).
 
 ### Storage layout in production
 
@@ -109,7 +145,7 @@ one-off S3 client call before the app can write anything. Name the buckets you
 need instead and VaultS3 creates the missing ones while it starts:
 
 ```bash
-docker run -p 9000:9000 \
+docker run -p 9000:9000 --stop-timeout 35 \
   -e VAULTS3_DEFAULT_BUCKETS=app-data,backups \
   -v ./data:/data -v ./metadata:/metadata \
   eniz1806/vaults3
@@ -158,6 +194,7 @@ All settings can be overridden via environment variables (takes precedence over 
 | `VAULTS3_TRACE_FORWARD` | Log per-hop latency (DNS/connect/reuse/TTFB) for proxied cluster reads | `0` |
 | `VAULTS3_TRACE_READS` | Log the cause (`meta_nil` vs `data_missing`) of cluster `GET`/`HEAD` 404s | `0` |
 | `VAULTS3_OIDC_CLIENT_SECRET` | OAuth client secret for SSO (keeps it out of the config file) | _(public client)_ |
+| `PUID` / `PGID` | Started as root (`--user 0:0`), give the data folders to this user and group and run as them. See [PUID and PGID](#unraid-synology-truenas-puid-and-pgid) | _(unset: no change)_ |
 
 ## Storage requirements
 

@@ -5,6 +5,7 @@
 | **Helm chart** | [`helm/vaults3/`](./helm/vaults3/) | Configurable, production installs |
 | **Plain manifests** | [`k8s/quickstart.yaml`](./k8s/quickstart.yaml) | One-command single-node try-out |
 | **Docker / Compose** | [`../docs/INSTALL.md`](../docs/INSTALL.md#docker) | Single host, no Kubernetes |
+| **Unraid template** | [`unraid/`](./unraid/) | Unraid servers (Docker tab, Add Container) |
 
 ## Helm (recommended)
 

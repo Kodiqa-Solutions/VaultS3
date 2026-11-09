@@ -332,7 +332,7 @@ func (h *ObjectHandler) quotaByteLimit(bucket string) int64 {
 	if err != nil || info.MaxSizeBytes == 0 {
 		return -1
 	}
-	currentSize, _, _ := h.engine.BucketSize(bucket)
+	currentSize, _ := bucketUsage(h.store, h.engine, h.storedUsage, bucket)
 	// A bucket already past its quota (the quota was lowered) has no room,
 	// not no limit: -1 means only "no quota". A negative remainder used to
 	// be read as no limit by every streaming check, so such a bucket took

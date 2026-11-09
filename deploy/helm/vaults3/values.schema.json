@@ -133,6 +133,11 @@
     "resources": { "type": "object" },
     "livenessProbe": { "type": "object" },
     "readinessProbe": { "type": "object" },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Seconds the pod gets to stop. Keep it above server.shutdown_timeout_secs (30 by default)."
+    },
     "podSecurityContext": { "type": "object" },
     "securityContext": { "type": "object" },
     "serviceAccount": {

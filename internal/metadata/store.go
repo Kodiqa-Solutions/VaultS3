@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,7 @@ var (
 	replicationConfigBucket = []byte("replication_configs")
 	serverSettingsBucket    = []byte("server_settings")
 	bucketStatsBucket       = []byte("bucket_stats")
+	bucketStoredBucket      = []byte("bucket_stored")
 )
 
 type Store struct {
@@ -365,6 +367,12 @@ func NewStore(path string) (*Store, error) {
 
 	s := &Store{db: db}
 
+	// First, before any other write moves the transaction count on.
+	if err := verifyStoredFigures(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("check stored usage figures: %w", err)
+	}
+
 	// A snapshot restore that did not finish leaves a partial copy of the
 	// cluster's metadata. Serving it would silently present a subset of the
 	// objects as the whole set, so drop it and start clean: the state is derived
@@ -457,6 +465,9 @@ func NewStore(path string) (*Store, error) {
 		if _, err := tx.CreateBucketIfNotExists(serverSettingsBucket); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists(bucketStoredBucket); err != nil {
+			return err
+		}
 		if _, err := tx.CreateBucketIfNotExists(bucketStatsBucket); err != nil {
 			return err
 		}
@@ -466,12 +477,52 @@ func NewStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init metadata buckets: %w", err)
 	}
-
 	return s, nil
 }
 
 func (s *Store) Close() error {
+	// Mark the stored-usage figures as kept by this binary up to this
+	// point (see storedCleanKey).
+	_ = s.db.Update(func(tx *bolt.Tx) error {
+		sb := tx.Bucket(bucketStoredBucket)
+		if sb == nil {
+			return nil
+		}
+		return sb.Put(storedCleanKey, []byte(strconv.Itoa(tx.ID())))
+	})
 	return s.db.Close()
+}
+
+// storedCleanKey marks, in bucket_stored, the transaction a clean close of
+// this version ended on. Bucket names cannot hold a NUL byte, so no bucket's
+// figure uses the key.
+//
+// A version before 5.0.13 never adjusts the figures, so writes it made (a
+// node rolled back to it and forward again) were never counted and the
+// figures were wrong for good. A crash can leave them behind too. Opening
+// clears every figure unless the file ends on this version's own clean close;
+// each bucket is then measured again when next used.
+var storedCleanKey = []byte("\x00closed-at-tx")
+
+// verifyStoredFigures clears the stored-usage figures unless the last close
+// was this version's own, with nothing written since.
+func verifyStoredFigures(db *bolt.DB) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		sb := tx.Bucket(bucketStoredBucket)
+		if sb == nil {
+			return nil
+		}
+		marker := sb.Get(storedCleanKey)
+		clean := marker != nil && string(marker) == strconv.Itoa(tx.ID()-1)
+		if clean {
+			return sb.Delete(storedCleanKey)
+		}
+		if err := tx.DeleteBucket(bucketStoredBucket); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucket(bucketStoredBucket)
+		return err
+	})
 }
 
 // Bucket operations
@@ -499,6 +550,11 @@ func (s *Store) DeleteBucket(name string) error {
 		}
 		if sb := tx.Bucket(bucketStatsBucket); sb != nil {
 			sb.Delete([]byte(name))
+		}
+		if sb := tx.Bucket(bucketStoredBucket); sb != nil {
+			if err := sb.Delete([]byte(name)); err != nil {
+				return err
+			}
 		}
 		return b.Delete([]byte(name))
 	})
@@ -1016,6 +1072,11 @@ func putObjectMetaTx(tx *bolt.Tx, meta ObjectMeta) error {
 	if err := b.Put(key, data); err != nil {
 		return err
 	}
+	ps, pc := pointerStoredWeight(prior)
+	ns, nc := pointerStoredWeight(&meta)
+	if err := adjustStoredTx(tx, meta.Bucket, ns-ps, nc-pc); err != nil {
+		return err
+	}
 	nSize, nCount := metaWeight(&meta)
 	return adjustBucketStatsTx(tx, meta.Bucket, nSize-oSize, nCount-oCount)
 }
@@ -1060,8 +1121,13 @@ func (s *Store) DeleteObjectMeta(bucket, key string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectsBucket)
 		k := objectMetaKey(bucket, key)
-		oSize, oCount := metaWeight(getObjectMetaTx(b, k))
+		prior := getObjectMetaTx(b, k)
+		oSize, oCount := metaWeight(prior)
 		if err := b.Delete(k); err != nil {
+			return err
+		}
+		ps, pc := pointerStoredWeight(prior)
+		if err := adjustStoredTx(tx, bucket, -ps, -pc); err != nil {
 			return err
 		}
 		return adjustBucketStatsTx(tx, bucket, -oSize, -oCount)
@@ -1551,6 +1617,12 @@ func (s *Store) DeleteBucketObjectMeta(bucket string) error {
 		if err := deletePrefix(tx.Bucket(objectsBucket), prefix); err != nil {
 			return err
 		}
+		// Measured again, from the versions that remain, when next needed.
+		if sb := tx.Bucket(bucketStoredBucket); sb != nil {
+			if err := sb.Delete([]byte(bucket)); err != nil {
+				return err
+			}
+		}
 		// All objects gone → reset the cached counters to zero.
 		if sb := tx.Bucket(bucketStatsBucket); sb != nil {
 			if data, _ := json.Marshal(BucketStat{}); data != nil {
@@ -1727,7 +1799,13 @@ func (s *Store) PutObjectVersion(meta ObjectMeta) error {
 				}
 			}
 		}
-		return b.Put(versionKey(meta.Bucket, meta.Key, meta.VersionID), data)
+		vk := versionKey(meta.Bucket, meta.Key, meta.VersionID)
+		os_, oc := versionStoredWeight(decodeMeta(b.Get(vk)))
+		if err := b.Put(vk, data); err != nil {
+			return err
+		}
+		ns, nc := versionStoredWeight(&meta)
+		return adjustStoredTx(tx, meta.Bucket, ns-os_, nc-oc)
 	})
 }
 
@@ -1794,7 +1872,12 @@ func (s *Store) LatestObjectVersion(bucket, key string) (*ObjectMeta, error) {
 func (s *Store) DeleteObjectVersion(bucket, key, versionID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(objectVersionsBucket)
-		if err := b.Delete(versionKey(bucket, key, versionID)); err != nil {
+		vk := versionKey(bucket, key, versionID)
+		vs, vc := versionStoredWeight(decodeMeta(b.Get(vk)))
+		if err := b.Delete(vk); err != nil {
+			return err
+		}
+		if err := adjustStoredTx(tx, bucket, -vs, -vc); err != nil {
 			return err
 		}
 		ob := tx.Bucket(objectsBucket)
@@ -1812,8 +1895,12 @@ func (s *Store) DeleteObjectVersion(bucket, key, versionID string) error {
 		} else {
 			k, v = c.Prev()
 		}
+		ps, pc := pointerStoredWeight(cur)
 		if k == nil || !bytes.HasPrefix(k, prefix) {
 			if err := ob.Delete(mk); err != nil {
+				return err
+			}
+			if err := adjustStoredTx(tx, bucket, -ps, -pc); err != nil {
 				return err
 			}
 			return adjustBucketStatsTx(tx, bucket, -oSize, -oCount)
@@ -1831,6 +1918,10 @@ func (s *Store) DeleteObjectVersion(bucket, key, versionID string) error {
 			return err
 		}
 		if err := ob.Put(mk, data); err != nil {
+			return err
+		}
+		ns, nc := pointerStoredWeight(&next)
+		if err := adjustStoredTx(tx, bucket, ns-ps, nc-pc); err != nil {
 			return err
 		}
 		nSize, nCount := metaWeight(&next)
@@ -2079,8 +2170,14 @@ func (s *Store) SetLatestVersion(bucket, key, versionID string) error {
 		}
 		ob := tx.Bucket(objectsBucket)
 		mk := objectMetaKey(bucket, key)
-		oSize, oCount := metaWeight(getObjectMetaTx(ob, mk))
+		prior := getObjectMetaTx(ob, mk)
+		oSize, oCount := metaWeight(prior)
 		if err := ob.Put(mk, data); err != nil {
+			return err
+		}
+		ps, pc := pointerStoredWeight(prior)
+		ns, nc := pointerStoredWeight(decodeMeta(data))
+		if err := adjustStoredTx(tx, bucket, ns-ps, nc-pc); err != nil {
 			return err
 		}
 		// Repointing the latest pointer changes the bucket's live size/count (e.g.
@@ -2103,7 +2200,13 @@ func (s *Store) UpdateObjectVersionMeta(meta ObjectMeta) error {
 		if err != nil {
 			return err
 		}
-		if err := b.Put(versionKey(meta.Bucket, meta.Key, meta.VersionID), data); err != nil {
+		vk := versionKey(meta.Bucket, meta.Key, meta.VersionID)
+		vs, vc := versionStoredWeight(decodeMeta(b.Get(vk)))
+		if err := b.Put(vk, data); err != nil {
+			return err
+		}
+		nvs, nvc := versionStoredWeight(&meta)
+		if err := adjustStoredTx(tx, meta.Bucket, nvs-vs, nvc-vc); err != nil {
 			return err
 		}
 		// Also update the objects bucket if this is the latest, adjusting the cached
@@ -2111,8 +2214,14 @@ func (s *Store) UpdateObjectVersionMeta(meta ObjectMeta) error {
 		if meta.IsLatest {
 			ob := tx.Bucket(objectsBucket)
 			mk := objectMetaKey(meta.Bucket, meta.Key)
-			oSize, oCount := metaWeight(getObjectMetaTx(ob, mk))
+			prior := getObjectMetaTx(ob, mk)
+			oSize, oCount := metaWeight(prior)
 			if err := ob.Put(mk, data); err != nil {
+				return err
+			}
+			ps, pc := pointerStoredWeight(prior)
+			ns, nc := pointerStoredWeight(&meta)
+			if err := adjustStoredTx(tx, meta.Bucket, ns-ps, nc-pc); err != nil {
 				return err
 			}
 			nSize, nCount := metaWeight(&meta)
@@ -3321,4 +3430,138 @@ func (m *ObjectMeta) versionIDOr(def string) string {
 		return def
 	}
 	return m.VersionID
+}
+
+// The stored usage of a bucket is the size and count of everything it keeps:
+// every version (delete markers hold nothing) and every object written
+// without versioning. A bucket quota on a cluster is held to it.
+//
+// A quota on one server is held to the bytes on its disk (BucketSize). On a
+// cluster each node only sees its own disk, so each node held the quota on
+// its own share and the bucket could grow to several times its quota. This
+// figure is kept in the metadata, adjusted in the same transaction as each
+// write the Raft state machine applies, so every node holds the same value.
+// It counts an object's size once, as the client wrote it, however many
+// nodes hold a copy and whatever compression does on disk.
+
+// versionStoredWeight is a version record's share of the stored usage.
+func versionStoredWeight(m *ObjectMeta) (int64, int64) {
+	if m == nil || m.DeleteMarker {
+		return 0, 0
+	}
+	return m.Size, 1
+}
+
+// pointerStoredWeight is a key's current record's share. A record that names
+// a version is counted with the versions; only an object written without
+// versioning, which has no version record, counts here.
+func pointerStoredWeight(m *ObjectMeta) (int64, int64) {
+	if m == nil || m.DeleteMarker || m.VersionID != "" {
+		return 0, 0
+	}
+	return m.Size, 1
+}
+
+func decodeMeta(data []byte) *ObjectMeta {
+	if data == nil {
+		return nil
+	}
+	var m ObjectMeta
+	if json.Unmarshal(data, &m) != nil {
+		return nil
+	}
+	return &m
+}
+
+// adjustStoredTx moves a bucket's stored usage by a write already made in
+// tx. A bucket with no figure yet (created before 5.0.13, or emptied) is
+// measured instead, in the same transaction, after the write, so the figure
+// includes it. Every node measures at the same point of the Raft log, so all
+// reach the same value.
+func adjustStoredTx(tx *bolt.Tx, bucket string, dSize, dCount int64) error {
+	if dSize == 0 && dCount == 0 {
+		return nil
+	}
+	sb := tx.Bucket(bucketStoredBucket)
+	if sb == nil {
+		return nil
+	}
+	var st BucketStat
+	if data := sb.Get([]byte(bucket)); data != nil {
+		if err := json.Unmarshal(data, &st); err != nil {
+			return err
+		}
+		st.Size, st.Count = max(0, st.Size+dSize), max(0, st.Count+dCount)
+	} else {
+		st = measureStoredTx(tx, bucket)
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	return sb.Put([]byte(bucket), data)
+}
+
+// measureStoredTx adds up a bucket's stored usage from its records.
+func measureStoredTx(tx *bolt.Tx, bucket string) BucketStat {
+	var st BucketStat
+	add := func(s, c int64) { st.Size += s; st.Count += c }
+	if ob := tx.Bucket(objectsBucket); ob != nil {
+		prefix := []byte(bucket + "/")
+		c := ob.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			add(pointerStoredWeight(decodeMeta(v)))
+		}
+	}
+	if vb := tx.Bucket(objectVersionsBucket); vb != nil {
+		prefix := []byte(bucket + "\x00")
+		c := vb.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			add(versionStoredWeight(decodeMeta(v)))
+		}
+	}
+	return st
+}
+
+// BucketStoredUsage is the size and count of everything the bucket keeps,
+// every version included, as the metadata records it: the same on every node
+// of a cluster.
+//
+// A bucket with no figure is measured and the figure kept, so it is measured
+// once: measured on every call, a bucket over its quota (whose writes all
+// fail, so none sets the figure) was walked on every refused request.
+func (s *Store) BucketStoredUsage(bucket string) (BucketStat, error) {
+	var st BucketStat
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if sb := tx.Bucket(bucketStoredBucket); sb != nil {
+			if data := sb.Get([]byte(bucket)); data != nil {
+				found = true
+				return json.Unmarshal(data, &st)
+			}
+		}
+		return nil
+	})
+	if err != nil || found {
+		return st, err
+	}
+	// The figure always equals the records at any transaction, so a figure
+	// measured here is the one every other node holds or measures.
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		sb := tx.Bucket(bucketStoredBucket)
+		if sb == nil {
+			st = measureStoredTx(tx, bucket)
+			return nil
+		}
+		if data := sb.Get([]byte(bucket)); data != nil {
+			return json.Unmarshal(data, &st)
+		}
+		st = measureStoredTx(tx, bucket)
+		data, err := json.Marshal(st)
+		if err != nil {
+			return err
+		}
+		return sb.Put([]byte(bucket), data)
+	})
+	return st, err
 }

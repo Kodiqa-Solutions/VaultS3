@@ -92,7 +92,7 @@ S3 is the API VaultS3 implements, not a competitor you would swap it for. If you
 ## Quick start
 
 ```bash
-docker run -d --name vaults3 -p 9000:9000 \
+docker run -d --name vaults3 -p 9000:9000 --stop-timeout 35 \
   -e VAULTS3_ACCESS_KEY=myadmin \
   -e VAULTS3_SECRET_KEY=mysupersecret \
   -v vaults3-data:/data -v vaults3-meta:/metadata \
@@ -132,7 +132,9 @@ gh attestation verify vaults3_5.0.12_amd64.deb --repo Kodiqa-Solutions/VaultS3
 
 Building from source is `make build`. Kubernetes is a Helm chart
 (`helm install vaults3 oci://ghcr.io/kodiqa-solutions/charts/vaults3`) or a single
-manifest. All of it, plus the disk layout to use in production, is in the
+manifest. Unraid has a [template](deploy/unraid/), and on any NAS whose
+folders are owned by root, `PUID`/`PGID` let the container take them over.
+All of it, plus the disk layout to use in production, is in the
 **[installation guide](docs/INSTALL.md)**.
 
 ## Features

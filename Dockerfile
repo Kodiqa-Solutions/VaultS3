@@ -26,7 +26,11 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o /vault
 
 # Stage 3: Runtime
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates && \
+# apk upgrade takes the security fixes Alpine has published since the base
+# image was built: the 5.0.12 image carried zlib 1.3.2 (CVE-2026-4738)
+# although 1.4 was already in the 3.21 repository.
+RUN apk upgrade --no-cache && \
+    apk add --no-cache ca-certificates && \
     addgroup -g 1000 vaults3 && \
     adduser -D -u 1000 -G vaults3 vaults3 && \
     mkdir -p /data /metadata /etc/vaults3 /home/vaults3 && \

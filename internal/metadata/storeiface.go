@@ -121,6 +121,9 @@ type StoreAPI interface {
 	PutObjectMeta(meta ObjectMeta) error
 	PutObjectVersion(meta ObjectMeta) error
 	BucketStats(bucket string) (BucketStat, bool, error)
+	// BucketStoredUsage is everything the bucket keeps, every version
+	// included, as the replicated metadata records it (cluster quotas).
+	BucketStoredUsage(bucket string) (BucketStat, error)
 	SetBucketStats(bucket string, stat BucketStat) error
 	BackfillBucketStats(bucket string) (BucketStat, error)
 	BackupDB(w io.Writer) (int64, error)

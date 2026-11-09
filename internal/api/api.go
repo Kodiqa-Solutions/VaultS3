@@ -31,6 +31,10 @@ import (
 
 // APIHandler serves the dashboard REST API at /api/v1/.
 type APIHandler struct {
+	// storedUsage holds dashboard uploads to the bucket's stored usage in the
+	// metadata instead of this node's disk, as the S3 API does on a cluster.
+	storedUsage bool
+
 	streamsDone        chan struct{} // closed by CloseStreams on shutdown, ends live streams
 	streamsOnce        sync.Once
 	allowPrivateLambda bool
@@ -132,6 +136,10 @@ func (h *APIHandler) SetJWTKeyStore(s jwtKeyStore) { h.jwtKeyStore = s }
 // SetLocalStore wires the node-local metadata store, used for state that is
 // deliberately not replicated (in-progress multipart uploads). No-op single-node.
 func (h *APIHandler) SetLocalStore(local metadata.StoreAPI) { h.localStore = local }
+
+// SetStoredUsageQuota holds quotas to the stored usage the metadata records
+// (a cluster), as s3.Handler.SetStoredUsageQuota.
+func (h *APIHandler) SetStoredUsageQuota(on bool) { h.storedUsage = on }
 
 // ReplicationFunc is called after a dashboard-initiated object mutation so the
 // write is replicated to peers, mirroring the S3 API path. Without this, objects

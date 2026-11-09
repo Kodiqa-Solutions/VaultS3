@@ -1,9 +1,11 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"strings"
@@ -108,6 +110,13 @@ func main() {
 			"hint", "run `vaults3 setup` to write one")
 	}
 
+	// Started as root with PUID/PGID (a NAS container): own the folders and
+	// run as that user, before the server opens any file.
+	if err := dropPrivileges(cfg); err != nil {
+		slog.Error("could not switch to the PUID/PGID user", "error", err)
+		os.Exit(1)
+	}
+
 	// Make the build version available to the server (update checker, /version API).
 	server.Version = version
 
@@ -115,6 +124,15 @@ func main() {
 	srv, err := server.New(cfg)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
+		if errors.Is(err, fs.ErrPermission) {
+			fix := "give the folders to this user (chown -R), or start the container as root with PUID and PGID set (--user 0:0 -e PUID=99 -e PGID=100) and it takes them over"
+			if os.Getenv("PUID") != "" || os.Getenv("PGID") != "" {
+				fix = "a file or folder the server uses belongs to another user: give it to this user (chown -R), for example a cold tier, erasure or backup folder whose contents were not given over, or a TLS certificate or key readable only by root"
+			}
+			slog.Error("the server cannot write a file or folder it needs",
+				"running_as", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+				"fix", fix)
+		}
 		os.Exit(1)
 	}
 	// Run blocks until a shutdown signal. Close is called on every way out:

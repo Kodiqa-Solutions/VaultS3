@@ -76,6 +76,7 @@ const (
 	OpListLatestDelimited     ShardOp = "list_latest_delimited"
 	OpListObjectVersions      ShardOp = "list_object_versions"
 	OpBucketStats             ShardOp = "bucket_stats"
+	OpBucketStoredUsage       ShardOp = "bucket_stored_usage"
 	OpSetBucketStats          ShardOp = "set_bucket_stats"
 	OpBackfillBucketStats     ShardOp = "backfill_bucket_stats"
 	OpUpdateLastAccess        ShardOp = "update_last_access"
@@ -216,6 +217,13 @@ func ExecuteShardRequest(h ShardHandle, req ShardRequest) ShardResponse {
 		}
 		return ShardResponse{Stat: stat, Found: found}
 
+	case OpBucketStoredUsage:
+		stat, err := s.BucketStoredUsage(req.Bucket)
+		if err != nil {
+			return shardErr(err)
+		}
+		return ShardResponse{Stat: stat, Found: true}
+
 	case OpSetBucketStats:
 		return shardErr(s.SetBucketStats(req.Bucket, req.Stat))
 
@@ -338,6 +346,19 @@ func (s *ShardedStore) ListObjectVersions(bucket, prefix, keyMarker, versionMark
 		return nil, false, err
 	}
 	return resp.Metas, resp.Truncated, nil
+}
+
+// BucketStoredUsage is read from the bucket's own shard, where its records
+// and its figure are.
+func (s *ShardedStore) BucketStoredUsage(bucket string) (BucketStat, error) {
+	resp, err := s.call(ShardRequest{Op: OpBucketStoredUsage, Bucket: bucket})
+	if err != nil {
+		return BucketStat{}, err
+	}
+	if err := resp.err(); err != nil {
+		return BucketStat{}, err
+	}
+	return resp.Stat, nil
 }
 
 // BucketStats reads the cached size and object count from the shard that holds

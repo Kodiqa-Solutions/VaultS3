@@ -5,6 +5,45 @@ All notable changes to VaultS3 are documented here. The format is based on
 semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
+### Added
+- **`PUID` and `PGID`, for NAS containers (Unraid, Synology, TrueNAS).**
+  Docker creates a host folder that does not exist yet owned by root, and the
+  image runs as uid 1000, so the server stopped with `permission denied` on
+  its metadata. Started as root with `PUID`/`PGID` set, the server now gives
+  its folders to that user and group (walking a folder only when it has
+  another owner, so a large one is walked once) and switches to them for
+  good before opening anything. Without the variables nothing changes. A
+  `permission denied` at startup now says how to fix it.
+- **Bucket quotas on a cluster count the whole cluster.** Each node held a
+  bucket to the objects on its own disk, so with fewer replicas than nodes a
+  bucket grew past its quota (on three nodes with one replica, a 1,000 byte
+  quota took 1,200 bytes). The quota is now held to the bucket's stored
+  usage, kept in the replicated metadata in the same transaction as each
+  write, so every node holds the same figure: every version and object,
+  counted once at the size it was written with. A single server still counts
+  bytes on its disk. On an existing cluster each bucket is measured at its
+  first write after the upgrade, the same on every node.
+- **An Unraid template**, [`deploy/unraid/vaults3.xml`](deploy/unraid/), and a
+  square icon, `assets/icon-256.png`.
+
+### Security
+- **The image installs Alpine's security updates when it is built**
+  (`apk upgrade`). The 5.0.12 image carried zlib 1.3.2 (CVE-2026-4738,
+  medium) from the Alpine base image although the fixed 1.4 was already
+  published. VaultS3 itself does not use the system zlib (the binary is
+  static), but scanners such as Artifact Hub's report the image.
+
+### Fixed
+- **A container is given time to let running requests finish when it
+  stops.** VaultS3 waits up to `server.shutdown_timeout_secs` (30) for
+  requests in progress, but Docker kills a container 10 seconds after asking
+  it to stop and Kubernetes after 30, so an upload or download still running
+  was cut off. The Helm chart and `deploy/k8s/quickstart.yaml` now set
+  `terminationGracePeriodSeconds: 35` (the chart's
+  `terminationGracePeriodSeconds` value), and the Docker and Compose examples
+  `--stop-timeout 35` / `stop_grace_period: 35s`. The Compose example on
+  Docker Hub no longer overrides the image's own healthcheck with a `wget`
+  probe, which failed with `VAULTS3_BASE_PATH` set.
 
 ## [5.0.12] - 2026-11-09
 ### Changed

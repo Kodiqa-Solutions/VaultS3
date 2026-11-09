@@ -218,8 +218,14 @@ readinessProbe:
   timeoutSeconds: 5
   failureThreshold: 3
 
+# How long Kubernetes lets the pod stop before killing it. Keep it above
+# server.shutdown_timeout_secs in config (30), the time VaultS3 gives running
+# requests to finish; the Kubernetes default of 30 cut the last ones short.
+terminationGracePeriodSeconds: 35
+
 # Pod- and container-level security. The image already runs as UID/GID 1000;
 # fsGroup makes the mounted PVCs writable by that user.
+
 podSecurityContext:
   fsGroup: 1000
 securityContext:

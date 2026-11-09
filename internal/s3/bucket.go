@@ -60,6 +60,7 @@ func validateEndpointURL(rawURL string, allowPrivate bool) error {
 }
 
 type BucketHandler struct {
+	storedUsage          bool // see ObjectHandler.storedUsage
 	allowPrivateWebhooks bool
 	allowPrivateLambda   bool
 	store                metadata.StoreAPI
@@ -389,7 +390,7 @@ func (h *BucketHandler) GetBucketQuota(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 
-	currentSize, currentCount, _ := h.engine.BucketSize(bucket)
+	currentSize, currentCount := bucketUsage(h.store, h.engine, h.storedUsage, bucket)
 
 	resp := struct {
 		MaxSizeBytes int64 `json:"max_size_bytes"`

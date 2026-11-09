@@ -8,6 +8,7 @@ Lightweight S3-compatible object storage. Single binary, <80MB RAM, built-in das
 docker run -d \
   --name vaults3 \
   -p 9000:9000 \
+  --stop-timeout 35 \
   -e VAULTS3_ACCESS_KEY=myadmin \
   -e VAULTS3_SECRET_KEY=mysupersecretkey123 \
   -v vaults3-data:/data \
@@ -17,6 +18,8 @@ docker run -d \
 
 Dashboard: `http://localhost:9000/dashboard/`
 S3 API: `http://localhost:9000`
+
+`--stop-timeout 35` gives requests still running at a stop the 30 seconds the server waits for them (`server.shutdown_timeout_secs`); Docker's default of 10 kills them part way.
 
 ## Features
 
@@ -68,6 +71,7 @@ S3 API: `http://localhost:9000`
 | `VAULTS3_TLS_CERT` | TLS certificate path | _(disabled)_ |
 | `VAULTS3_TLS_KEY` | TLS private key path | _(disabled)_ |
 | `VAULTS3_LOG_LEVEL` | Log level (debug/info/warn/error) | `info` |
+| `PUID` / `PGID` | With the container started as root (`--user 0:0`): give `/data` and `/metadata` to this user and group, and run as them (Unraid: `99`/`100`) | _(unset: runs as uid 1000)_ |
 
 ## Volumes
 
@@ -75,6 +79,8 @@ S3 API: `http://localhost:9000`
 |------|---------|
 | `/data` | Object data storage |
 | `/metadata` | BoltDB metadata database |
+
+The image runs as uid 1000. A host folder Docker creates for a bind mount is owned by root, which stops the server with `permission denied`: give the folders to uid 1000, or start as root with `PUID`/`PGID` (see above). Unraid has a ready template in [`deploy/unraid`](https://github.com/Kodiqa-Solutions/VaultS3/tree/main/deploy/unraid).
 
 ## Docker Compose
 
@@ -91,11 +97,11 @@ services:
       - vaults3-data:/data
       - vaults3-meta:/metadata
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9000/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    # Longer than server.shutdown_timeout_secs (30), so requests still
+    # running at a stop get to finish instead of being killed at 10s.
+    stop_grace_period: 35s
+    # The image has its own healthcheck (vaults3 healthcheck), which follows
+    # the configured port, address and TLS.
 
 volumes:
   vaults3-data:
@@ -107,6 +113,7 @@ volumes:
 ```bash
 docker run -d \
   -p 9000:9000 \
+  --stop-timeout 35 \
   -v ./vaults3.yaml:/etc/vaults3/vaults3.yaml \
   -v vaults3-data:/data \
   -v vaults3-meta:/metadata \

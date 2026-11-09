@@ -58,6 +58,8 @@ var raftOwnedBuckets = [][]byte{
 	publicAccessBlockBucket,
 	loggingConfigBucket,
 	bucketStatsBucket,
+	// Adjusted only by writes the state machine applies, like bucket_stats.
+	bucketStoredBucket,
 }
 
 // nodeLocalBuckets hold records this node writes for itself, outside Raft. A

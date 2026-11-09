@@ -656,6 +656,9 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// Initialize S3 handler
 	s3h := s3.NewHandler(metaStore, engine, auth, cfg.Encryption.Enabled, cfg.Server.Domain, mc)
+	// On a cluster each node sees only its own disk; quotas are held to the
+	// stored usage the replicated metadata records instead.
+	s3h.SetStoredUsageQuota(cfg.Cluster.Enabled)
 	s3h.SetPrivateEndpoints(cfg.Notifications.AllowPrivateWebhooks, cfg.Lambda.AllowPrivateEndpoints)
 	s3h.SetPerBucketMode(cfg.Encryption.PerBucket)
 
@@ -1232,6 +1235,7 @@ func (s *Server) Run() error {
 	// Share the node write gate so the admin drain/undrain endpoints toggle the
 	// same flag the S3 handler enforces.
 	apiHandler.SetWritable(s.writable)
+	apiHandler.SetStoredUsageQuota(s.cfg.Cluster.Enabled)
 	apiHandler.SetSearchIndex(s.searchIndex)
 	apiHandler.SetEventBus(s.eventBus)
 	apiHandler.SetTraceBroadcaster(s.traceBus)
