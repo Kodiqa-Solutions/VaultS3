@@ -74,7 +74,9 @@ func (d *DistributedStore) GetObjectMetaConsistent(bucket, key string) (*ObjectM
 	// object written over on another node as it was before, old bytes and
 	// old ETag both, until this node applied the write: a GET straight after
 	// an acknowledged overwrite read the previous object.
-	if b, ok := d.raft.(readBarrier); ok && !d.raft.IsLeader() {
+	// On the leader too: a new leader first applies the previous term's last
+	// writes (cluster.Node.leaderCaughtUp, once per term).
+	if b, ok := d.raft.(readBarrier); ok {
 		// A node that cannot catch up (it does not know the leader yet,
 		// just after a restart, or is cut off from it) answers that it
 		// cannot tell. It used to read its own copy, and a node restarted
@@ -516,11 +518,9 @@ type readBarrier interface {
 // ReadBarrier brings this node up to what the leader has applied. A caller that
 // reads a record and decides on it (an object's lock state before allowing a
 // change) needs the latest copy, not whatever this node has applied so far.
-// A no-op on the leader.
+// On the leader it waits, once per term, for a new leader to apply the
+// previous term's last writes.
 func (d *DistributedStore) ReadBarrier() error {
-	if d.raft.IsLeader() {
-		return nil
-	}
 	if b, ok := d.raft.(readBarrier); ok {
 		return b.ReadBarrier(ReadYourWritesTimeout)
 	}

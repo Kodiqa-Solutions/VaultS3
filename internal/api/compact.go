@@ -11,7 +11,7 @@ import (
 // volumes (deleted/overwritten objects). Only available when small-file packing
 // is enabled. Optional ?min_dead_ratio=0.0..1.0 (default 0.5).
 func (h *APIHandler) handleCompact(w http.ResponseWriter, r *http.Request) {
-	pe, ok := h.engine.(*storage.PackedEngine)
+	pe, ok := storage.EngineAs[*storage.PackedEngine](h.engine)
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "small-file packing is not enabled")
 		return

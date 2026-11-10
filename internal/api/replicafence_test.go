@@ -62,3 +62,46 @@ func TestReplicaCopyOfAnOlderObjectIsRefused(t *testing.T) {
 		t.Errorf("a copy without an ETag: %d, stored %q", c, stored())
 	}
 }
+
+// A version's copy is checked against that version's record and stored as
+// that version; replica-get serves it. Versions were never copied, so on a
+// cluster each lived on the node that wrote it alone.
+func TestReplicaCopyOfAVersion(t *testing.T) {
+	h, store := newTestAPI(t)
+	if err := store.CreateBucket("vb"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObjectVersion(metadata.ObjectMeta{Bucket: "vb", Key: "k", VersionID: "v1", Size: 4, ETag: `"e1"`}); err != nil {
+		t.Fatal(err)
+	}
+	put := func(version, body, etag string) int {
+		req := httptest.NewRequest(http.MethodPost, "/cluster/replica-put?bucket=vb&key=k&version="+version, strings.NewReader(body))
+		req.Header.Set(clusterSecretHeader, "s")
+		req.Header.Set(ReplicaETagHeader, etag)
+		rr := httptest.NewRecorder()
+		h.ClusterReplicaPutHandler("s")(rr, req)
+		return rr.Code
+	}
+	if c := put("v1", "vers", `"other"`); c != http.StatusConflict {
+		t.Errorf("a copy with another ETag: %d", c)
+	}
+	if c := put("v2", "vers", `"e1"`); c != http.StatusConflict {
+		t.Errorf("a copy of a version with no record: %d", c)
+	}
+	if c := put("..%2Fx", "vers", `"e1"`); c != http.StatusBadRequest {
+		t.Errorf("a version ID naming another path: %d", c)
+	}
+	if c := put("v1", "vers", `"e1"`); c != http.StatusOK {
+		t.Fatalf("the version's copy: %d", c)
+	}
+	if h.engine.ObjectExists("vb", "k") {
+		t.Error("the version was stored at the plain path")
+	}
+	req := httptest.NewRequest(http.MethodGet, "/cluster/replica-get?bucket=vb&key=k&version=v1", nil)
+	req.Header.Set(clusterSecretHeader, "s")
+	rr := httptest.NewRecorder()
+	h.ClusterReplicaGetHandler("s")(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "vers" {
+		t.Errorf("replica-get of the version: %d %q", rr.Code, rr.Body.String())
+	}
+}

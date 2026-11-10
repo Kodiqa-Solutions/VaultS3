@@ -114,7 +114,10 @@ type ObjectHandler struct {
 	// just-written object's data to the other nodes in its replica set so a node
 	// loss doesn't make it unavailable (issue #37). Best-effort + asynchronous —
 	// never blocks or fails the client write; GET failover already tries replicas.
-	replicatePlacement func(bucket, key, etag string, size int64)
+	replicatePlacement func(bucket, key, versionID, etag string, size int64)
+	// copies records which object each local data file holds (cluster only;
+	// nil otherwise, and every method of a nil index is a no-op).
+	copies *metadata.CopyIndex
 	// dataHolderFallback, if set (cluster mode), re-routes a read this node has
 	// metadata for but no readable data to a peer that holds the object's bytes.
 	// That gap is normal and transient while replicatePlacement above is still in
@@ -666,6 +669,20 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
 			return
 		}
+		// A copy recorded as another object is behind (metadata.CopyIndex).
+		// The null version is replaced in place in a bucket with versioning
+		// suspended, so a node that missed that write still holds the old
+		// bytes.
+		if recorded, known := h.copies.Lookup(bucket, key, versionID, size); known && h.dataHolderFallback != nil && recorded != meta.ETag {
+			_ = reader.Close()
+			slog.Info("local copy of a version is recorded as another object, routing the read to a holder",
+				"bucket", bucket, "key", key, "version", versionID)
+			if h.serveFromDataHolder(w, r, bucket, key) {
+				return
+			}
+			writeS3Error(w, "SlowDown", "Object data is being replicated, please retry", http.StatusServiceUnavailable)
+			return
+		}
 		var ok bool
 		if reader, size, ok = h.openSSEC(w, r, meta, reader, size); !ok {
 			return
@@ -703,6 +720,7 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		} else {
 			reader, size, err = h.engine.GetObject(bucket, key)
 		}
+		stored := size // the copy record is kept with the size the engine reads back
 		if err == nil {
 			// Plaintext size and reader from here on, which is what the stale-copy
 			// checks below compare against the metadata.
@@ -711,7 +729,15 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 				return
 			}
 		}
-		if err == nil && !h.localCopyIsStale(meta, size) && h.localCopyNeedsContentCheck(bucket, meta, size) &&
+		// On a cluster the node records which object each local file holds
+		// (metadata.CopyIndex). A file recorded as another object is behind,
+		// whatever its size or age. The record only ever adds doubt: a file
+		// recorded as this object is still checked as before, since two
+		// overwrites of one key racing on this node can leave the record and
+		// the file naming different writes.
+		recorded, known := h.copies.Lookup(bucket, key, meta.VersionID, stored)
+		recordedStale := err == nil && known && h.dataHolderFallback != nil && recorded != meta.ETag
+		if err == nil && !recordedStale && !h.localCopyIsStale(meta, size) && h.localCopyNeedsContentCheck(bucket, meta, size) &&
 			!h.localCopyContentMatches(reader, meta) {
 			// Same byte count, different bytes: an overwrite that kept the size
 			// landed on another holder and has not replicated here yet.
@@ -724,7 +750,7 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			writeS3Error(w, "SlowDown", "Object data is being replicated, please retry", http.StatusServiceUnavailable)
 			return
 		}
-		if err == nil && h.localCopyIsStale(meta, size) {
+		if err == nil && (recordedStale || h.localCopyIsStale(meta, size)) {
 			// The bytes here are not the bytes the metadata describes, so serving
 			// them would answer with the previous object under the new object's
 			// ETag. Ask a holder that has the current data instead.

@@ -146,10 +146,16 @@ func (h *Handler) SetMultipartPeerLister(fn func(bucket string) []metadata.Multi
 	h.objects.multipartPeers = fn
 }
 
+// SetCopyIndex wires the node-local record of which object each local data
+// file holds (cluster only).
+func (h *Handler) SetCopyIndex(c *metadata.CopyIndex) {
+	h.objects.copies = c
+}
+
 // SetPlacementReplicator wires the cluster hook that copies a just-written
 // object's data to the other nodes in its replica set (issue #37, replica_count
 // > 1). No-op single-node / replica_count 1.
-func (h *Handler) SetPlacementReplicator(fn func(bucket, key, etag string, size int64)) {
+func (h *Handler) SetPlacementReplicator(fn func(bucket, key, versionID, etag string, size int64)) {
 	h.objects.replicatePlacement = fn
 }
 

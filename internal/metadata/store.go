@@ -2414,7 +2414,7 @@ func (s *Store) ScanObjects(fn func(ObjectMeta) bool) error {
 				return nil // skip malformed entries
 			}
 			if !fn(meta) {
-				return fmt.Errorf("scan stopped") // break iteration
+				return ErrStopIteration // break iteration
 			}
 			return nil
 		})
@@ -2431,7 +2431,7 @@ func (s *Store) ScanObjectVersions(fn func(ObjectMeta) bool) error {
 				return nil
 			}
 			if !fn(meta) {
-				return fmt.Errorf("scan stopped")
+				return ErrStopIteration
 			}
 			return nil
 		})

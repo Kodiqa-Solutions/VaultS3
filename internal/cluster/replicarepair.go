@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -56,11 +57,15 @@ type RepairStats struct {
 type ReplicaRepairer struct {
 	store  metadata.StoreAPI
 	engine storage.Engine
-	ring   *HashRing
-	proxy  *Proxy
-	selfID string
-	secret string
-	scheme string
+	copies *metadata.CopyIndex // nil: no records, every copy judged by presence
+	// plainCursor and versionCursor are where the next pass's walks go on
+	// (entries to skip), so a cluster larger than one pass is covered.
+	plainCursor, versionCursor int
+	ring                       *HashRing
+	proxy                      *Proxy
+	selfID                     string
+	secret                     string
+	scheme                     string
 
 	replicasFor     func(bucket string) int
 	bucketEncrypted func(bucket string) bool
@@ -235,41 +240,73 @@ func (r *ReplicaRepairer) scan(ctx context.Context) {
 	// Collect first, act second, for the same reason. The callback below must not
 	// touch the store, the network or the disk: it only decides whether an object
 	// is this node's to repair and remembers it.
-	type candidate struct{ bucket, key string }
+	type candidate struct{ bucket, key, version string }
 	var todo []candidate
-	truncated := false
-	err := r.store.IterateAllObjects(func(bucket, key string, _ metadata.ObjectMeta) bool {
-		if ctx.Err() != nil {
-			return false
-		}
-		p, known := policy[bucket]
-		if !known || p.replicas <= 1 || p.erasure {
+	// Unversioned objects and versions each take half a pass, and each walk
+	// goes on where the last pass stopped: every pass used to start from the
+	// first object, so past the limit the same objects were probed again and
+	// again, the rest never, and versions not at all.
+	half := maxRepairCandidates / 2
+	walk := func(cursor *int, add func(func(candidate) bool) error, what string) {
+		seen, taken, full := 0, 0, false
+		err := add(func(c candidate) bool {
+			if ctx.Err() != nil {
+				return false
+			}
+			seen++
+			if seen <= *cursor {
+				return true
+			}
+			if taken >= half {
+				full = true
+				return false
+			}
+			todo = append(todo, c)
+			taken++
 			return true
+		})
+		if err != nil && !errors.Is(err, metadata.ErrStopIteration) {
+			slog.Warn("replica repair: "+what+" scan failed", "error", err)
 		}
-		if !r.owns(bucket, key) {
-			return true
+		if full {
+			*cursor += taken
+			slog.Info("replica repair: more "+what+" than one pass takes, the next pass goes on from here", "limit", half)
+		} else if ctx.Err() == nil {
+			*cursor = 0
 		}
-		if len(todo) >= maxRepairCandidates {
-			truncated = true
-			return false
-		}
-		todo = append(todo, candidate{bucket, key})
-		return true
-	})
-	if err != nil {
-		slog.Warn("replica repair: metadata scan failed", "error", err)
 	}
-	if truncated {
-		slog.Warn("replica repair: too many objects for one pass, the rest follow on the next scan",
-			"limit", maxRepairCandidates)
-	}
+	walk(&r.plainCursor, func(take func(candidate) bool) error {
+		return r.store.IterateAllObjects(func(bucket, key string, meta metadata.ObjectMeta) bool {
+			// A key with versions is repaired version by version below: its
+			// bytes are not at the plain path, so looking there reported every
+			// versioned object as lost ("no surviving copy").
+			if meta.VersionID != "" || meta.DeleteMarker {
+				return true
+			}
+			if p, known := policy[bucket]; !known || p.replicas <= 1 || p.erasure || !r.owns(bucket, key) {
+				return true
+			}
+			return take(candidate{bucket, key, ""})
+		})
+	}, "object")
+	walk(&r.versionCursor, func(take func(candidate) bool) error {
+		return r.store.ScanObjectVersions(func(v metadata.ObjectMeta) bool {
+			if v.DeleteMarker || v.VersionID == "" {
+				return true
+			}
+			if p, known := policy[v.Bucket]; !known || p.replicas <= 1 || p.erasure || !r.owns(v.Bucket, v.Key) {
+				return true
+			}
+			return take(candidate{v.Bucket, v.Key, v.VersionID})
+		})
+	}, "version")
 
 	for _, c := range todo {
 		if ctx.Err() != nil {
 			break
 		}
 		st.Scanned++
-		copied, outcome := r.repairObject(ctx, c.bucket, c.key, policy[c.bucket].replicas)
+		copied, outcome := r.repairObject(ctx, c.bucket, c.key, c.version, policy[c.bucket].replicas)
 		switch outcome {
 		case repairDone:
 			st.Repaired++
@@ -359,30 +396,55 @@ const (
 // as a lost copy: a brief network partition would otherwise read as every
 // object on the far side being under-replicated and start a copy storm at the
 // worst possible moment.
-func (r *ReplicaRepairer) repairObject(ctx context.Context, bucket, key string, want int) (int64, repairOutcome) {
+func (r *ReplicaRepairer) repairObject(ctx context.Context, bucket, key, version string, want int) (int64, repairOutcome) {
 	addrs := r.proxy.NodeAddrs()
 	holders := r.ring.GetNodes(bucket, key, want)
 
+	// The object the metadata names. A record that is gone (deleted since
+	// the walk) leaves nothing to repair.
+	record, err := r.recordETag(bucket, key, version)
+	if err != nil {
+		return 0, repairNoop
+	}
+
 	var missing []string
 	var present []string
-	unknown := false
+	var verified []string // holders whose copy is recorded as this object
+	unknown, wrong := false, 0
 
+	// A copy recorded as another object (metadata.CopyIndex) is replaced like
+	// a missing one: a node that was down while the object was overwritten
+	// kept the previous bytes, and repair, which looked for missing copies
+	// only, never replaced them. A copy with no record is trusted as before.
+	judge := func(id, copyETag string) {
+		switch {
+		case copyETag != "" && copyETag != record:
+			missing = append(missing, id)
+			wrong++
+		case copyETag != "":
+			present = append(present, id)
+			verified = append(verified, id)
+		default:
+			present = append(present, id)
+		}
+	}
 	for _, id := range holders {
 		if id == r.selfID {
-			if r.engine.ObjectExists(bucket, key) {
-				present = append(present, id)
-			} else {
+			if !r.hasLocal(bucket, key, version) {
 				missing = append(missing, id)
+				continue
 			}
+			etag, _ := r.copies.Lookup(bucket, key, version, storage.LocalCopySize(r.engine, bucket, key, version))
+			judge(id, etag)
 			continue
 		}
 		if addrs[id] == "" {
 			unknown = true // not a member we can reach, so we cannot judge it
 			continue
 		}
-		switch r.probe(ctx, addrs[id], bucket, key) {
+		switch res, etag := r.probe(ctx, addrs[id], bucket, key, version); res {
 		case probeHas:
-			present = append(present, id)
+			judge(id, etag)
 		case probeMissing:
 			missing = append(missing, id)
 		default:
@@ -402,12 +464,15 @@ func (r *ReplicaRepairer) repairObject(ctx context.Context, bucket, key string, 
 		// still describes the object and deleting it here would turn a
 		// recoverable operator problem into real data loss.
 		slog.Error("replica repair: no surviving copy",
-			"bucket", bucket, "key", key, "wanted", want,
+			"bucket", bucket, "key", key, "version", version, "wanted", want, "copies_of_another_object", wrong,
 		)
 		return 0, repairLost
 	}
 
 	source := present[0]
+	if len(verified) > 0 {
+		source = verified[0]
+	}
 	var copied int64
 	repaired := false
 	for _, target := range missing {
@@ -415,18 +480,18 @@ func (r *ReplicaRepairer) repairObject(ctx context.Context, bucket, key string, 
 		var n int64
 		switch {
 		case target == r.selfID:
-			n, err = r.pullLocal(ctx, addrs[source], bucket, key)
+			n, err = r.pullLocal(ctx, addrs[source], bucket, key, version)
 		case source == r.selfID:
-			n, err = r.push(ctx, addrs[target], bucket, key)
+			n, err = r.push(ctx, addrs[target], bucket, key, version)
 		default:
 			// This node coordinates but holds no copy, so it asks the node that
 			// is short one to fetch from a node that has it. The bytes go
 			// straight between them instead of through here.
-			n, err = r.askPull(ctx, addrs[target], source, bucket, key)
+			n, err = r.askPull(ctx, addrs[target], source, bucket, key, version)
 		}
 		if err != nil {
 			slog.Warn("replica repair: copy failed",
-				"bucket", bucket, "key", key, "target", target, "error", err,
+				"bucket", bucket, "key", key, "version", version, "target", target, "error", err,
 			)
 			continue
 		}
@@ -447,40 +512,54 @@ const (
 	probeMissing
 )
 
-func (r *ReplicaRepairer) probe(ctx context.Context, addr, bucket, key string) probeResult {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, r.replicaURL(addr, "replica-get", bucket, key), nil)
+func (r *ReplicaRepairer) probe(ctx context.Context, addr, bucket, key, version string) (probeResult, string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, r.replicaURL(addr, "replica-get", bucket, key, version), nil)
 	if err != nil {
-		return probeUnknown
+		return probeUnknown, ""
 	}
 	r.sign(req)
 	resp, err := r.probeClient.Do(req)
 	if err != nil {
-		return probeUnknown
+		return probeUnknown, ""
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return probeHas
+		// A node still on 5.0.14 ignores the version parameter and answers
+		// about the plain file: that says nothing about the version.
+		if version != "" && resp.Header.Get(copyVersionHeader) != version {
+			return probeUnknown, ""
+		}
+		return probeHas, resp.Header.Get(copyETagHeader)
 	case http.StatusNotFound:
-		return probeMissing
+		return probeMissing, ""
 	default:
-		return probeUnknown
+		return probeUnknown, ""
 	}
 }
 
 // push streams a local copy to a node that is missing one.
-func (r *ReplicaRepairer) push(ctx context.Context, addr, bucket, key string) (int64, error) {
-	reader, size, err := r.engine.GetObject(bucket, key)
+func (r *ReplicaRepairer) push(ctx context.Context, addr, bucket, key, version string) (int64, error) {
+	// The copy names the object it is, as a write's copy does: the receiver
+	// stores it only while its record names the same ETag. A node still on
+	// 5.0.14 ignores the version parameter, and without the ETag stored a
+	// version's bytes at the key's plain path; with it, it refuses the copy.
+	etag, err := r.recordETag(bucket, key, version)
+	if err != nil {
+		return 0, err
+	}
+	reader, size, err := r.openLocal(bucket, key, version)
 	if err != nil {
 		return 0, err
 	}
 	defer reader.Close()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.replicaURL(addr, "replica-put", bucket, key), reader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.replicaURL(addr, "replica-put", bucket, key, version), reader)
 	if err != nil {
 		return 0, err
 	}
 	req.ContentLength = size
 	r.sign(req)
+	req.Header.Set(replicaETagHeader, etag)
 	if r.bucketEncrypted != nil && r.bucketEncrypted(bucket) {
 		req.Header.Set(bucketEncryptedHeader, "1")
 	}
@@ -497,8 +576,8 @@ func (r *ReplicaRepairer) push(ctx context.Context, addr, bucket, key string) (i
 }
 
 // pullLocal fetches a copy from a peer into this node's own engine.
-func (r *ReplicaRepairer) pullLocal(ctx context.Context, addr, bucket, key string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.replicaURL(addr, "replica-get", bucket, key), nil)
+func (r *ReplicaRepairer) pullLocal(ctx context.Context, addr, bucket, key, version string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.replicaURL(addr, "replica-get", bucket, key, version), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -518,15 +597,61 @@ func (r *ReplicaRepairer) pullLocal(ctx context.Context, addr, bucket, key strin
 		r.bucketEncrypted != nil && !r.bucketEncrypted(bucket) {
 		return 0, fmt.Errorf("bucket encryption config has not reached this node yet")
 	}
-	n, _, err := r.engine.PutObject(bucket, key, resp.Body, resp.ContentLength)
+	// A node still on 5.0.14 ignores the version parameter and answers about
+	// the key's plain file, which would be stored as the version.
+	if version != "" && resp.Header.Get(copyVersionHeader) != version {
+		return 0, fmt.Errorf("the source did not answer for version %s", version)
+	}
+	copyETag := resp.Header.Get(copyETagHeader)
+	if record, err := r.recordETag(bucket, key, version); err != nil || (copyETag != "" && copyETag != record) {
+		return 0, fmt.Errorf("the source's copy is not the current object")
+	}
+	// Staged without the key's lock, installed under it: a client overwrite
+	// on this node holds the lock (shared) from its write to its metadata
+	// commit, and in that window its file is recorded as the new object
+	// while the metadata still names the old one, which repair took for a
+	// wrong copy and replaced with the old bytes. Held across the transfer,
+	// the lock made every client write of the key wait for the network.
+	staged, err := storage.StageCopy(r.engine.DataDir(), resp.Body, resp.ContentLength)
+	if err != nil {
+		return 0, err
+	}
+	defer staged.Close()
+	unlock := storage.LockObjectKey(bucket, storage.VersionLockKey(key, version))
+	defer unlock()
+	// The record again, caught up with the leader: this node's own metadata
+	// can lag a write it forwarded a moment ago.
+	record, err := r.recordETagConsistent(bucket, key, version)
+	if err != nil {
+		return 0, err
+	}
+	if local, ok := r.copies.Lookup(bucket, key, version, storage.LocalCopySize(r.engine, bucket, key, version)); ok && local == record {
+		return 0, nil // this node's copy is the current object after all
+	}
+	if copyETag != "" && copyETag != record {
+		return 0, fmt.Errorf("the source's copy is not the current object")
+	}
+	body, err := staged.Reader()
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	if version != "" {
+		n, _, err = r.engine.PutObjectVersion(bucket, key, version, body, staged.Size)
+	} else {
+		n, _, err = r.engine.PutObject(bucket, key, body, staged.Size)
+	}
+	if err == nil {
+		r.copies.Record(bucket, key, version, copyETag, storage.LocalCopySize(r.engine, bucket, key, version))
+	}
 	return n, err
 }
 
 // askPull tells the node that is short a copy to fetch one from a node that has
 // it. The source travels as a node ID, never an address: the receiver resolves
 // it against its own membership, so a caller cannot aim it at an arbitrary host.
-func (r *ReplicaRepairer) askPull(ctx context.Context, addr, sourceID, bucket, key string) (int64, error) {
-	u := r.replicaURL(addr, "replica-pull", bucket, key) + "&from=" + url.QueryEscape(sourceID)
+func (r *ReplicaRepairer) askPull(ctx context.Context, addr, sourceID, bucket, key, version string) (int64, error) {
+	u := r.replicaURL(addr, "replica-pull", bucket, key, version) + "&from=" + url.QueryEscape(sourceID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
 	if err != nil {
 		return 0, err
@@ -544,9 +669,39 @@ func (r *ReplicaRepairer) askPull(ctx context.Context, addr, sourceID, bucket, k
 	return 0, nil
 }
 
-func (r *ReplicaRepairer) replicaURL(addr, op, bucket, key string) string {
-	return r.scheme + "://" + addr + "/cluster/" + op +
+func (r *ReplicaRepairer) replicaURL(addr, op, bucket, key, version string) string {
+	u := r.scheme + "://" + addr + "/cluster/" + op +
 		"?bucket=" + url.QueryEscape(bucket) + "&key=" + url.QueryEscape(key)
+	if version != "" {
+		u += "&version=" + url.QueryEscape(version)
+	}
+	return u
+}
+
+// openLocal opens this node's copy of an object's plain data or of one
+// version. The null version of an object written before versioning was
+// enabled is still at the plain path.
+func (r *ReplicaRepairer) openLocal(bucket, key, version string) (storage.ReadSeekCloser, int64, error) {
+	if version == "" {
+		return r.engine.GetObject(bucket, key)
+	}
+	rc, size, err := r.engine.GetObjectVersion(bucket, key, version)
+	if err != nil && version == "null" {
+		return r.engine.GetObject(bucket, key)
+	}
+	return rc, size, err
+}
+
+func (r *ReplicaRepairer) hasLocal(bucket, key, version string) bool {
+	if version == "" {
+		return r.engine.ObjectExists(bucket, key)
+	}
+	rc, _, err := r.openLocal(bucket, key, version)
+	if err != nil {
+		return false
+	}
+	_ = rc.Close()
+	return true
 }
 
 func (r *ReplicaRepairer) sign(req *http.Request) {
@@ -574,4 +729,50 @@ func (r *ReplicaRepairer) throttle(ctx context.Context, justCopied int64, start 
 	case <-ctx.Done():
 	case <-time.After(sleep):
 	}
+}
+
+// replicaETagHeader and copyETagHeader are api.ReplicaETagHeader and
+// api.CopyETagHeader (api imports this package).
+const (
+	replicaETagHeader = "X-VaultS3-Replica-ETag"
+	copyETagHeader    = "X-VaultS3-Copy-ETag"
+	copyVersionHeader = "X-VaultS3-Copy-Version"
+)
+
+// SetCopyIndex wires the node-local record of which object each local data
+// file holds.
+func (r *ReplicaRepairer) SetCopyIndex(c *metadata.CopyIndex) { r.copies = c }
+
+// recordETagConsistent is recordETag read after catching up with the leader.
+func (r *ReplicaRepairer) recordETagConsistent(bucket, key, version string) (string, error) {
+	meta, err := r.store.GetObjectMetaConsistent(bucket, key)
+	if err != nil && errors.Is(err, metadata.ErrShardUnavailable) {
+		return "", err
+	}
+	if version == "" {
+		if meta == nil || meta.DeleteMarker || meta.ETag == "" || meta.VersionID != "" {
+			return "", fmt.Errorf("no record to name the copy")
+		}
+		return meta.ETag, nil
+	}
+	return r.recordETag(bucket, key, version)
+}
+
+// recordETag is the ETag the metadata names for an object's plain data or
+// one of its versions. Read while repairing, after the object walk.
+func (r *ReplicaRepairer) recordETag(bucket, key, version string) (string, error) {
+	var meta *metadata.ObjectMeta
+	var err error
+	if version == "" {
+		meta, err = r.store.GetObjectMeta(bucket, key)
+	} else {
+		meta, err = r.store.GetObjectVersion(bucket, key, version)
+	}
+	if err != nil {
+		return "", err
+	}
+	if meta == nil || meta.DeleteMarker || meta.ETag == "" || (version == "" && meta.VersionID != "") {
+		return "", fmt.Errorf("no record to name the copy")
+	}
+	return meta.ETag, nil
 }

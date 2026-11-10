@@ -133,9 +133,15 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 	switch versioning {
 	case "Enabled":
 		versionID = h.nextVersionID(o.bucket, o.key)
+		unlock := storage.LockObjectKeyShared(o.bucket, storage.VersionLockKey(o.key, versionID))
+		defer unlock()
 		written, etag, err = h.engine.PutObjectVersion(o.bucket, o.key, versionID, o.body, o.size)
 	case "Suspended":
+		// The null version is replaced in place, so a copy of the previous one
+		// must not land after it (see the plain path below).
 		versionID = nullVersionID
+		unlock := storage.LockObjectKeyShared(o.bucket, storage.VersionLockKey(o.key, versionID))
+		defer unlock()
 		written, etag, err = h.engine.PutObjectVersion(o.bucket, o.key, versionID, o.body, o.size)
 	default:
 		// Held (shared) to the metadata commit: a replica copy of an older object,
@@ -165,6 +171,16 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 			return metadata.ObjectMeta{}, re
 		}
 		return metadata.ObjectMeta{}, err
+	}
+
+	// The local file now holds this write, whatever happens to the metadata
+	// next (see metadata.CopyIndex).
+	if h.copies.Working() {
+		recorded := etag
+		if o.etag != "" {
+			recorded = o.etag
+		}
+		h.copies.Record(o.bucket, o.key, versionID, recorded, storage.LocalCopySize(h.engine, o.bucket, o.key, versionID))
 	}
 
 	meta := o.meta
@@ -202,7 +218,7 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 			return metadata.ObjectMeta{}, &metaWriteError{"PutObjectMeta", err}
 		}
 		if h.replicatePlacement != nil {
-			h.replicatePlacement(o.bucket, o.key, meta.ETag, meta.Size) // copy data to replica-set peers (issue #37)
+			h.replicatePlacement(o.bucket, o.key, "", meta.ETag, meta.Size) // copy data to replica-set peers (issue #37)
 		}
 		return meta, nil
 	}
@@ -220,6 +236,13 @@ func (h *ObjectHandler) writeObject(o newObject) (metadata.ObjectMeta, error) {
 	}
 	if err := h.store.PutObjectMeta(meta); err != nil { // update "latest pointer"
 		return metadata.ObjectMeta{}, &metaWriteError{"PutObjectMeta", err}
+	}
+	// A version is copied to the other nodes of its replica set like an
+	// unversioned object. It was not, so on a cluster every version lived on
+	// the node that wrote it alone, whatever the replica count, and was lost
+	// with that node's disk.
+	if h.replicatePlacement != nil {
+		h.replicatePlacement(o.bucket, o.key, versionID, meta.ETag, meta.Size)
 	}
 	if replacedPlain {
 		// The object written before versioning was the null version and has just

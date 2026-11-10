@@ -4,8 +4,8 @@ description: Lightweight S3-compatible object storage with a built-in dashboard,
 type: application
 # version  = the chart version (bump on chart changes)
 # appVersion = the VaultS3 image tag this chart defaults to
-version: 0.2.14
-appVersion: "5.0.14"
+version: 0.2.15
+appVersion: "5.0.15"
 home: https://github.com/Kodiqa-Solutions/VaultS3
 sources:
   - https://github.com/Kodiqa-Solutions/VaultS3
@@ -25,15 +25,15 @@ icon: https://raw.githubusercontent.com/Kodiqa-Solutions/VaultS3/main/assets/log
 # fixed or security), with the highlights of CHANGELOG.md.
 annotations:
   artifacthub.io/changes: |
-    - kind: security
-      description: "VaultS3 5.0.14: an object grant (bucket/*) no longer reaches the bucket's own settings, version IDs cannot name another key's version, object lock headers need the lock permission"
+    - kind: fixed
+      description: "VaultS3 5.0.15: on a cluster, objects in buckets with versioning are kept on every node of their replica set, not only on the node that wrote them"
       links:
         - name: Changelog
           url: https://github.com/Kodiqa-Solutions/VaultS3/blob/main/CHANGELOG.md
-    - kind: security
-      description: "VaultS3 5.0.14: uploaded HTML is sandboxed, bucket policy Deny applies to signed requests, policy variables are substituted, S3 Select is bounded, failed signatures are slowed"
     - kind: fixed
-      description: "VaultS3 5.0.14: on a cluster, an overwrite is no longer lost to a late replica copy of the object it replaced, and a read after an overwrite never returns the previous object"
+      description: "VaultS3 5.0.15: a cluster node that missed an overwrite no longer serves the previous object, and replica repair replaces wrong copies, not only missing ones"
+    - kind: fixed
+      description: "VaultS3 5.0.15: a read straight after a leader change no longer answers an existing object as missing"
   artifacthub.io/license: AGPL-3.0
   artifacthub.io/category: storage
   artifacthub.io/links: |
@@ -45,4 +45,4 @@ annotations:
       url: https://vaults3.com/migrate-from-minio
   artifacthub.io/images: |
     - name: vaults3
-      image: eniz1806/vaults3:5.0.14
+      image: eniz1806/vaults3:5.0.15

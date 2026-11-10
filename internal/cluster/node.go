@@ -28,9 +28,11 @@ type Node struct {
 	// in tests that inject an in-memory transport.
 	mux *TransportMux
 	// riMu and riCur share questions to the leader between read barriers.
-	riMu   sync.Mutex
-	riCur  *readIndexCall // the question running now
-	riNext *readIndexCall // the one to send after it, shared by its waiters
+	// catchUp runs leaderCaughtUp's barrier once per term.
+	catchUp termBarrier
+	riMu    sync.Mutex
+	riCur   *readIndexCall // the question running now
+	riNext  *readIndexCall // the one to send after it, shared by its waiters
 	// askLeader replaces leaderAppliedIndex in a test.
 	askLeader func(timeout time.Duration) (uint64, error)
 }
@@ -221,17 +223,29 @@ func (n *Node) ApplyIndexed(data []byte) (uint64, error) {
 
 // ReadBarrier blocks until this node's FSM has applied everything the leader had
 // applied at call time, making a follower read linearizable (read-your-writes for
-// state written on other nodes, e.g. a bucket created elsewhere — issue #37). A
-// no-op on the leader (it applies committed entries itself).
+// state written on other nodes, e.g. a bucket created elsewhere — issue #37). On
+// the leader it waits only, once per term, for the leader to catch up
+// (leaderCaughtUp).
 func (n *Node) ReadBarrier(timeout time.Duration) error {
 	if n.IsLeader() {
-		return nil
+		return n.leaderCaughtUp(timeout)
 	}
 	idx, err := n.leaderAppliedIndexSince(time.Now(), timeout)
 	if err != nil {
 		return err
 	}
 	return n.WaitForApply(idx, timeout)
+}
+
+// leaderCaughtUp waits, once per term, until this leader has applied every
+// entry committed before it took over. A newly elected leader may not have
+// applied the last writes of the previous term yet; it skipped the barrier
+// for its own reads and gave followers its applied index, so in the 5.0.15
+// soak a read straight after the leader was restarted answered an existing
+// object as missing. raft.Barrier commits an entry in this term and returns
+// once everything before it is applied.
+func (n *Node) leaderCaughtUp(timeout time.Duration) error {
+	return n.catchUp.caughtUp(n.raft, timeout)
 }
 
 // readIndexCall is one question to the leader for its applied index, which
@@ -355,6 +369,10 @@ func (n *Node) ReadIndexHandler() http.HandlerFunc {
 		// object. The caller retries against the current leader.
 		if !n.IsLeader() {
 			http.Error(w, "not the leader", http.StatusServiceUnavailable)
+			return
+		}
+		if err := n.leaderCaughtUp(ReadIndexBarrierTimeout); err != nil {
+			http.Error(w, "the leader is still catching up", http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -553,3 +571,7 @@ func ParsePeer(peer string) (nodeID, addr string, ok bool) {
 
 // ErrNotLeader is returned when a write is attempted on a non-leader node.
 var ErrNotLeader = fmt.Errorf("not cluster leader")
+
+// ReadIndexBarrierTimeout bounds a new leader's catch-up when a follower asks
+// for its applied index.
+const ReadIndexBarrierTimeout = 3 * time.Second

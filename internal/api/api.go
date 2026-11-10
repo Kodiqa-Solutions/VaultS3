@@ -40,6 +40,7 @@ type APIHandler struct {
 	allowPrivateLambda bool
 	store              metadata.StoreAPI
 	engine             storage.Engine
+	copies             *metadata.CopyIndex   // which object each local data file holds (cluster only)
 	keyMgr             *bucketcrypto.Manager // per-bucket encryption keys (nil if unconfigured)
 	metrics            *metrics.Collector
 	cfg                *config.Config

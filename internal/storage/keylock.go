@@ -91,3 +91,12 @@ var keyLocks struct {
 	mu sync.Mutex
 	m  map[string]*keyLock
 }
+
+// VersionLockKey is the key a version's copy is locked under, apart from the
+// plain object and from other versions of the key.
+func VersionLockKey(key, version string) string {
+	if version == "" {
+		return key
+	}
+	return key + "\x00" + version
+}

@@ -40,6 +40,8 @@ type ShardGroup struct {
 	trans *raft.NetworkTransport
 
 	closeOnce sync.Once
+	// catchUp runs LeaderCaughtUp's barrier once per term.
+	catchUp termBarrier
 }
 
 // Shard returns which shard this group serves.
@@ -326,4 +328,10 @@ func (rt *ShardRuntime) Stop(shard int) error {
 		return nil
 	}
 	return g.Close()
+}
+
+// LeaderCaughtUp waits, once per term, until this shard leader has applied
+// every entry committed before it took over (see Node.leaderCaughtUp).
+func (g *ShardGroup) LeaderCaughtUp(timeout time.Duration) error {
+	return g.catchUp.caughtUp(g.raft, timeout)
 }

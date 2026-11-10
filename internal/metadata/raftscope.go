@@ -78,6 +78,8 @@ var raftOwnedBuckets = [][]byte{
 //   - replication_configs: written straight to the local store by the S3 API.
 //   - bucket_snapshots: written straight to the local store by the snapshot API.
 //   - _restore_state: the marker of a restore in progress on this node.
+//   - copies: which object each local data file holds (CopyIndex). It is in
+//     a file of its own, local-copies.db, never in the Raft-owned database.
 var nodeLocalBuckets = [][]byte{
 	multipartBucket,
 	partsBucket,
@@ -88,6 +90,7 @@ var nodeLocalBuckets = [][]byte{
 	replicationConfigBucket,
 	bucketSnapshotsBucket,
 	restoreStateBucket,
+	copiesBucket,
 }
 
 // mixedBuckets hold both kinds of record, told apart by key. server_settings

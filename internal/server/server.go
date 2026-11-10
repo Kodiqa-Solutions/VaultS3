@@ -153,6 +153,7 @@ func (a clusterControllerAdapter) Members() []api.ClusterMember {
 type Server struct {
 	cfg                  *config.Config
 	store                *metadata.Store
+	copies               *metadata.CopyIndex // cluster only: which object each local data file holds
 	metaStore            metadata.StoreAPI
 	engine               storage.Engine
 	keyMgr               *bucketcrypto.Manager
@@ -367,6 +368,19 @@ func New(cfg *config.Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init metadata: %w", err)
 	}
+	// On a cluster each node records which object each of its local data
+	// files holds, to recognise a copy left behind by an overwrite it missed.
+	var copyIndex *metadata.CopyIndex
+	if cfg.Cluster.Enabled {
+		if copyIndex, err = metadata.OpenCopyIndex(filepath.Join(metaDir, "local-copies.db")); err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("open the local copy index: %w", err)
+		}
+		engine = storage.NewForgetOnWrite(engine, copyIndex)
+		// Copies staged by a previous run cannot be read (their keys were in
+		// that process's memory).
+		storage.ClearStaging(engine.DataDir())
+	}
 
 	// Initialize cluster if enabled
 	var clusterNode *cluster.Node
@@ -568,6 +582,7 @@ func New(cfg *config.Config) (*Server, error) {
 			cfg.Cluster.NodeID, cfg.Cluster.Secret, repairScheme, cfg.Cluster.Repair,
 		)
 		replicaRepairer.SetBucketEncrypted(encryptedNow)
+		replicaRepairer.SetCopyIndex(copyIndex)
 		replicaRepairer.SetShardedMetadata(cfg.Cluster.MetadataShards > 1)
 
 		failureDetector.SetCallbacks(
@@ -659,6 +674,7 @@ func New(cfg *config.Config) (*Server, error) {
 	// On a cluster each node sees only its own disk; quotas are held to the
 	// stored usage the replicated metadata records instead.
 	s3h.SetStoredUsageQuota(cfg.Cluster.Enabled)
+	s3h.SetCopyIndex(copyIndex)
 	s3h.SetPrivateEndpoints(cfg.Notifications.AllowPrivateWebhooks, cfg.Lambda.AllowPrivateEndpoints)
 	s3h.SetPerBucketMode(cfg.Encryption.PerBucket)
 
@@ -787,7 +803,7 @@ func New(cfg *config.Config) (*Server, error) {
 			repScheme := reapScheme
 			localEngine := engine
 			ring := clusterProxy.Ring()
-			s3h.SetPlacementReplicator(func(bucket, key, etag string, size int64) {
+			s3h.SetPlacementReplicator(func(bucket, key, versionID, etag string, size int64) {
 				repCount := replicasFor(bucket)
 				if repCount <= 1 {
 					return // this bucket keeps a single copy
@@ -808,7 +824,21 @@ func New(cfg *config.Config) (*Server, error) {
 						// the write's (a newer write has replaced the file
 						// here) is not sent: that write sends its own. An
 						// SSE-C object is stored larger than its size.
-						reader, stored, err := localEngine.GetObject(bucket, key)
+						// This node's file must still be this write, by its
+						// record, before and after it is opened: a later
+						// overwrite here drops the record before writing, and
+						// sends its own copy.
+						if rec, _, ok := copyIndex.Entry(bucket, key, versionID); copyIndex.Working() && (!ok || rec != etag) {
+							return
+						}
+						var reader storage.ReadSeekCloser
+						var stored int64
+						var err error
+						if versionID == "" {
+							reader, stored, err = localEngine.GetObject(bucket, key)
+						} else {
+							reader, stored, err = localEngine.GetObjectVersion(bucket, key, versionID)
+						}
 						if err != nil {
 							return
 						}
@@ -816,8 +846,14 @@ func New(cfg *config.Config) (*Server, error) {
 						if stored != size && !ssecStored(metaStore, bucket, key) {
 							return
 						}
+						if rec, ok := copyIndex.Lookup(bucket, key, versionID, stored); copyIndex.Working() && (!ok || rec != etag) {
+							return
+						}
 						u := repScheme + "://" + addr + "/cluster/replica-put?bucket=" +
 							url.QueryEscape(bucket) + "&key=" + url.QueryEscape(key)
+						if versionID != "" {
+							u += "&version=" + url.QueryEscape(versionID)
+						}
 						req, err := http.NewRequest(http.MethodPost, u, reader)
 						if err != nil {
 							return
@@ -1191,6 +1227,7 @@ func New(cfg *config.Config) (*Server, error) {
 	return &Server{
 		cfg:                  cfg,
 		store:                store,
+		copies:               copyIndex,
 		metaStore:            metaStore,
 		engine:               engine,
 		reapElsewhere:        reapOne,
@@ -1237,6 +1274,7 @@ func (s *Server) Run() error {
 	// Dashboard API
 	apiHandler := api.NewAPIHandler(s.metaStore, s.engine, s.metrics, s.cfg, s.activity)
 	apiHandler.SetS3Authenticator(s.s3Auth)
+	apiHandler.SetCopyIndex(s.copies)
 	apiHandler.SetAllowPrivateLambda(s.cfg.Lambda.AllowPrivateEndpoints)
 	// Graph the measured physical footprint next to the logical size, so growth
 	// that never shows up in object bytes (old versions, replicas, Raft logs) is
@@ -2030,6 +2068,9 @@ func (s *Server) Close() {
 	}
 	if s.store != nil {
 		s.store.Close()
+	}
+	if s.copies != nil {
+		_ = s.copies.Close()
 	}
 }
 

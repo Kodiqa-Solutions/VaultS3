@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,9 +28,20 @@ type fakeEngine struct {
 	storage.Engine
 	mu   sync.Mutex
 	data map[string][]byte
+	dir  string
 }
 
 func newFakeEngine() *fakeEngine { return &fakeEngine{data: map[string][]byte{}} }
+
+// DataDir is where replica copies are staged.
+func (e *fakeEngine) DataDir() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.dir == "" {
+		e.dir, _ = os.MkdirTemp("", "fake-engine-")
+	}
+	return e.dir
+}
 
 func (e *fakeEngine) put(bucket, key string, b []byte) {
 	e.mu.Lock()
@@ -61,6 +74,15 @@ func (e *fakeEngine) GetObject(bucket, key string) (storage.ReadSeekCloser, int6
 		return nil, 0, fmt.Errorf("not found")
 	}
 	return nopSeekCloser{bytes.NewReader(b)}, int64(len(b)), nil
+}
+
+// A version is kept under key + "@" + version.
+func (e *fakeEngine) GetObjectVersion(bucket, key, version string) (storage.ReadSeekCloser, int64, error) {
+	return e.GetObject(bucket, key+"@"+version)
+}
+
+func (e *fakeEngine) PutObjectVersion(bucket, key, version string, r io.Reader, size int64) (int64, string, error) {
+	return e.PutObject(bucket, key+"@"+version, r, size)
 }
 
 func (e *fakeEngine) PutObject(bucket, key string, r io.Reader, size int64) (int64, string, error) {
@@ -103,6 +125,30 @@ func (nopSeekCloser) Close() error { return nil }
 type fakeStore struct {
 	metadata.StoreAPI
 	objects [][2]string
+	// versions are keys with versioning: their latest record names the
+	// version, and the version scan lists them.
+	versions []metadata.ObjectMeta
+}
+
+func (s *fakeStore) GetObjectMeta(bucket, key string) (*metadata.ObjectMeta, error) {
+	return &metadata.ObjectMeta{Bucket: bucket, Key: key, Size: 4, ETag: `"e"`}, nil
+}
+
+func (s *fakeStore) GetObjectMetaConsistent(bucket, key string) (*metadata.ObjectMeta, error) {
+	return s.GetObjectMeta(bucket, key)
+}
+
+func (s *fakeStore) GetObjectVersion(bucket, key, version string) (*metadata.ObjectMeta, error) {
+	return &metadata.ObjectMeta{Bucket: bucket, Key: key, VersionID: version, Size: 4, ETag: `"e"`}, nil
+}
+
+func (s *fakeStore) ScanObjectVersions(fn func(metadata.ObjectMeta) bool) error {
+	for _, v := range s.versions {
+		if !fn(v) {
+			return nil
+		}
+	}
+	return nil
 }
 
 // ListBuckets is read once, before the object walk, so the walk never calls back
@@ -110,10 +156,17 @@ type fakeStore struct {
 func (s *fakeStore) ListBuckets() ([]metadata.BucketInfo, error) {
 	seen := map[string]bool{}
 	var out []metadata.BucketInfo
+	names := make([]string, 0, len(s.objects)+len(s.versions))
 	for _, o := range s.objects {
-		if !seen[o[0]] {
-			seen[o[0]] = true
-			out = append(out, metadata.BucketInfo{Name: o[0]})
+		names = append(names, o[0])
+	}
+	for _, v := range s.versions {
+		names = append(names, v.Bucket)
+	}
+	for _, n := range names {
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, metadata.BucketInfo{Name: n})
 		}
 	}
 	return out, nil
@@ -122,6 +175,11 @@ func (s *fakeStore) ListBuckets() ([]metadata.BucketInfo, error) {
 func (s *fakeStore) IterateAllObjects(fn func(bucket, key string, meta metadata.ObjectMeta) bool) error {
 	for _, o := range s.objects {
 		if !fn(o[0], o[1], metadata.ObjectMeta{Bucket: o[0], Key: o[1], Size: 4}) {
+			return nil
+		}
+	}
+	for _, v := range s.versions {
+		if !fn(v.Bucket, v.Key, v) {
 			return nil
 		}
 	}
@@ -156,6 +214,9 @@ func newPeerStub() *peerStub {
 			return
 		}
 		bucket, key := r.URL.Query().Get("bucket"), r.URL.Query().Get("key")
+		if v := r.URL.Query().Get("version"); v != "" {
+			key += "@" + v
+		}
 		if !p.engine.ObjectExists(bucket, key) {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -173,7 +234,11 @@ func newPeerStub() *peerStub {
 		p.putCount++
 		p.mu.Unlock()
 		b, _ := io.ReadAll(r.Body)
-		p.engine.put(r.URL.Query().Get("bucket"), r.URL.Query().Get("key"), b)
+		key := r.URL.Query().Get("key")
+		if v := r.URL.Query().Get("version"); v != "" {
+			key += "@" + v
+		}
+		p.engine.put(r.URL.Query().Get("bucket"), key, b)
 		w.WriteHeader(http.StatusOK)
 	})
 	p.srv = httptest.NewServer(mux)
@@ -500,6 +565,12 @@ func (s *reentrantStore) durability(string) int {
 	return 2
 }
 
+func (s *reentrantStore) GetObjectMeta(bucket, key string) (*metadata.ObjectMeta, error) {
+	return &metadata.ObjectMeta{Bucket: bucket, Key: key, Size: 4, ETag: `"e"`}, nil
+}
+
+func (s *reentrantStore) ScanObjectVersions(func(metadata.ObjectMeta) bool) error { return nil }
+
 func (s *reentrantStore) IterateAllObjects(fn func(bucket, key string, meta metadata.ObjectMeta) bool) error {
 	s.iterating.Store(true)
 	defer s.iterating.Store(false)
@@ -541,5 +612,70 @@ func TestRepairNeverReadsTheStoreDuringTheObjectWalk(t *testing.T) {
 
 	if n := store.reentered.Load(); n != 0 {
 		t.Fatalf("the object walk read the metadata store %d times, which deadlocks it under a concurrent writer", n)
+	}
+}
+
+// A version is repaired like an unversioned object: copied to the holder that
+// lacks it, under its version. Versioned objects used to be looked for at
+// their plain path, found nowhere, and reported lost ("no surviving copy")
+// on every scan, while their versions were never copied (5.0.15 soak).
+func TestRepairCopiesAVersionToTheHolderThatLacksIt(t *testing.T) {
+	f := newRepairFixture(t, 2)
+	store := f.repairer.store.(*fakeStore)
+	store.objects = nil
+	store.versions = []metadata.ObjectMeta{{Bucket: f.bucket, Key: f.key, VersionID: "v1", Size: 4}}
+	f.engine.put(f.bucket, f.key+"@v1", []byte("vers"))
+
+	st := f.runScan()
+	if st.Repaired != 1 || st.Unrecoverable != 0 {
+		t.Fatalf("stats %+v, want 1 repaired and none lost", st)
+	}
+	if !f.peer.engine.ObjectExists(f.bucket, f.key+"@v1") {
+		t.Fatal("the peer did not receive the version")
+	}
+	if f.peer.engine.ObjectExists(f.bucket, f.key) {
+		t.Error("the version was stored at the plain path")
+	}
+	// Both hold it now: nothing more to do, and nothing reported lost.
+	if st := f.runScan(); st.Repaired != 0 || st.Unrecoverable != 0 {
+		t.Errorf("second scan %+v", st)
+	}
+}
+
+// A copy recorded as another object (this node missed an overwrite of the
+// same size) is replaced from a holder of the current one. Repair used to
+// look only for missing copies, so it was served for good (5.0.14 soak).
+func TestRepairReplacesACopyOfAnotherObject(t *testing.T) {
+	f := newRepairFixture(t, 2)
+	idx, err := metadata.OpenCopyIndex(filepath.Join(t.TempDir(), "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = idx.Close() }()
+	f.repairer.SetCopyIndex(idx)
+	f.engine.put(f.bucket, f.key, []byte("old!"))
+	idx.Record(f.bucket, f.key, "", `"previous"`, 4) // the record names "e"
+	f.peer.engine.put(f.bucket, f.key, []byte("new!"))
+
+	st := f.runScan()
+	if st.Repaired != 1 {
+		t.Fatalf("stats %+v, want the stale copy replaced", st)
+	}
+	rc, _, err := f.engine.GetObject(f.bucket, f.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(rc)
+	if string(b) != "new!" {
+		t.Errorf("local copy %q after repair, want the holder's", b)
+	}
+	if e, ok := idx.Lookup(f.bucket, f.key, "", 4); ok && e == `"previous"` {
+		t.Error("the stale record was kept")
+	}
+
+	// A copy recorded as the current object is left alone.
+	idx.Record(f.bucket, f.key, "", `"e"`, 4)
+	if st := f.runScan(); st.Repaired != 0 {
+		t.Errorf("a verified copy was copied again: %+v", st)
 	}
 }

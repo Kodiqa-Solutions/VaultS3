@@ -64,6 +64,23 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.15
+
+- **On a cluster, replica repair copies the versions written before the
+  upgrade** to the other nodes of their replica set, over the scans that
+  follow (`cluster.repair.interval_secs`, 600 seconds by default), within
+  `cluster.repair.max_bandwidth_mbps`. A cluster with many versions moves a
+  lot of data once: lower the bandwidth if it competes with client traffic.
+  A node still on 5.0.14 refuses version copies (it cannot store them), so
+  versions reach it only once it is upgraded: upgrade every node.
+- **Each cluster node keeps `local-copies.db` in `metadata_dir`**, its record
+  of which object each of its data files holds. It is node-local: never copy
+  it between nodes or restore it from another node's backup (a missing or
+  damaged one is recreated empty, which is safe). Files written before the
+  upgrade have no record and are judged as before (by size), so a copy that
+  went stale before the upgrade is found only once the object is written
+  again.
+
 ## Upgrading to 5.0.14
 
 A security release. Some fixes change what existing policies allow:

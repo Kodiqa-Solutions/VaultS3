@@ -43,7 +43,7 @@ func (h *APIHandler) handleReencrypt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Only an engine that can still hold the old format has anything to do here.
-	lf, ok := h.engine.(storage.LegacyFormatEngine)
+	lf, ok := storage.EngineAs[storage.LegacyFormatEngine](h.engine)
 	if !ok {
 		writeJSON(w, http.StatusOK, reencryptReport{
 			DryRun:   true,

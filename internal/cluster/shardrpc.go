@@ -141,6 +141,15 @@ func (r *ShardRouter) CallHandler() http.HandlerFunc {
 			http.Error(w, ErrNotShardLeader.Error(), http.StatusServiceUnavailable)
 			return
 		}
+		// A new shard leader catches up first. Answered as 503, as "not the
+		// leader" is: a node still on 5.0.14 reads an error in a 200 answer
+		// as a miss, and served an existing object as 404.
+		if env.Request.LeaderOnly {
+			if err := g.LeaderCaughtUp(metadata.ShardReadYourWritesTimeout); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+		}
 		resp := metadata.ExecuteShardRequest(g, env.Request)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)

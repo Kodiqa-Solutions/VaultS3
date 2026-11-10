@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/metadata"
 	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 	"io"
 	"log/slog"
@@ -292,11 +293,13 @@ func (h *APIHandler) ClusterObjectDeleteHandler(secret string) http.HandlerFunc 
 		if bucket != "" && key != "" && h.engine != nil && storage.KeyProblem(key) == "" {
 			// best-effort throughout; a missing file is the expected case on the
 			// nodes that never held this object
-			if version := r.URL.Query().Get("version"); version != "" {
+			version := r.URL.Query().Get("version")
+			if version != "" {
 				_ = h.engine.DeleteObjectVersion(bucket, key, version)
 			} else {
 				_ = h.engine.DeleteObject(bucket, key)
 			}
+			h.copies.Forget(bucket, key, version)
 		}
 		w.WriteHeader(http.StatusOK)
 	}
@@ -335,6 +338,7 @@ func (h *APIHandler) ClusterObjectDeleteBatchHandler(secret string) http.Handler
 				continue
 			}
 			_ = h.engine.DeleteObject(req.Bucket, key)
+			h.copies.Forget(req.Bucket, key, "")
 		}
 		w.WriteHeader(http.StatusOK)
 	}
@@ -363,7 +367,8 @@ func (h *APIHandler) ClusterReplicaPullHandler(secret string) http.HandlerFunc {
 		bucket := r.URL.Query().Get("bucket")
 		key := r.URL.Query().Get("key")
 		from := r.URL.Query().Get("from")
-		if bucket == "" || key == "" || from == "" || h.engine == nil || h.peerAddr == nil {
+		version, ok := replicaVersion(r)
+		if bucket == "" || key == "" || from == "" || h.engine == nil || h.peerAddr == nil || !ok {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -374,6 +379,9 @@ func (h *APIHandler) ClusterReplicaPullHandler(secret string) http.HandlerFunc {
 		}
 		u := h.peerScheme + "://" + addr + "/cluster/replica-get?bucket=" +
 			url.QueryEscape(bucket) + "&key=" + url.QueryEscape(key)
+		if version != "" {
+			u += "&version=" + url.QueryEscape(version)
+		}
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -396,12 +404,95 @@ func (h *APIHandler) ClusterReplicaPullHandler(secret string) http.HandlerFunc {
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
-		if _, _, err := h.engine.PutObject(bucket, key, resp.Body, resp.ContentLength); err != nil {
+		// A source copy recorded as another object than the metadata names
+		// is not taken (see ClusterReplicaPutHandler), and a source that does
+		// not say which version it sent (a node still on 5.0.14 sends the
+		// plain file) is not taken for a version. The lock keeps the copy
+		// from landing inside a client overwrite of the key on this node.
+		if version != "" && resp.Header.Get(CopyVersionHeader) != version {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		etag := resp.Header.Get(CopyETagHeader)
+		sourceIsCurrent := func() bool {
+			if etag == "" {
+				return true // a source with no record (5.0.14, or an older file): as before
+			}
+			meta, err := h.currentCopyMeta(bucket, key, version)
+			return err == nil && meta != nil && meta.ETag == etag
+		}
+		if !sourceIsCurrent() {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		// Staged without the key's lock, installed under it (see
+		// ClusterReplicaPutHandler).
+		staged, err := storage.StageCopy(h.engine.DataDir(), resp.Body, resp.ContentLength)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer staged.Close()
+		unlock := storage.LockObjectKey(bucket, storage.VersionLockKey(key, version))
+		defer unlock()
+		if !sourceIsCurrent() {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		body, err := staged.Reader()
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		if err := h.putLocalCopy(bucket, key, version, body, staged.Size); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		h.copies.Record(bucket, key, version, etag, storage.LocalCopySize(h.engine, bucket, key, version))
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// replicaVersion reads a replica request's version parameter: "" for the
+// plain (unversioned) copy. ok is false for a version ID that could name
+// another key's file (storage.VersionIDProblem).
+func replicaVersion(r *http.Request) (version string, ok bool) {
+	version = r.URL.Query().Get("version")
+	return version, version == "" || storage.VersionIDProblem(version) == ""
+}
+
+// openLocalCopy opens this node's copy of an object's plain data, or of one
+// version. The null version of an object written before versioning was
+// enabled is still at the plain path.
+func (h *APIHandler) openLocalCopy(bucket, key, version string) (storage.ReadSeekCloser, int64, error) {
+	if version == "" {
+		return h.engine.GetObject(bucket, key)
+	}
+	rc, size, err := h.engine.GetObjectVersion(bucket, key, version)
+	if err != nil && version == "null" {
+		return h.engine.GetObject(bucket, key)
+	}
+	return rc, size, err
+}
+
+// putLocalCopy stores a copy of an object's plain data, or of one version.
+func (h *APIHandler) putLocalCopy(bucket, key, version string, body io.Reader, size int64) error {
+	if version == "" {
+		_, _, err := h.engine.PutObject(bucket, key, body, size)
+		return err
+	}
+	_, _, err := h.engine.PutObjectVersion(bucket, key, version, body, size)
+	return err
+}
+
+// currentCopyMeta is the record a copy must match, read after catching up
+// with the leader: the object's current record, or the version's.
+func (h *APIHandler) currentCopyMeta(bucket, key, version string) (*metadata.ObjectMeta, error) {
+	meta, err := h.store.GetObjectMetaConsistent(bucket, key)
+	if version == "" || errors.Is(err, metadata.ErrShardUnavailable) {
+		return meta, err
+	}
+	return h.store.GetObjectVersion(bucket, key, version)
 }
 
 var replicaPullClient = &http.Client{Timeout: 5 * time.Minute}
@@ -470,36 +561,40 @@ func (h *APIHandler) ClusterReplicaGetHandler(secret string) http.HandlerFunc {
 		}
 		bucket := r.URL.Query().Get("bucket")
 		key := r.URL.Query().Get("key")
-		if bucket == "" || key == "" || h.engine == nil {
+		version, ok := replicaVersion(r)
+		if bucket == "" || key == "" || h.engine == nil || !ok {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if !h.engine.ObjectExists(bucket, key) {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if h.bucketEncrypted != nil && h.bucketEncrypted(bucket) {
-			w.Header().Set(BucketEncryptedHeader, "1")
-		}
-		if r.Method == http.MethodHead {
-			size, err := h.engine.ObjectSize(bucket, key)
-			if err != nil {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		reader, size, err := h.engine.GetObject(bucket, key)
+		// The record is read before and after opening the file, and sent only
+		// when both agree: an overwrite on this node between the two (it drops
+		// the record before writing) would otherwise label the new bytes with
+		// the old object's ETag, or the reverse.
+		before, _, known := h.copies.Entry(bucket, key, version)
+		reader, size, err := h.openLocalCopy(bucket, key, version)
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		defer reader.Close()
+		after, _ := h.copies.Lookup(bucket, key, version, size)
+		defer func() { _ = reader.Close() }()
+		if h.bucketEncrypted != nil && h.bucketEncrypted(bucket) {
+			w.Header().Set(BucketEncryptedHeader, "1")
+		}
+		// Which object this copy is, when this node recorded it: replica
+		// repair replaces a copy recorded as another object.
+		if known && before == after {
+			w.Header().Set(CopyETagHeader, before)
+		}
+		if version != "" {
+			w.Header().Set(CopyVersionHeader, version)
+		}
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
-		io.Copy(w, reader)
+		if r.Method == http.MethodHead {
+			return
+		}
+		_, _ = io.Copy(w, reader)
 	}
 }
 
@@ -511,7 +606,8 @@ func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 		}
 		bucket := r.URL.Query().Get("bucket")
 		key := r.URL.Query().Get("key")
-		if bucket == "" || key == "" || h.engine == nil {
+		version, ok := replicaVersion(r)
+		if bucket == "" || key == "" || h.engine == nil || !ok {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -528,29 +624,90 @@ func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 		// then read those and spread them: the acknowledged write was lost on
 		// every node. A copy is stored only while it is the object the
 		// metadata names, read after catching up with the leader.
-		if etag := r.Header.Get(ReplicaETagHeader); etag != "" {
-			unlock := storage.LockObjectKey(bucket, key)
-			defer unlock()
-			meta, err := h.store.GetObjectMetaConsistent(bucket, key)
-			if err != nil || meta == nil || meta.ETag != etag || meta.VersionID != "" ||
-				(meta.SSECustomerKeyMD5 == "" && r.ContentLength >= 0 && r.ContentLength != meta.Size) {
-				current := ""
-				if meta != nil {
-					current = meta.ETag
-				}
-				slog.Debug("refused a replica copy that is not the current object",
-					"bucket", bucket, "key", key, "copy_etag", etag, "current_etag", current, "error", err)
-				w.WriteHeader(http.StatusConflict)
+		// Every sender of a version's copy names it; one that does not is not
+		// one this server can check.
+		if version != "" && r.Header.Get(ReplicaETagHeader) == "" {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		etag := r.Header.Get(ReplicaETagHeader)
+		if etag == "" {
+			// A node still on 5.0.14 names no object: stored as before, and
+			// the record dropped rather than kept wrong.
+			if err := h.putLocalCopy(bucket, key, version, r.Body, r.ContentLength); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
+			h.copies.Forget(bucket, key, version)
+			w.WriteHeader(http.StatusOK)
+			return
 		}
-		if _, _, err := h.engine.PutObject(bucket, key, r.Body, r.ContentLength); err != nil {
+		// Checked once before receiving it (a copy of an older object is
+		// refused without being read), and again under the key's lock before
+		// it is installed. The bytes are staged on disk in between, without
+		// the lock: held across the transfer, it made every client write of
+		// the key on this node wait for the network, for good if the sender
+		// stalled.
+		if !h.copyIsCurrent(w, bucket, key, version, etag, r.ContentLength) {
+			return
+		}
+		staged, err := storage.StageCopy(h.engine.DataDir(), r.Body, r.ContentLength)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		defer staged.Close()
+		unlock := storage.LockObjectKey(bucket, storage.VersionLockKey(key, version))
+		defer unlock()
+		if !h.copyIsCurrent(w, bucket, key, version, etag, staged.Size) {
+			return
+		}
+		body, err := staged.Reader()
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		if err := h.putLocalCopy(bucket, key, version, body, staged.Size); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		h.copies.Record(bucket, key, version, etag, storage.LocalCopySize(h.engine, bucket, key, version))
 		w.WriteHeader(http.StatusOK)
 	}
 }
+
+// copyIsCurrent reports whether a copy named etag, of size bytes, is the
+// object the metadata names (read after catching up with the leader). It
+// answers 409 when it is not.
+func (h *APIHandler) copyIsCurrent(w http.ResponseWriter, bucket, key, version, etag string, size int64) bool {
+	meta, err := h.currentCopyMeta(bucket, key, version)
+	if err != nil || meta == nil || meta.ETag != etag || meta.DeleteMarker ||
+		(version == "" && meta.VersionID != "") ||
+		(meta.SSECustomerKeyMD5 == "" && size >= 0 && size != meta.Size) {
+		current := ""
+		if meta != nil {
+			current = meta.ETag
+		}
+		slog.Debug("refused a replica copy that is not the current object",
+			"bucket", bucket, "key", key, "version", version, "copy_etag", etag, "current_etag", current, "error", err)
+		w.WriteHeader(http.StatusConflict)
+		return false
+	}
+	return true
+}
+
+// CopyETagHeader carries, on a replica-get answer, the ETag the sending node
+// recorded for its copy (metadata.CopyIndex), when it has one.
+const CopyETagHeader = "X-VaultS3-Copy-ETag"
+
+// CopyVersionHeader echoes, on a replica-get answer, the version it is about.
+// A node still on 5.0.14 ignores the version parameter and answers about the
+// key's plain file; without the echo that answer passed for the version.
+const CopyVersionHeader = "X-VaultS3-Copy-Version"
+
+// SetCopyIndex wires the node-local record of which object each local data
+// file holds (cluster only).
+func (h *APIHandler) SetCopyIndex(c *metadata.CopyIndex) { h.copies = c }
 
 // ReplicaETagHeader carries, on a replica copy, the ETag of the object the
 // copy is, so the receiving node can refuse a copy of an older object.

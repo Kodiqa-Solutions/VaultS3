@@ -120,11 +120,17 @@ type ShardResponse struct {
 	Stat       BucketStat         `json:"stat,omitempty"`
 	Found      bool               `json:"found,omitempty"`
 	Error      string             `json:"error,omitempty"`
+	// Unavailable marks an Error that means "cannot tell" (ErrShardUnavailable),
+	// which must not be read as a miss on the calling node.
+	Unavailable bool `json:"unavailable,omitempty"`
 }
 
 func (r ShardResponse) err() error {
 	if r.Error == "" {
 		return nil
+	}
+	if r.Unavailable {
+		return fmt.Errorf("%w: %s", ErrShardUnavailable, r.Error)
 	}
 	return errors.New(r.Error)
 }
@@ -133,7 +139,13 @@ func shardErr(err error) ShardResponse {
 	if err == nil {
 		return ShardResponse{}
 	}
-	return ShardResponse{Error: err.Error()}
+	return ShardResponse{Error: err.Error(), Unavailable: errors.Is(err, ErrShardUnavailable)}
+}
+
+// leaderCatchUp is what a shard group provides to let a new leader apply the
+// previous term's writes before it answers a leader-only read.
+type leaderCatchUp interface {
+	LeaderCaughtUp(timeout time.Duration) error
 }
 
 // ShardReadYourWritesTimeout bounds how long a shard follower waits for a
@@ -145,6 +157,15 @@ var ShardReadYourWritesTimeout = 2 * time.Second
 // node. Both the local fast path and the RPC server call it, so a request is
 // served identically wherever it lands.
 func ExecuteShardRequest(h ShardHandle, req ShardRequest) ShardResponse {
+	// A leader-only read is answered by a leader that has applied every
+	// write committed before it took over (see cluster.Node.leaderCaughtUp).
+	if req.LeaderOnly && h.IsLeader() {
+		if c, ok := h.(leaderCatchUp); ok {
+			if err := c.LeaderCaughtUp(ShardReadYourWritesTimeout); err != nil {
+				return shardErr(fmt.Errorf("%w: the shard leader is catching up: %v", ErrShardUnavailable, err))
+			}
+		}
+	}
 	s := h.Store()
 	switch req.Op {
 	case OpGetObjectMeta:

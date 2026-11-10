@@ -6,6 +6,53 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.15] - 2026-11-10
+Found by long cluster load tests (three nodes, a node killed or restarted every few
+minutes) and four review rounds of the fixes.
+
+### Fixed
+- **On a cluster, versions are kept on every node of their replica set.**
+  A write to a bucket with versioning was stored on the node that took it
+  and never copied, whatever the replica count, so each version lived on one
+  node and was lost with its disk (with one of three nodes down, a third of
+  the versions could not be read). Versions are now copied like unversioned
+  objects, checked against their own record on arrival, and replica repair
+  copies a version a node lacks, so versions written before the upgrade are
+  copied by the following scans. Repair no longer reports every versioned
+  object as lost ("no surviving copy").
+- **On a cluster, a node that missed an overwrite no longer serves the
+  previous object.** A node judged its copy by size alone (and by its hash
+  only in the first minute after a write), so a node that was down while an
+  object was overwritten with one of the same size served the old bytes for
+  good: 30 of 30 such reads through it were wrong, still a minute later.
+  Each node now records which object each of its files holds
+  (`local-copies.db` in `metadata_dir`, never replicated); a read of a file
+  recorded as another object goes to a node that has the current one, and
+  replica repair replaces such a copy, where it used to replace only
+  missing ones. A copy is pulled from a node that has the right one. The
+  record only ever adds doubt: any other write of the file (a dashboard
+  upload, a batch job) drops it, and a file with no record is judged by
+  size and, just after a write, by its hash, as before. During a rolling
+  upgrade an upgraded node does not take a 5.0.14 node's answer about a
+  version, since 5.0.14 answers about the plain file instead. A GET of a
+  specific version checks the record too (the null version is replaced in
+  place while versioning is suspended).
+
+- **On a cluster, a read straight after a leader change no longer answers an
+  existing object as missing.** A newly elected leader may not yet have
+  applied the last writes of the previous term. It skipped the read barrier
+  for its own reads and told followers how far to catch up from its applied
+  index, so for a moment after a leader restart both could read a state from
+  before those writes. A new leader now catches up once per term before it
+  serves such reads, its own and those it answers for followers, in the
+  main metadata group and in each metadata shard.
+- **On a cluster, a copy arriving from another node no longer holds client
+  writes of the key back while it transfers.** It is staged on local disk
+  first (encrypted with a key kept in memory, so an encrypted bucket's
+  object is never there in the clear) and installed under the key's lock in
+  one local step; a slow or stalled sender used to block every PUT of that
+  key on the receiving node.
+
 ## [5.0.14] - 2026-11-09
 ### Security
 Found by an internal security review of 5.0.13 (authorization, data paths and
@@ -4108,7 +4155,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.14...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.15...HEAD
+[5.0.15]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.14...v5.0.15
 [5.0.14]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.13...v5.0.14
 [5.0.13]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.12...v5.0.13
 [5.0.12]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.11...v5.0.12
