@@ -2,6 +2,7 @@ package s3
 
 import (
 	"encoding/xml"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 	"log/slog"
 	"net/http"
 )
@@ -107,7 +108,27 @@ func metaWriteFailed(w http.ResponseWriter, err error, op, bucket, key string) b
 	}
 	slog.Error("metadata write failed, reporting the write as unsuccessful",
 		"op", op, "bucket", bucket, "key", key, "error", err)
+	if writeNoSpace(w, err) {
+		return true
+	}
 	writeS3Error(w, "SlowDown",
 		"The write could not be recorded, please retry", http.StatusServiceUnavailable)
 	return true
+}
+
+// writeNoSpace answers a write that failed on a full disk with 507, and
+// reports whether it did. It was a 500 or a 503 SlowDown, which every SDK
+// retries, while only freeing space helps.
+func writeNoSpace(w http.ResponseWriter, err error) bool {
+	if !storage.IsNoSpace(err) {
+		return false
+	}
+	writeInsufficientStorage(w)
+	return true
+}
+
+// writeInsufficientStorage refuses a write for lack of disk space (507).
+func writeInsufficientStorage(w http.ResponseWriter) {
+	writeS3Error(w, "InsufficientStorage",
+		"The server does not have enough free disk space to store this; delete objects or add space", http.StatusInsufficientStorage)
 }

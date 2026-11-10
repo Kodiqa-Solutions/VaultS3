@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	"github.com/Kodiqa-Solutions/VaultS3/internal/storage"
 	"io"
 	"log/slog"
 	"net/http"
@@ -71,7 +72,7 @@ func (h *APIHandler) handleSpeedtest(w http.ResponseWriter, r *http.Request) {
 		if cerr := cleanup(); cerr != nil {
 			slog.Warn("speedtest cleanup failed", "error", cerr)
 		}
-		writeError(w, http.StatusInternalServerError, "write benchmark failed: "+err.Error())
+		writeError(w, writeStatus(err), "write benchmark failed: "+err.Error())
 		return
 	}
 	writeDur := time.Since(start)
@@ -109,4 +110,13 @@ func (h *APIHandler) handleSpeedtest(w http.ResponseWriter, r *http.Request) {
 		ReadThroughputMBps:  float64(testSize) / (1024 * 1024) / readDur.Seconds(),
 		Duration:            totalDur.String(),
 	})
+}
+
+// writeStatus is the status for a failed write of object data: 507 when the
+// disk is full or below the reserve (storage.min_free_mb), otherwise 500.
+func writeStatus(err error) int {
+	if storage.IsNoSpace(err) {
+		return http.StatusInsufficientStorage
+	}
+	return http.StatusInternalServerError
 }

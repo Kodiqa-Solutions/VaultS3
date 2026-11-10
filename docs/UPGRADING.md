@@ -64,6 +64,16 @@ ignores, so an older server reads those objects from the front correctly.
 Where a rollback is not safe the fix is the same: roll forward rather than back,
 or restore the data directory from a backup taken before the upgrade.
 
+## Upgrading to 5.0.16
+
+- **New object data is refused with `507 Insufficient Storage` when less than
+  100 MiB is free** on a disk the server writes to (`data_dir`, `metadata_dir`,
+  the Raft log, the cold tier, erasure disks); reads, deletes and settings go on.
+  A server that runs closer to full than that starts refusing uploads after the
+  upgrade: lower `storage.min_free_mb` (not below 32), or set it to 0 for the old
+  behaviour. A write that fails for lack of space is now a 507 instead of a 500
+  or 503.
+
 ## Upgrading to 5.0.15
 
 - **On a cluster, replica repair copies the versions written before the

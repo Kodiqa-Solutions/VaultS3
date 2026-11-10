@@ -76,7 +76,8 @@ func (d *DistributedStore) GetObjectMetaConsistent(bucket, key string) (*ObjectM
 	// an acknowledged overwrite read the previous object.
 	// On the leader too: a new leader first applies the previous term's last
 	// writes (cluster.Node.leaderCaughtUp, once per term).
-	if b, ok := d.raft.(readBarrier); ok {
+	b, hasBarrier := d.raft.(readBarrier)
+	if hasBarrier {
 		// A node that cannot catch up (it does not know the leader yet,
 		// just after a restart, or is cut off from it) answers that it
 		// cannot tell. It used to read its own copy, and a node restarted
@@ -87,7 +88,10 @@ func (d *DistributedStore) GetObjectMetaConsistent(bucket, key string) (*ObjectM
 			return nil, fmt.Errorf("%w: this node could not catch up with the cluster leader: %v", ErrShardUnavailable, err)
 		}
 	}
-	if meta, err := d.Store.GetObjectMeta(bucket, key); meta != nil {
+	if meta, err := d.GetObjectMeta(bucket, key); meta != nil || hasBarrier {
+		// Caught up with the leader, a miss is final: waiting for it to
+		// arrive cost every lookup of a deleted object two seconds (replica
+		// repair after a mass delete stalled for hours).
 		return meta, err
 	}
 	d.waitReplicated(func() bool { m, _ := d.Store.GetObjectMeta(bucket, key); return m != nil })

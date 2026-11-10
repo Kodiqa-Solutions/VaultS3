@@ -76,6 +76,10 @@ spec:
             - name: VAULTS3_USAGE_SCAN_INTERVAL_SECS
               value: {{ .Values.usageScanIntervalSecs | quote }}
             {{- end }}
+            {{- if ne (int .Values.minFreeMB) 100 }}
+            - name: VAULTS3_MIN_FREE_MB
+              value: {{ .Values.minFreeMB | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

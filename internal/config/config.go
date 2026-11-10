@@ -408,6 +408,12 @@ type StorageConfig struct {
 	// asks for the numbers. Set to 0 to disable it on very large or slow
 	// filesystems. (env: VAULTS3_USAGE_SCAN_INTERVAL_SECS)
 	UsageScanIntervalSecs int `yaml:"usage_scan_interval_secs"`
+	// MinFreeMB is the free space, in MiB, kept in the data and metadata
+	// folders. Below it new writes are refused with 507 while deletes go on.
+	// A full metadata disk could not even delete (its database writes new
+	// pages for a delete), so the server stayed full until the disk grew.
+	// 0 disables the check. (env: VAULTS3_MIN_FREE_MB)
+	MinFreeMB int `yaml:"min_free_mb"`
 }
 
 type AuthConfig struct {
@@ -591,6 +597,7 @@ func parse(data []byte) (*Config, error) {
 			DataDir:               "./data",
 			MetadataDir:           "./metadata",
 			UsageScanIntervalSecs: 300,
+			MinFreeMB:             100,
 		},
 		Logging: LoggingConfig{
 			FilePath: "./access.log",
@@ -685,6 +692,11 @@ func parse(data []byte) (*Config, error) {
 	// A YAML list can carry stray whitespace, and the env form accepts both "a,b"
 	// and "a, b" — normalise the startup bucket list from whichever source it came.
 	cfg.Storage.DefaultBuckets = splitList(strings.Join(cfg.Storage.DefaultBuckets, ","))
+
+	// A negative reserve became an enormous one: every write refused, forever.
+	if cfg.Storage.MinFreeMB < 0 {
+		return nil, fmt.Errorf("storage.min_free_mb is %d; it must be 0 (off) or more", cfg.Storage.MinFreeMB)
+	}
 
 	// Validate encryption config. SSE-KMS gets its keys from the KMS, so it needs
 	// no static key: requiring one anyway meant the documented KMS example refused
@@ -791,6 +803,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("VAULTS3_USAGE_SCAN_INTERVAL_SECS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			cfg.Storage.UsageScanIntervalSecs = n
+		}
+	}
+	if v := os.Getenv("VAULTS3_MIN_FREE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Storage.MinFreeMB = n
 		}
 	}
 	if v := os.Getenv("VAULTS3_ENCRYPTION_KEY"); v != "" {

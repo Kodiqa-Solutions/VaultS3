@@ -19,11 +19,11 @@ RPM, DEB and APK packages are attached to every [release](https://github.com/Kod
 
 ```bash
 # Debian or Ubuntu
-sudo apt install ./vaults3_5.0.15_amd64.deb
+sudo apt install ./vaults3_5.0.16_amd64.deb
 # RHEL, Rocky or Fedora
-sudo rpm -i vaults3-5.0.15-1.x86_64.rpm
+sudo rpm -i vaults3-5.0.16-1.x86_64.rpm
 # Alpine
-sudo apk add --allow-untrusted vaults3_5.0.15_x86_64.apk
+sudo apk add --allow-untrusted vaults3_5.0.16_x86_64.apk
 
 sudo systemctl enable --now vaults3
 journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
@@ -32,7 +32,7 @@ journalctl -u vaults3 --no-pager | head -40   # the admin secret is printed once
 Every release also ships an SPDX SBOM per platform, generated from the binary so it lists the modules actually compiled in, and a Sigstore provenance bundle attached as an asset, so a download can be verified against the workflow run and commit that produced it, offline or from a mirror:
 
 ```bash
-gh attestation verify vaults3_5.0.15_amd64.deb --repo Kodiqa-Solutions/VaultS3
+gh attestation verify vaults3_5.0.16_amd64.deb --repo Kodiqa-Solutions/VaultS3
 ```
 
 ## Build from source
@@ -187,6 +187,7 @@ All settings can be overridden via environment variables (takes precedence over 
 | `VAULTS3_METADATA_DIR` | BoltDB metadata directory | `./metadata` |
 | `VAULTS3_DEFAULT_BUCKETS` | Comma-separated buckets to create on startup if missing | _(none)_ |
 | `VAULTS3_USAGE_SCAN_INTERVAL_SECS` | How often VaultS3 may re-measure its own on-disk footprint (0 disables) | `300` |
+| `VAULTS3_MIN_FREE_MB` | Free disk space (MiB) kept for deletes; below it new writes get 507 (0 disables) | `100` |
 | `VAULTS3_ENCRYPTION_KEY` | 64-char hex key (enables encryption) | _(disabled)_ |
 | `VAULTS3_TLS_CERT` | TLS certificate file path | _(disabled)_ |
 | `VAULTS3_TLS_KEY` | TLS private key file path | _(disabled)_ |

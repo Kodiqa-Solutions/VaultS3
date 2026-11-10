@@ -315,3 +315,18 @@ func TestVectorIndexPathDefaultsToTheMetadataDir(t *testing.T) {
 		t.Errorf("explicit %q", got)
 	}
 }
+
+// Regression (5.0.16 review): a negative reserve became an enormous one.
+func TestANegativeMinFreeIsRefused(t *testing.T) {
+	if _, err := parse([]byte("storage:\n  min_free_mb: -1\n")); err == nil {
+		t.Error("storage.min_free_mb: -1 was accepted")
+	}
+	cfg, err := parse([]byte("storage:\n  min_free_mb: 0\n"))
+	if err != nil || cfg.Storage.MinFreeMB != 0 {
+		t.Errorf("0 (off): %v %d", err, cfg.Storage.MinFreeMB)
+	}
+	cfg, err = parse(nil)
+	if err != nil || cfg.Storage.MinFreeMB != 100 {
+		t.Errorf("default: %v %d", err, cfg.Storage.MinFreeMB)
+	}
+}

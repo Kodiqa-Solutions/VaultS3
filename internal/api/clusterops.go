@@ -344,10 +344,6 @@ func (h *APIHandler) ClusterObjectDeleteBatchHandler(secret string) http.Handler
 	}
 }
 
-// ClusterReplicaPutHandler stores an object's data on THIS node's local engine
-// (no metadata write — that arrives via Raft — and no re-fan-out). The primary
-// broadcasts here to keep replica copies so a node loss doesn't make an object
-// unavailable (issue #37, replica_count > 1). Cluster-secret authed.
 // ClusterReplicaPullHandler makes this node fetch a missing copy of an object
 // from another cluster member.
 //
@@ -358,6 +354,10 @@ func (h *APIHandler) ClusterReplicaPullHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if h.space.Low() {
+			w.WriteHeader(http.StatusInsufficientStorage)
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -598,10 +598,18 @@ func (h *APIHandler) ClusterReplicaGetHandler(secret string) http.HandlerFunc {
 	}
 }
 
+// ClusterReplicaPutHandler stores an object's data on THIS node's local engine
+// (no metadata write — that arrives via Raft — and no re-fan-out). The primary
+// broadcasts here to keep replica copies so a node loss doesn't make an object
+// unavailable (issue #37, replica_count > 1). Cluster-secret authed.
 func (h *APIHandler) ClusterReplicaPutHandler(secret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !clusterAuthOK(r, secret) {
 			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if h.space.Low() {
+			w.WriteHeader(http.StatusInsufficientStorage)
 			return
 		}
 		bucket := r.URL.Query().Get("bucket")
@@ -708,6 +716,10 @@ const CopyVersionHeader = "X-VaultS3-Copy-Version"
 // SetCopyIndex wires the node-local record of which object each local data
 // file holds (cluster only).
 func (h *APIHandler) SetCopyIndex(c *metadata.CopyIndex) { h.copies = c }
+
+// SetSpaceGuard wires the free disk space watch: below the reserve, uploads
+// and replica copies are refused (507) and repair retries later.
+func (h *APIHandler) SetSpaceGuard(g *storage.SpaceGuard) { h.space = g }
 
 // ReplicaETagHeader carries, on a replica copy, the ETag of the object the
 // copy is, so the receiving node can refuse a copy of an older object.

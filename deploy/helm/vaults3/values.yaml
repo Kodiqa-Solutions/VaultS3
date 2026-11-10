@@ -114,6 +114,12 @@ defaultBuckets: []
 # background-only and on demand. Set to 0 to switch it off on very large volumes.
 usageScanIntervalSecs: 300
 
+# Free disk space, in MiB, kept on the data and metadata volumes. Below it new
+# writes are refused with 507 Insufficient Storage while deletes go on, so a full
+# volume can always be emptied (on a completely full volume the metadata database
+# could not even delete). Keep it at 32 or more. 0 disables it.
+minFreeMB: 100
+
 service:
   type: ClusterIP
   port: 9000

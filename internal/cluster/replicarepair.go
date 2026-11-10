@@ -400,10 +400,16 @@ func (r *ReplicaRepairer) repairObject(ctx context.Context, bucket, key, version
 	addrs := r.proxy.NodeAddrs()
 	holders := r.ring.GetNodes(bucket, key, want)
 
-	// The object the metadata names. A record that is gone (deleted since
-	// the walk) leaves nothing to repair.
-	record, err := r.recordETag(bucket, key, version)
+	// The object the metadata names, read after catching up with the leader:
+	// a node just back from a partition judged every copy against its own
+	// stale record and reported current objects as lost. A record that is
+	// gone (deleted since the walk) leaves nothing to repair; one that cannot
+	// be read now is left for the next pass.
+	record, err := r.recordETagConsistent(bucket, key, version)
 	if err != nil {
+		if errors.Is(err, metadata.ErrShardUnavailable) {
+			return 0, repairUndecidable
+		}
 		return 0, repairNoop
 	}
 

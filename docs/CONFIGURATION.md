@@ -207,6 +207,27 @@ server:
 This enables `bucket-name.s3.example.com/key` in addition to the default `s3.example.com/bucket-name/key` path-style.
 
 
+## Free Disk Space Reserve
+
+`storage.min_free_mb` (default `100`, env `VAULTS3_MIN_FREE_MB`) keeps that much
+free on every disk the server writes to (`data_dir`, `metadata_dir`, and when
+in use the Raft log, the cold tier and the erasure disks). Below it, new object
+data is refused with `507 Insufficient Storage`: uploads, copies, multipart
+uploads, dashboard uploads and rollbacks, batch jobs, migrations and copies from
+other cluster nodes. Reads, deletes and settings go on, so a full disk can always
+be emptied: delete objects, release a legal hold or retention, or add a lifecycle
+rule that expires them. Without the reserve, a completely full metadata disk
+could not even delete: the metadata database writes new pages for every change.
+A write that runs out of space anyway is answered with 507 too, which S3 SDKs do
+not retry.
+
+Keep it at 32 or more: the metadata database grows its file 16 MiB at a time. On
+a disk shared by data and metadata, deleting objects frees space and writes resume
+on their own. A separate metadata disk does not shrink when records are deleted
+(the space they leave is reused for new records), so give that disk room to grow.
+`0` disables the reserve. On Windows free space is not measured and the reserve
+does not apply.
+
 ## Health Checks
 
 ```bash

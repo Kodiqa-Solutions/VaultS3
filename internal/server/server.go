@@ -154,6 +154,7 @@ type Server struct {
 	cfg                  *config.Config
 	store                *metadata.Store
 	copies               *metadata.CopyIndex // cluster only: which object each local data file holds
+	space                *storage.SpaceGuard // free disk space reserve (storage.min_free_mb)
 	metaStore            metadata.StoreAPI
 	engine               storage.Engine
 	keyMgr               *bucketcrypto.Manager
@@ -368,6 +369,20 @@ func New(cfg *config.Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init metadata: %w", err)
 	}
+	// The free disk space reserve (storage.min_free_mb), over every folder the
+	// server writes, and enforced on every write of object data.
+	spaceDirs := []string{cfg.Storage.DataDir, cfg.Storage.MetadataDir}
+	if cfg.Cluster.Enabled && cfg.Cluster.DataDir != "" {
+		spaceDirs = append(spaceDirs, cfg.Cluster.DataDir)
+	}
+	if cfg.Tiering.Enabled {
+		spaceDirs = append(spaceDirs, cfg.Tiering.ColdDataDir)
+	}
+	if cfg.Erasure.Enabled {
+		spaceDirs = append(spaceDirs, cfg.Erasure.DataDirs...)
+	}
+	space := storage.NewSpaceGuard(uint64(cfg.Storage.MinFreeMB)<<20, spaceDirs...)
+
 	// On a cluster each node records which object each of its local data
 	// files holds, to recognise a copy left behind by an overwrite it missed.
 	var copyIndex *metadata.CopyIndex
@@ -381,6 +396,9 @@ func New(cfg *config.Config) (*Server, error) {
 		// that process's memory).
 		storage.ClearStaging(engine.DataDir())
 	}
+	// Outermost, so a refused write changes nothing below it (not even a
+	// copy record).
+	engine = storage.NewGuardedEngine(engine, space)
 
 	// Initialize cluster if enabled
 	var clusterNode *cluster.Node
@@ -675,6 +693,7 @@ func New(cfg *config.Config) (*Server, error) {
 	// stored usage the replicated metadata records instead.
 	s3h.SetStoredUsageQuota(cfg.Cluster.Enabled)
 	s3h.SetCopyIndex(copyIndex)
+	s3h.SetSpaceGuard(space)
 	s3h.SetPrivateEndpoints(cfg.Notifications.AllowPrivateWebhooks, cfg.Lambda.AllowPrivateEndpoints)
 	s3h.SetPerBucketMode(cfg.Encryption.PerBucket)
 
@@ -1228,6 +1247,7 @@ func New(cfg *config.Config) (*Server, error) {
 		cfg:                  cfg,
 		store:                store,
 		copies:               copyIndex,
+		space:                space,
 		metaStore:            metaStore,
 		engine:               engine,
 		reapElsewhere:        reapOne,
@@ -1275,6 +1295,7 @@ func (s *Server) Run() error {
 	apiHandler := api.NewAPIHandler(s.metaStore, s.engine, s.metrics, s.cfg, s.activity)
 	apiHandler.SetS3Authenticator(s.s3Auth)
 	apiHandler.SetCopyIndex(s.copies)
+	apiHandler.SetSpaceGuard(s.space)
 	apiHandler.SetAllowPrivateLambda(s.cfg.Lambda.AllowPrivateEndpoints)
 	// Graph the measured physical footprint next to the logical size, so growth
 	// that never shows up in object bytes (old versions, replicas, Raft logs) is
@@ -1728,6 +1749,11 @@ func (s *Server) Run() error {
 		defer tierCancel()
 		go s.tieringMgr.Run(tierCtx)
 	}
+
+	// Watch the free disk space (storage.min_free_mb).
+	spaceCtx, spaceCancel := context.WithCancel(context.Background())
+	defer spaceCancel()
+	go s.space.Run(spaceCtx, 5*time.Second)
 
 	// Start lambda trigger manager if enabled
 	if s.lambdaMgr != nil {

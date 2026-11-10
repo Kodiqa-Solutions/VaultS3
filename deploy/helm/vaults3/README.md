@@ -46,6 +46,7 @@ The chart ships a `values.schema.json`, so `helm install` and `helm upgrade` ref
 | `config` | single-node config | The `vaults3.yaml` mounted at `/etc/vaults3/`. Replace to enable encryption/replication/erasure/external auth/etc. |
 | `existingConfigMap` | `""` | Use your own ConfigMap (key `vaults3.yaml`). |
 | `defaultBuckets` | `[]` | Buckets created on startup if missing (e.g. `{app-data,backups}`). Existing buckets are untouched; an invalid name stops the pod. |
+| `minFreeMB` | `100` | Free disk space (MiB) kept on the volumes so objects can always be deleted; below it new writes get 507 Insufficient Storage. `0` disables it. |
 | `usageScanIntervalSecs` | `300` | How often VaultS3 may re-measure its own on-disk footprint, so the dashboard can show it separately from total filesystem usage. `0` disables the walk. |
 | `controller.kind` | `StatefulSet` | `StatefulSet` (default. Required for clustering/multi-replica) or `Deployment` (single-node, standalone PVCs). |
 | `persistence.enabled` | `true` | Keep enabled for real use. |

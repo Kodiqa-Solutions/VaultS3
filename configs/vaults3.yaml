@@ -54,6 +54,14 @@ storage:
   # the numbers. Set to 0 to switch it off on very large or slow filesystems.
   # (env: VAULTS3_USAGE_SCAN_INTERVAL_SECS)
   usage_scan_interval_secs: 300
+  # Free space, in MiB, kept on every disk the server writes to. Below it new
+  # object data is refused with 507 Insufficient Storage while reads, deletes and
+  # settings go on, so a full disk can always be emptied: the metadata database
+  # writes new pages even to delete, so on a completely full disk nothing could be
+  # deleted. Keep it at 32 or more (the database grows its file 16 MiB at a time).
+  # 0 disables. Not applied on Windows.
+  # (env: VAULTS3_MIN_FREE_MB)
+  min_free_mb: 100
 
 auth:
   # Dashboard and S3 admin credentials.

@@ -69,6 +69,11 @@
       "minimum": 0,
       "description": "How often, at most, the server measures its own disk use. 0 switches it off."
     },
+    "minFreeMB": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Free disk space (MiB) kept for deletes; below it new writes get 507. 0 switches it off."
+    },
     "service": {
       "type": "object",
       "properties": {

@@ -162,6 +162,10 @@ spec:
             # dashboard shows separately from the volume's total usage. 0 disables it.
             # - name: VAULTS3_USAGE_SCAN_INTERVAL_SECS
             #   value: "300"
+            # Free disk space (MiB) kept so objects can always be deleted; below it
+            # new writes get 507 Insufficient Storage. 0 disables it.
+            # - name: VAULTS3_MIN_FREE_MB
+            #   value: "100"
           livenessProbe:
             httpGet:
               path: /health

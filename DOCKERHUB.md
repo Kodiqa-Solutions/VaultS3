@@ -67,6 +67,7 @@ S3 API: `http://localhost:9000`
 | `VAULTS3_METADATA_DIR` | BoltDB metadata directory | `/metadata` |
 | `VAULTS3_DEFAULT_BUCKETS` | Comma-separated buckets to create on startup if missing | _(none)_ |
 | `VAULTS3_USAGE_SCAN_INTERVAL_SECS` | How often VaultS3 may re-measure its own on-disk footprint (0 disables) | `300` |
+| `VAULTS3_MIN_FREE_MB` | Free disk space (MiB) kept for deletes; below it new writes get 507 (0 disables) | `100` |
 | `VAULTS3_ENCRYPTION_KEY` | 64-char hex key (enables SSE-S3) | _(disabled)_ |
 | `VAULTS3_TLS_CERT` | TLS certificate path | _(disabled)_ |
 | `VAULTS3_TLS_KEY` | TLS private key path | _(disabled)_ |

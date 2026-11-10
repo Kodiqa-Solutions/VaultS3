@@ -115,6 +115,8 @@ type ObjectHandler struct {
 	// loss doesn't make it unavailable (issue #37). Best-effort + asynchronous —
 	// never blocks or fails the client write; GET failover already tries replicas.
 	replicatePlacement func(bucket, key, versionID, etag string, size int64)
+	// space refuses new data while the disks are low (nil: never).
+	space *storage.SpaceGuard
 	// copies records which object each local data file holds (cluster only;
 	// nil otherwise, and every method of a nil index is a no-op).
 	copies *metadata.CopyIndex
@@ -138,6 +140,9 @@ type ObjectHandler struct {
 // retry lands after it arrives. Refusing beats the alternative, which was
 // storing the object in the clear in a bucket that asked for encryption.
 func writePutError(w http.ResponseWriter, err error) {
+	if writeNoSpace(w, err) {
+		return
+	}
 	if errors.Is(err, storage.ErrBucketKeyUnavailable) {
 		slog.Warn("refusing a write until this node has the bucket encryption key")
 		writeS3Error(w, "SlowDown", "Bucket encryption key is still replicating, please retry", http.StatusServiceUnavailable)
@@ -659,7 +664,20 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			writeS3Error(w, "NoSuchKey", "Object is a delete marker", http.StatusNotFound)
 			return
 		}
+		// Opened and judged under the key's lock (see the latest-version read
+		// below).
+		var unlockRead func()
+		if h.copies.Working() {
+			unlockRead = storage.LockObjectKeyShared(bucket, storage.VersionLockKey(key, versionID))
+		}
 		reader, size, err = h.readObjectData(bucket, key, versionID)
+		versionRecorded, versionKnown := "", false
+		if err == nil {
+			versionRecorded, versionKnown = h.copies.Lookup(bucket, key, versionID, size)
+		}
+		if unlockRead != nil {
+			unlockRead()
+		}
 		if err != nil {
 			// The version's metadata is here but its bytes may live on another
 			// holder that has not been copied to yet (issue #42).
@@ -673,7 +691,7 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		// The null version is replaced in place in a bucket with versioning
 		// suspended, so a node that missed that write still holds the old
 		// bytes.
-		if recorded, known := h.copies.Lookup(bucket, key, versionID, size); known && h.dataHolderFallback != nil && recorded != meta.ETag {
+		if recorded, known := versionRecorded, versionKnown; known && h.dataHolderFallback != nil && recorded != meta.ETag {
 			_ = reader.Close()
 			slog.Info("local copy of a version is recorded as another object, routing the read to a holder",
 				"bucket", bucket, "key", key, "version", versionID)
@@ -713,6 +731,17 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			writeS3Error(w, "NoSuchKey", "Object not found", http.StatusNotFound)
 			return
 		}
+		// On a cluster the file is opened and its copy record read under the
+		// key's lock (shared, as client writes take it): a copy arriving from
+		// another node drops the record, replaces the file and records it
+		// again under the exclusive lock, and a read in between found the old
+		// file with no record, judged it by size alone, and served the
+		// previous object (a 10 MiB multipart of the same size, in a soak
+		// test seconds after a node restarted).
+		var unlockRead func()
+		if h.copies.Working() {
+			unlockRead = storage.LockObjectKeyShared(bucket, storage.VersionLockKey(key, meta.VersionID))
+		}
 		if meta.VersionID != "" {
 			// Versioned bucket — read from version storage
 			reader, size, err = h.readObjectData(bucket, key, meta.VersionID)
@@ -721,6 +750,10 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			reader, size, err = h.engine.GetObject(bucket, key)
 		}
 		stored := size // the copy record is kept with the size the engine reads back
+		recorded, known := h.copies.Lookup(bucket, key, meta.VersionID, stored)
+		if unlockRead != nil {
+			unlockRead()
+		}
 		if err == nil {
 			// Plaintext size and reader from here on, which is what the stale-copy
 			// checks below compare against the metadata.
@@ -735,7 +768,6 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 		// recorded as this object is still checked as before, since two
 		// overwrites of one key racing on this node can leave the record and
 		// the file naming different writes.
-		recorded, known := h.copies.Lookup(bucket, key, meta.VersionID, stored)
 		recordedStale := err == nil && known && h.dataHolderFallback != nil && recorded != meta.ETag
 		if err == nil && !recordedStale && !h.localCopyIsStale(meta, size) && h.localCopyNeedsContentCheck(bucket, meta, size) &&
 			!h.localCopyContentMatches(reader, meta) {
@@ -749,6 +781,10 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request, bucket
 			}
 			writeS3Error(w, "SlowDown", "Object data is being replicated, please retry", http.StatusServiceUnavailable)
 			return
+		}
+		if err == nil && h.dataHolderFallback != nil {
+			slog.Debug("cluster: local copy judged", "bucket", bucket, "key", key, "meta_etag", meta.ETag,
+				"recorded", recorded, "known", known, "stored", stored, "size", size, "meta_size", meta.Size)
 		}
 		if err == nil && (recordedStale || h.localCopyIsStale(meta, size)) {
 			// The bytes here are not the bytes the metadata describes, so serving

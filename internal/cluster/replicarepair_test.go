@@ -569,6 +569,10 @@ func (s *reentrantStore) GetObjectMeta(bucket, key string) (*metadata.ObjectMeta
 	return &metadata.ObjectMeta{Bucket: bucket, Key: key, Size: 4, ETag: `"e"`}, nil
 }
 
+func (s *reentrantStore) GetObjectMetaConsistent(bucket, key string) (*metadata.ObjectMeta, error) {
+	return s.GetObjectMeta(bucket, key)
+}
+
 func (s *reentrantStore) ScanObjectVersions(func(metadata.ObjectMeta) bool) error { return nil }
 
 func (s *reentrantStore) IterateAllObjects(fn func(bucket, key string, meta metadata.ObjectMeta) bool) error {

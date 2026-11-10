@@ -477,6 +477,10 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 		writeError(w, http.StatusNotFound, "bucket not found")
 		return
 	}
+	if h.space.Low() {
+		writeError(w, http.StatusInsufficientStorage, "the server does not have enough free disk space; delete objects or add space")
+		return
+	}
 
 	// Stream each file part straight to storage. ParseMultipartForm buffered the
 	// whole request body to a temp file first, which fails for very large uploads
@@ -492,7 +496,7 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 	versioning, _ := h.store.GetBucketVersioning(bucket)
 	user, _ := h.authenticateUser(r)
 	var results []uploadResult
-	var anyFailed, anyDenied, anyOverQuota bool
+	var anyFailed, anyDenied, anyOverQuota, anyNoSpace bool
 
 	// fail records a per-file failure: it logs the real reason (uploads used to
 	// swallow write errors silently and still return 200, so a full disk or a
@@ -510,6 +514,11 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 		if errors.As(err, &refused) {
 			results = append(results, uploadResult{Key: key, Error: refused.msg})
 			anyDenied = true
+			return
+		}
+		if storage.IsNoSpace(err) {
+			results = append(results, uploadResult{Key: key, Error: "not enough free disk space on the server"})
+			anyNoSpace = true
 			return
 		}
 		slog.Error("dashboard upload failed", "bucket", bucket, "key", key, "error", err)
@@ -708,6 +717,8 @@ func (h *APIHandler) handleUpload(w http.ResponseWriter, r *http.Request, bucket
 	switch {
 	case anyFailed:
 		status = http.StatusInternalServerError
+	case anyNoSpace:
+		status = http.StatusInsufficientStorage
 	case anyDenied, anyOverQuota:
 		status = http.StatusForbidden
 	}

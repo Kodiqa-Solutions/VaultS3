@@ -658,6 +658,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Low on disk space (storage.SpaceGuard): new data is refused before its
+	// body is read, while deletes go on and free it. After the hand-off above,
+	// so a part for an upload another node holds is judged by that node.
+	if h.objects.space.Low() && addsData(r, key) {
+		writeInsufficientStorage(w)
+		return
+	}
+
 	// Decode an aws-chunked (streaming) request body, if present, before any
 	// handler reads it. Must run after auth (which signs the STREAMING-* literal,
 	// not the body). Without this, HTTPS/HTTP-2 uploads from modern SDKs are stored
@@ -1669,3 +1677,30 @@ func longSegment(key string) bool {
 	}
 	return false
 }
+
+// addsData reports a request that stores object data: an upload, a copy or
+// a multipart part (a PUT on a key with no subresource, or with partNumber),
+// starting or completing a multipart upload, or a restore from the cold
+// tier. Requests that change settings are let through, small as they are:
+// releasing a legal hold or retention, or a lifecycle rule that expires
+// objects, is how a full disk is emptied.
+func addsData(r *http.Request, key string) bool {
+	q := r.URL.Query()
+	switch r.Method {
+	case http.MethodPut:
+		if key == "" {
+			return false
+		}
+		_, part := q["partNumber"]
+		return len(q) == 0 || part
+	case http.MethodPost:
+		_, uploads := q["uploads"]
+		_, complete := q["uploadId"]
+		_, restore := q["restore"]
+		return key != "" && (uploads || complete || restore)
+	}
+	return false
+}
+
+// SetSpaceGuard wires the free disk space watch (nil: never low).
+func (h *Handler) SetSpaceGuard(g *storage.SpaceGuard) { h.objects.space = g }

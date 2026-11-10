@@ -6,6 +6,42 @@ semantic-ish versioning via git tags (`vMAJOR.MINOR.PATCH`).
 
 ## [Unreleased]
 
+## [5.0.16] - 2026-11-10
+Found by filling the disks of a test server and by cluster load tests that cut
+nodes off the network, freeze them and slow their network down.
+
+### Added
+- **A free disk space reserve** (`storage.min_free_mb`, default 100 MiB,
+  `VAULTS3_MIN_FREE_MB`). Below it new object data is refused with `507
+  Insufficient Storage` (uploads, copies, multipart uploads, dashboard uploads,
+  batch jobs, migrations, copies between cluster nodes) while reads, deletes
+  and settings go on, so a legal hold can be released or a lifecycle rule
+  added to make room. A completely full
+  metadata disk could not be emptied: its database writes new pages even to
+  delete, so every delete failed and the server stayed full until the disk
+  grew. Found by filling the disks of a test server.
+
+### Changed
+- **A write that runs out of disk space is answered `507 Insufficient
+  Storage`.** It was a 500 for object data and a 503 SlowDown for metadata,
+  which S3 SDKs retry although only freeing space helps.
+
+### Fixed
+- **On a cluster, a read no longer catches a copy from another node being
+  installed.** The node drops its record of the file, replaces the file and
+  records it again; a read in between found the previous object's file with
+  no record and, for a multipart object of the same size (which has no
+  content check), served it. Seen in load tests as one stale read in an
+  hour, seconds after a node restarted and caught up. A read now opens and
+  checks the file under the key's lock, which a copy holds only for the
+  local install.
+- **On a cluster, replica repair no longer reports current objects as lost**
+  ("no surviving copy") right after a node rejoins from a network partition.
+  It judged every copy against the node's own stale record; it now catches up
+  with the leader first and leaves the object for the next pass when it
+  cannot. Repair also no longer waits two seconds for each object deleted
+  since its walk began.
+
 ## [5.0.15] - 2026-11-10
 Found by long cluster load tests (three nodes, a node killed or restarted every few
 minutes) and four review rounds of the fixes.
@@ -4155,7 +4191,8 @@ engines) plus an audit of the high-risk packages. Every fix has a regression tes
   dashboard, CLI, versioning, WORM, notifications, full-text search, FUSE mount,
   and multi-platform release binaries + Docker images.
 
-[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.15...HEAD
+[Unreleased]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.16...HEAD
+[5.0.16]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.15...v5.0.16
 [5.0.15]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.14...v5.0.15
 [5.0.14]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.13...v5.0.14
 [5.0.13]: https://github.com/Kodiqa-Solutions/VaultS3/compare/v5.0.12...v5.0.13

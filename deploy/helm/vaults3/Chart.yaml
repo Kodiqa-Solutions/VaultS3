@@ -4,8 +4,8 @@ description: Lightweight S3-compatible object storage with a built-in dashboard,
 type: application
 # version  = the chart version (bump on chart changes)
 # appVersion = the VaultS3 image tag this chart defaults to
-version: 0.2.15
-appVersion: "5.0.15"
+version: 0.2.16
+appVersion: "5.0.16"
 home: https://github.com/Kodiqa-Solutions/VaultS3
 sources:
   - https://github.com/Kodiqa-Solutions/VaultS3
@@ -25,15 +25,15 @@ icon: https://raw.githubusercontent.com/Kodiqa-Solutions/VaultS3/main/assets/log
 # fixed or security), with the highlights of CHANGELOG.md.
 annotations:
   artifacthub.io/changes: |
-    - kind: fixed
-      description: "VaultS3 5.0.15: on a cluster, objects in buckets with versioning are kept on every node of their replica set, not only on the node that wrote them"
+    - kind: added
+      description: "minFreeMB (default 100): free disk space kept on the volumes so objects can always be deleted; below it new writes get 507 Insufficient Storage"
       links:
         - name: Changelog
           url: https://github.com/Kodiqa-Solutions/VaultS3/blob/main/CHANGELOG.md
+    - kind: changed
+      description: "VaultS3 5.0.16: a write that runs out of disk space is answered 507 Insufficient Storage instead of a 500 or 503 that SDKs retry"
     - kind: fixed
-      description: "VaultS3 5.0.15: a cluster node that missed an overwrite no longer serves the previous object, and replica repair replaces wrong copies, not only missing ones"
-    - kind: fixed
-      description: "VaultS3 5.0.15: a read straight after a leader change no longer answers an existing object as missing"
+      description: "VaultS3 5.0.16: cluster replica repair no longer reports current objects as lost after a network partition"
   artifacthub.io/license: AGPL-3.0
   artifacthub.io/category: storage
   artifacthub.io/links: |
@@ -45,4 +45,4 @@ annotations:
       url: https://vaults3.com/migrate-from-minio
   artifacthub.io/images: |
     - name: vaults3
-      image: eniz1806/vaults3:5.0.15
+      image: eniz1806/vaults3:5.0.16
